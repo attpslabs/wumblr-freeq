@@ -119,6 +119,10 @@ export interface Store {
   connectionState: TransportState;
   nick: string;
   registered: boolean;
+  // Sticky version of `registered` — set true on first registration, kept true
+  // through transient reconnects (so the app stays mounted), cleared on explicit
+  // logout (`fullReset`). App.tsx uses this to decide ConnectScreen vs app shell.
+  wasRegistered: boolean;
   authDid: string | null;
   authMessage: string | null;
   authError: string | null;
@@ -169,6 +173,7 @@ export interface Store {
   setConnectionState: (state: TransportState) => void;
   setNick: (nick: string) => void;
   setRegistered: (v: boolean) => void;
+  setWasRegistered: (v: boolean) => void;
   setAuth: (did: string, message: string) => void;
   setAuthError: (error: string) => void;
   appendMotd: (line: string) => void;
@@ -298,6 +303,7 @@ export const useStore = create<Store>((set, get) => ({
   connectionState: 'disconnected',
   nick: '',
   registered: false,
+  wasRegistered: false,
   authDid: null,
   authMessage: null,
   authError: null,
@@ -340,6 +346,7 @@ export const useStore = create<Store>((set, get) => ({
   setConnectionState: (state) => set({ connectionState: state }),
   setNick: (nick) => set({ nick }),
   setRegistered: (v) => set({ registered: v }),
+  setWasRegistered: (v) => set({ wasRegistered: v }),
   setAuth: (did, message) => set({ authDid: did, authMessage: message, authError: null }),
   appendMotd: (line) => set((s) => ({ motd: [...s.motd, line] })),
   dismissMotd: () => set({ motdDismissed: true }),
@@ -360,6 +367,7 @@ export const useStore = create<Store>((set, get) => ({
     connectionState: 'disconnected',
     nick: '',
     registered: false,
+    wasRegistered: false,
     connectedServer: null,
     authDid: null,
     authMessage: null,

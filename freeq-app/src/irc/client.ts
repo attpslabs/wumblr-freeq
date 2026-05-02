@@ -85,6 +85,13 @@ export function disconnect() {
   client?.disconnect();
   client = null;
   saslState = { token: '', did: '', pdsUrl: '', method: '', skipBrokerRefresh: false };
+  // Clear persistent-login material so ConnectScreen doesn't immediately
+  // re-auth the user via broker session refresh after a deliberate logout.
+  try {
+    localStorage.removeItem('freeq-broker-token');
+    localStorage.removeItem('freeq-oauth-result');
+    localStorage.removeItem('freeq-oauth-pending');
+  } catch { /* ignore */ }
   useStore.getState().fullReset();
 }
 

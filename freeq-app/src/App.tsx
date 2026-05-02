@@ -29,13 +29,16 @@ import { CallPanel } from './components/CallPanel';
 
 export default function App() {
   const registered = useStore((s) => s.registered);
+  const wasRegistered = useStore((s) => s.wasRegistered);
+  const setWasRegistered = useStore((s) => s.setWasRegistered);
   const theme = useStore((s) => s.theme);
   // Once we've been registered in this session, don't flash back to ConnectScreen
   // on brief state transitions (e.g. reconnect). The ReconnectBanner handles that.
-  const [wasRegistered, setWasRegistered] = useState(false);
+  // `wasRegistered` lives in the store so explicit logout (`fullReset`) can clear
+  // it and bounce back to ConnectScreen.
   useEffect(() => {
-    if (registered) setWasRegistered(true);
-  }, [registered]);
+    if (registered && !wasRegistered) setWasRegistered(true);
+  }, [registered, wasRegistered, setWasRegistered]);
   const showApp = registered || wasRegistered;
   const [quickSwitcher, setQuickSwitcher] = useState(false);
   const [settings, setSettings] = useState(false);
