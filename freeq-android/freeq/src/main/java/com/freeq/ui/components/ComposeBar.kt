@@ -19,6 +19,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -38,14 +41,30 @@ fun ComposeBar(
     var completions by remember { mutableStateOf<List<String>>(emptyList()) }
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     val haptic = LocalHapticFeedback.current
+    val view = LocalView.current
 
     val replyingTo by appState.replyingTo
     val editingMessage by appState.editingMessage
     val activeChannel = appState.activeChannel.value
 
-    // Pre-fill text when entering edit mode
+    // Pre-fill text when entering edit mode; dismiss keyboard when leaving.
+    //
+    // Compose's `LocalSoftwareKeyboardController.hide()` is documented as
+    // best-effort and unreliable when called from a coroutine / state-change
+    // context (the focus token may be stale by the time it dispatches to
+    // InputMethodManager). Going through the view + WindowInsetsController
+    // is the official Android API for IME visibility and works regardless
+    // of who calls it.
+    var wasEditingAState by remember { mutableStateOf(false) }
     LaunchedEffect(editingMessage) {
-        editingMessage?.let { text = it.text }
+        if (editingMessage != null) {
+            text = editingMessage!!.text
+            wasEditingAState = true
+        } else if (wasEditingAState) {
+            wasEditingAState = false
+            view.clearFocus()
+            ViewCompat.getWindowInsetsController(view)?.hide(WindowInsetsCompat.Type.ime())
+        }
     }
 
     val canSend = text.isNotBlank()
