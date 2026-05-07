@@ -184,7 +184,6 @@ class AppState(application: Application) : AndroidViewModel(application) {
     var isDarkTheme = mutableStateOf(true)
 
     val batches = mutableMapOf<String, BatchBuffer>()
-    data class BatchBuffer(val target: String, val batchType: String = "", val messages: MutableList<ChatMessage> = mutableListOf())
 
     // MOTD
     val motdLines = mutableStateListOf<String>()
@@ -612,21 +611,17 @@ class AppState(application: Application) : AndroidViewModel(application) {
 
     fun markRead(channel: String) {
         unreadCounts[channel] = 0
-        val state = channels.firstOrNull { it.name == channel }
+        val buffer = channels.firstOrNull { it.name == channel }
             ?: dmBuffers.firstOrNull { it.name == channel }
-        // Prefer the last real message (has a sender) — system messages use random UUIDs
-        // that don't survive CHATHISTORY replay
-        val lastMsg = state?.messages?.lastOrNull { it.from.isNotEmpty() }
-            ?: state?.messages?.lastOrNull()
-        lastMsg?.let {
-            lastReadMessageIds[channel] = it.id
-            lastReadTimestamps[channel] = it.timestamp.time
+        UnreadTracker.anchorMessage(buffer?.messages ?: emptyList())?.let { anchor ->
+            lastReadMessageIds[channel] = anchor.id
+            lastReadTimestamps[channel] = anchor.timestamp.time
             persistReadPositions()
         }
     }
 
     fun incrementUnread(channel: String) {
-        if (activeChannel.value != channel && !isMuted(channel)) {
+        if (UnreadTracker.shouldIncrement(channel, activeChannel.value, isMuted(channel))) {
             unreadCounts[channel] = (unreadCounts[channel] ?: 0) + 1
         }
     }
@@ -1105,43 +1100,35 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
                 val tags = event.msg.tags.associate { it.key to it.value }
                 val target = event.msg.target
                 val from = event.msg.from
-                // Typing indicators (ignore self)
+                fun lookupBuffer(name: String): ChannelState? =
+                    if (name.startsWith("#"))
+                        state.channels.firstOrNull { it.name.equals(name, ignoreCase = true) }
+                    else
+                        state.dmBuffers.firstOrNull { it.name.equals(name, ignoreCase = true) }
+
+                // Typing indicators
                 tags["+typing"]?.let { typing ->
-                    if (!from.equals(state.nick.value, ignoreCase = true)) {
-                        val bufferName = if (target.startsWith("#")) target else from
-                        val ch = if (bufferName.startsWith("#"))
-                            state.channels.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                        else
-                            state.dmBuffers.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                        ch?.let {
-                            if (typing == "active") it.typingUsers[from] = Date()
-                            else if (typing == "done") it.typingUsers.remove(from)
-                        }
+                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value) ?: return@let
+                    lookupBuffer(bufferName)?.let { ch ->
+                        if (typing == "active") ch.typingUsers[from] = Date()
+                        else if (typing == "done") ch.typingUsers.remove(from)
                     }
                 }
 
-                // Message deletion (ignore self — already handled optimistically by deleteMessage)
+                // Message deletion (self-echo already applied optimistically by deleteMessage)
                 tags["+draft/delete"]?.let { deleteId ->
-                    if (!from.equals(state.nick.value, ignoreCase = true)) {
-                        val bufferName = if (target.startsWith("#")) target else from
-                        val ch = if (bufferName.startsWith("#"))
-                            state.channels.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                        else
-                            state.dmBuffers.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                        ch?.applyDelete(deleteId)
-                    }
+                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value) ?: return@let
+                    lookupBuffer(bufferName)?.applyDelete(deleteId)
                 }
 
-                // Reactions (ignore self — already handled optimistically by sendReaction)
+                // Reactions (self-echo already applied optimistically by sendReaction)
                 val emoji = tags["+react"]
                 val replyId = tags["+reply"]
-                if (emoji != null && replyId != null && !from.equals(state.nick.value, ignoreCase = true)) {
-                    val bufferName = if (target.startsWith("#")) target else from
-                    val ch = if (bufferName.startsWith("#"))
-                        state.channels.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                    else
-                        state.dmBuffers.firstOrNull { it.name.equals(bufferName, ignoreCase = true) }
-                    ch?.applyReaction(replyId, emoji, from)
+                if (emoji != null && replyId != null) {
+                    val bufferName = TagMsgRouter.routeTo(target, from, state.nick.value)
+                    if (bufferName != null) {
+                        lookupBuffer(bufferName)?.applyReaction(replyId, emoji, from)
+                    }
                 }
             }
 
@@ -1154,19 +1141,18 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             }
 
             is FreeqEvent.BatchStart -> {
-                state.batches[event.id] = AppState.BatchBuffer(target = event.target, batchType = event.batchType)
+                state.batches[event.id] = BatchBuffer(target = event.target, batchType = event.batchType)
             }
 
             is FreeqEvent.BatchEnd -> {
                 val batch = state.batches.remove(event.id) ?: return
                 if (batch.target.isEmpty()) return
-                val sorted = batch.messages.sortedBy { it.timestamp }
                 val ch = if (batch.target.startsWith("#"))
                     state.getOrCreateChannel(batch.target)
                 else
                     state.getOrCreateDM(batch.target)
-                sorted.forEach { ch.appendIfNew(it) }
-                if (batch.batchType == "chathistory" && batch.messages.isEmpty()) {
+                BatchFlush.flushInto(batch, ch)
+                if (BatchFlush.isExhaustedHistory(batch)) {
                     ch.hasMoreHistory.value = false
                 }
             }

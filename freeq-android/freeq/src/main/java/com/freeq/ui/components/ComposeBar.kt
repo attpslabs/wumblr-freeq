@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.net.Uri
 import com.freeq.model.AppState
+import com.freeq.model.SlashCommand
+import com.freeq.model.SlashCommandParser
 import com.freeq.ui.theme.FreeqColors
 import com.freeq.ui.theme.Theme
 
@@ -354,28 +356,18 @@ private fun send(text: String, appState: AppState, onSent: () -> Unit) {
 }
 
 private fun handleCommand(input: String, appState: AppState) {
-    val parts = input.drop(1).split(" ", limit = 2)
-    val cmd = parts.firstOrNull()?.lowercase() ?: return
-    val arg = parts.getOrNull(1)
-
-    when (cmd) {
-        "join" -> arg?.let { appState.joinChannel(it) }
-        "part", "leave" -> appState.activeChannel.value?.let { appState.partChannel(it) }
-        "nick" -> arg?.let { appState.sendRaw("NICK $it") }
-        "me" -> {
-            val target = appState.activeChannel.value ?: return
-            arg?.let { appState.sendRaw("PRIVMSG $target :\u0001ACTION $it\u0001") }
+    when (val parsed = SlashCommandParser.parse(input)) {
+        is SlashCommand.Join -> appState.joinChannel(parsed.channel)
+        SlashCommand.PartActive -> appState.activeChannel.value?.let { appState.partChannel(it) }
+        is SlashCommand.Nick -> appState.sendRaw("NICK ${parsed.newNick}")
+        is SlashCommand.Me -> appState.activeChannel.value?.let { target ->
+            appState.sendRaw("PRIVMSG $target :\u0001ACTION ${parsed.text}\u0001")
         }
-        "msg" -> {
-            val msgParts = (arg ?: "").split(" ", limit = 2)
-            if (msgParts.size == 2) {
-                appState.sendMessage(msgParts[0], msgParts[1])
-            }
+        is SlashCommand.Msg -> appState.sendMessage(parsed.target, parsed.text)
+        is SlashCommand.Topic -> appState.activeChannel.value?.let { target ->
+            appState.sendRaw("TOPIC $target :${parsed.text}")
         }
-        "topic" -> {
-            val target = appState.activeChannel.value ?: return
-            arg?.let { appState.sendRaw("TOPIC $target :$it") }
-        }
-        else -> appState.sendRaw(input.drop(1))
+        is SlashCommand.Raw -> appState.sendRaw(parsed.line)
+        SlashCommand.Empty -> {} // recognized but missing arg — silent no-op
     }
 }
