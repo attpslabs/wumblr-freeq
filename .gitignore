@@ -53,6 +53,11 @@ freeq-ios/freeq.xcodeproj/
 [Bb]in/
 [Oo]bj/
 
+# Android source-set directories whose names collide with the Visual
+# Studio / .NET build patterns above.
+!freeq-android/**/src/debug/
+!freeq-android/**/src/release/
+
 # Visual Studio cache files
 vs/
 **/DesignTimeBuild/*

@@ -23,6 +23,8 @@ android {
         // auth broker).
         buildConfigField("String", "IRC_SERVER", "\"irc.freeq.at:6667\"")
         buildConfigField("String", "AUTH_BROKER_BASE", "\"https://auth.freeq.at\"")
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -110,4 +112,13 @@ dependencies {
 
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // Unit tests (pure JVM, plain JUnit — no Robolectric on aarch64 Linux).
+    testImplementation("junit:junit:4.13.2")
+
+    // Instrumented tests (run on a device/emulator).
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test:rules:1.5.0")
+    androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

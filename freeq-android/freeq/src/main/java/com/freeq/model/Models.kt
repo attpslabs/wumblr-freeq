@@ -340,9 +340,12 @@ class AppState(application: Application) : AndroidViewModel(application) {
      *  Returns true if a fallback was scheduled (caller should not also run
      *  the standard auto-reconnect path). Mirrors iOS attemptTransportFallback. */
     internal fun attemptTransportFallback(reason: String): Boolean {
-        if (transportFallbackUsed) return false
-        if (!reason.lowercase().contains("websocket")) return false
-        if (!hasSavedSession || nick.value.isEmpty()) return false
+        if (!TransportFallback.shouldFallback(
+                reason = reason,
+                transportFallbackUsed = transportFallbackUsed,
+                hasSavedSession = hasSavedSession,
+                nickIsEmpty = nick.value.isEmpty(),
+            )) return false
         transportFallbackUsed = true
         Log.w("freeq.auth", "WS connect failed; falling back to TCP. reason=$reason")
         client?.disconnect()
@@ -439,9 +442,9 @@ class AppState(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private data class BrokerSessionResponse(val token: String, val nick: String, val did: String)
+    internal data class BrokerSessionResponse(val token: String, val nick: String, val did: String)
 
-    private fun fetchBrokerSession(brokerToken: String): BrokerSessionResponse {
+    internal fun fetchBrokerSession(brokerToken: String): BrokerSessionResponse {
         // Retry up to 3 times with backoff — DPoP nonce rotation causes the first call to fail
         for (attempt in 0..2) {
             val url = java.net.URL("$authBrokerBase/session")
