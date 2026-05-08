@@ -860,6 +860,29 @@ pub async fn start(
     Ok((manager, event_rx))
 }
 
+/// `ProtocolHandler` that dispatches accepted S2S connections.
+#[derive(Clone)]
+pub struct S2sProtocol {
+    pub state: Arc<SharedState>,
+}
+
+impl std::fmt::Debug for S2sProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S2sProtocol").finish()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for S2sProtocol {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        tracing::info!("Incoming S2S connection from {}", conn.remote_id());
+        handle_incoming_s2s(conn, Arc::clone(&self.state)).await;
+        Ok(())
+    }
+}
+
 /// Handle an incoming S2S connection (called from iroh accept loop).
 pub async fn handle_incoming_s2s(conn: iroh::endpoint::Connection, state: Arc<SharedState>) {
     let manager = state.s2s_manager.lock().clone();

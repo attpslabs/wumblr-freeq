@@ -142,7 +142,11 @@ fn load_or_create_secret_key(path: &std::path::Path) -> Result<iroh::SecretKey> 
     }
 }
 
-/// Start the iroh endpoint and accept connections.
+/// Bind the iroh endpoint with our ALPNs registered at the TLS layer.
+///
+/// Does not spawn an accept loop — call [`spawn_router`] after any other
+/// subsystems that need to register protocols on the same endpoint
+/// (e.g. iroh-live for AV) have been initialized.
 ///
 /// Returns the endpoint (for getting the address/node ID to share with clients).
 pub async fn start(state: Arc<SharedState>, bind_port: Option<u16>) -> Result<iroh::Endpoint> {
@@ -166,29 +170,62 @@ pub async fn start(state: Arc<SharedState>, bind_port: Option<u16>) -> Result<ir
 
     tracing::info!("Iroh endpoint ID: {}", endpoint.id());
 
-    // Spawn accept loop
-    let ep = endpoint.clone();
-    tokio::spawn(async move {
-        while let Some(incoming) = ep.accept().await {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                match incoming.await {
-                    Ok(conn) => {
-                        // Route by ALPN: client connections vs S2S links
-                        let alpn = conn.alpn();
-                        if alpn == crate::s2s::S2S_ALPN {
-                            tracing::info!("Incoming S2S connection from {}", conn.remote_id());
-                            crate::s2s::handle_incoming_s2s(conn, state).await;
-                        } else {
-                            handle_connection(conn, state).await;
-                        }
-                    }
-                    Err(e) => tracing::warn!("Iroh incoming connection failed: {e}"),
-                }
-            });
-        }
-        tracing::info!("Iroh accept loop ended");
-    });
-
+    let _ = state;
     Ok(endpoint)
+}
+
+/// `ProtocolHandler` that bridges accepted iroh client connections into
+/// `handle_connection`.
+#[derive(Clone)]
+pub struct IrohClientProtocol {
+    pub state: Arc<SharedState>,
+}
+
+impl std::fmt::Debug for IrohClientProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohClientProtocol").finish()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for IrohClientProtocol {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        handle_connection(conn, Arc::clone(&self.state)).await;
+        Ok(())
+    }
+}
+
+/// Build and spawn the iroh `Router` that owns the endpoint's accept loop.
+///
+/// The Router registers handlers for `freeq/iroh/1` (client) and
+/// `freeq/s2s/1` (server-to-server). When `live` is provided, iroh-live's
+/// gossip + MoQ protocols are also registered on the same Router so AV
+/// works without iroh-live spawning its own router (which would otherwise
+/// `set_alpns` over the freeq ALPNs and break inbound dials).
+///
+/// The returned `Router` must be kept alive for the lifetime of the
+/// server — dropping it aborts the accept task.
+pub fn spawn_router(
+    endpoint: iroh::Endpoint,
+    state: Arc<SharedState>,
+    #[cfg(feature = "av-native")] live: Option<&iroh_live::Live>,
+) -> iroh::protocol::Router {
+    let builder = iroh::protocol::Router::builder(endpoint)
+        .accept(
+            ALPN,
+            IrohClientProtocol {
+                state: Arc::clone(&state),
+            },
+        )
+        .accept(crate::s2s::S2S_ALPN, crate::s2s::S2sProtocol { state });
+
+    #[cfg(feature = "av-native")]
+    let builder = match live {
+        Some(live) => live.register_protocols(builder),
+        None => builder,
+    };
+
+    builder.spawn()
 }

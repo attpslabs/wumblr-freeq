@@ -612,6 +612,9 @@ pub struct SharedState {
     pub server_iroh_id: Mutex<Option<String>>,
     /// Iroh endpoint handle (kept alive for the server's lifetime).
     pub iroh_endpoint: Mutex<Option<iroh::Endpoint>>,
+    /// Iroh `Router` that owns the endpoint accept loop. Holding this is
+    /// load-bearing — dropping the Router aborts inbound iroh handling.
+    pub iroh_router: Mutex<Option<iroh::protocol::Router>>,
     /// AV session manager (voice/video/screen sharing).
     pub av_sessions: Mutex<crate::av::AvSessionManager>,
     /// AV media backend (iroh-live rooms).
@@ -1155,6 +1158,7 @@ impl Server {
             session_away: Mutex::new(HashMap::new()),
             server_iroh_id: Mutex::new(None),
             iroh_endpoint: Mutex::new(None),
+            iroh_router: Mutex::new(None),
             av_sessions: Mutex::new(crate::av::AvSessionManager::new()),
             av_media: Mutex::new(None),
             #[cfg(feature = "av-native")]
@@ -1411,6 +1415,23 @@ impl Server {
         #[cfg(not(feature = "av-native"))]
         {
             *state.av_media.lock() = Some(crate::av_media::init_backend_stub());
+        }
+
+        // Spawn the iroh Router that owns the endpoint accept loop. Done
+        // AFTER AV init so iroh-live's gossip + MoQ protocols can be
+        // mounted on the same Router as freeq's `freeq/iroh/1` and
+        // `freeq/s2s/1` — preventing iroh-live from spawning its own
+        // Router and overwriting the endpoint's ALPN list.
+        if let Some(ref endpoint) = iroh_endpoint {
+            #[cfg(feature = "av-native")]
+            let router = {
+                let av_backend = state.av_media.lock().clone();
+                let live = av_backend.as_ref().map(|b| b.live());
+                crate::iroh::spawn_router(endpoint.clone(), Arc::clone(&state), live)
+            };
+            #[cfg(not(feature = "av-native"))]
+            let router = crate::iroh::spawn_router(endpoint.clone(), Arc::clone(&state));
+            *state.iroh_router.lock() = Some(router);
         }
 
         // Store iroh endpoint in shared state to keep it alive
@@ -3877,6 +3898,7 @@ mod s2s_adversarial_tests {
             session_away: Mutex::new(HashMap::new()),
             server_iroh_id: Mutex::new(Some("test-server-id".to_string())),
             iroh_endpoint: Mutex::new(None),
+            iroh_router: Mutex::new(None),
             av_sessions: Mutex::new(crate::av::AvSessionManager::new()),
             av_media: Mutex::new(None),
             s2s_manager: Mutex::new(None),
@@ -4546,6 +4568,7 @@ mod s2s_adversarial_tests {
             session_away: Mutex::new(HashMap::new()),
             server_iroh_id: Mutex::new(Some("test-server-id".to_string())),
             iroh_endpoint: Mutex::new(None),
+            iroh_router: Mutex::new(None),
             av_sessions: Mutex::new(crate::av::AvSessionManager::new()),
             av_media: Mutex::new(None),
             s2s_manager: Mutex::new(None),
