@@ -80,8 +80,16 @@ pub(super) fn handle_join(
             if ch.members.contains(session_id) {
                 return;
             }
+            // Founder + persistent DID-ops bypass admission gates (+k, +b, +i).
+            // Standard IRC behavior: the channel's authority figures can always
+            // rejoin their own channel. Without this bypass, a founder who sets
+            // +i and then disconnects is locked out of their own channel.
+            let is_did_authority = did.is_some_and(|d| {
+                ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
+            });
             // Check channel key (+k)
-            if let Some(ref key) = ch.key
+            if !is_did_authority
+                && let Some(ref key) = ch.key
                 && supplied_key != Some(key.as_str())
             {
                 let reply = Message::from_server(
@@ -93,7 +101,7 @@ pub(super) fn handle_join(
                 return;
             }
             // Check bans
-            if ch.is_banned(&hostmask, did) {
+            if !is_did_authority && ch.is_banned(&hostmask, did) {
                 let reply = Message::from_server(
                     server_name,
                     irc::ERR_BANNEDFROMCHAN,
@@ -103,7 +111,7 @@ pub(super) fn handle_join(
                 return;
             }
             // Check invite-only
-            if ch.invite_only {
+            if !is_did_authority && ch.invite_only {
                 let has_invite = ch.invites.contains(session_id)
                     || did.is_some_and(|d| ch.invites.contains(d))
                     || ch.invites.contains(&format!("nick:{nick}"));

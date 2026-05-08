@@ -1278,6 +1278,201 @@ async fn invite_only_channel() {
     server_handle.abort();
 }
 
+// ── Test: Founder bypasses +i on rejoin ─────────────────────────────
+//
+// Standard IRC behavior: the channel founder (and DID-ops) can rejoin a
+// `+i` channel without an invite. freeq currently rejects everyone
+// without an invite — including the founder of the channel — which is
+// the bug this test exercises.
+
+#[tokio::test]
+async fn founder_bypasses_invite_only_on_rejoin() {
+    let private_key = PrivateKey::generate_ed25519();
+    let did_str = "did:plc:founderbypass";
+    let doc = did::make_test_did_document(did_str, &private_key.public_key_multibase());
+
+    let mut docs = HashMap::new();
+    docs.insert(did_str.to_string(), doc);
+    let resolver = DidResolver::static_map(docs);
+
+    let (addr, server_handle) = start_test_server(resolver).await;
+
+    let signer: Arc<dyn ChallengeSigner> =
+        Arc::new(KeySigner::new(did_str.to_string(), private_key));
+
+    let config = ConnectConfig {
+        server_addr: addr.to_string(),
+        nick: "alice".to_string(),
+        user: "alice".to_string(),
+        realname: "Alice".to_string(),
+        ..Default::default()
+    };
+
+    let (handle, mut events) = client::connect(config, Some(signer));
+
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Authenticated { .. }),
+        "Alice authenticated",
+    )
+    .await;
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Registered { .. }),
+        "Alice registered",
+    )
+    .await;
+
+    // Alice creates #founder-i — becomes founder (founder_did set on JOIN
+    // when authenticated and channel didn't previously exist).
+    handle.join("#founder-i").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#founder-i"),
+        "Alice joined as founder",
+    )
+    .await;
+
+    // Lock the channel down with +i.
+    handle.raw("MODE #founder-i +i").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::ModeChanged { mode, .. } if mode == "+i"),
+        "+i set",
+    )
+    .await;
+
+    // Alice leaves the channel.
+    handle.raw("PART #founder-i").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Parted { channel, nick } if channel == "#founder-i" && nick == "alice"),
+        "Alice parted",
+    )
+    .await;
+
+    // Alice rejoins. As founder, she should bypass +i without needing an
+    // invite. Currently the server emits ERR_INVITEONLYCHAN (473).
+    handle.join("#founder-i").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#founder-i"),
+        "founder rejoined +i channel without invite",
+    )
+    .await;
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+// ── Test: Founder bypasses +m on speak ──────────────────────────────
+//
+// Standard IRC behavior: the channel founder (and DID-ops) can speak in
+// a `+m` (moderated) channel without needing explicit voice/op status.
+// freeq currently gates speak on ops/halfops/voiced membership only —
+// founders without an explicit op grant are silenced in their own
+// moderated channel.
+
+#[tokio::test]
+async fn founder_bypasses_moderated_on_speak() {
+    let private_key = PrivateKey::generate_ed25519();
+    let did_str = "did:plc:foundermoderated";
+    let doc = did::make_test_did_document(did_str, &private_key.public_key_multibase());
+
+    let mut docs = HashMap::new();
+    docs.insert(did_str.to_string(), doc);
+    let resolver = DidResolver::static_map(docs);
+
+    let (addr, server_handle) = start_test_server(resolver).await;
+
+    let signer: Arc<dyn ChallengeSigner> =
+        Arc::new(KeySigner::new(did_str.to_string(), private_key));
+
+    let config = ConnectConfig {
+        server_addr: addr.to_string(),
+        nick: "alice".to_string(),
+        user: "alice".to_string(),
+        realname: "Alice".to_string(),
+        ..Default::default()
+    };
+
+    let (handle, mut events) = client::connect(config, Some(signer));
+
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Authenticated { .. }),
+        "Alice authenticated",
+    )
+    .await;
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Registered { .. }),
+        "Alice registered",
+    )
+    .await;
+
+    // Alice creates #founder-m as founder. On create, the JOIN handler
+    // auto-ops her at the *session* level (ch.ops contains her session id),
+    // so to actually exercise the founder-bypass we deop her — then her
+    // ability to speak depends purely on founder_did matching her DID.
+    handle.join("#founder-m").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#founder-m"),
+        "Alice joined as founder",
+    )
+    .await;
+
+    // Set +m first (while still op — can't change modes after deop).
+    handle.raw("MODE #founder-m +m").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::ModeChanged { mode, .. } if mode == "+m"),
+        "+m set",
+    )
+    .await;
+
+    // Now drop Alice's session-level op grant. founder_did is unchanged.
+    handle.raw("MODE #founder-m -o alice").await.unwrap();
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::ModeChanged { mode, .. } if mode == "-o"),
+        "alice de-opped",
+    )
+    .await;
+
+    // Alice tries to speak in her own moderated channel — without ops,
+    // halfops, or voice. Should pass via founder DID bypass.
+    handle.privmsg("#founder-m", "hello").await.unwrap();
+
+    // The bot's own message should round-trip back via echo-message tag,
+    // confirming the server accepted and relayed the PRIVMSG. If the +m
+    // gate rejects, we'd get an ERR_CANNOTSENDTOCHAN (404) RawLine
+    // instead and the matcher would never fire.
+    expect_event(
+        &mut events,
+        2000,
+        |e| matches!(e, Event::Message { from, target, text, .. }
+                     if from == "alice" && target == "#founder-m" && text == "hello"),
+        "founder spoke in +m channel",
+    )
+    .await;
+
+    handle.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
 // ── Test: Message history replay on JOIN ────────────────────────────
 
 #[tokio::test]
@@ -1959,7 +2154,7 @@ async fn tls_connection() {
         realname: "TLS User".to_string(),
         tls: true,
         tls_insecure: true, // Self-signed cert
-        web_token: None,
+        ..Default::default()
     };
 
     let (handle, mut events) = client::connect(tls_config, None);

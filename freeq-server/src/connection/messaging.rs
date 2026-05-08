@@ -286,9 +286,16 @@ pub(super) fn handle_tagmsg(
     // Rich clients get TAGMSG, plain clients get fallback PRIVMSG (if any)
     if target.starts_with('#') || target.starts_with('&') {
         // Channel TAGMSG — enforce +n (no external messages) and +m (moderated)
+        // Resolve sender DID once, before taking the channels lock.
+        let sender_did = state.session_dids.lock().get(&conn.id).cloned();
         {
             let channels = state.channels.lock();
             if let Some(ch) = channels.get(target) {
+                // Founder + persistent DID-ops bypass +m. (+n is membership-based;
+                // a non-member can't be founder anyway, so no bypass needed there.)
+                let is_did_authority = sender_did.as_deref().is_some_and(|d| {
+                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
+                });
                 // +n: must be a member to send
                 if ch.no_ext_msg && !ch.members.contains(&conn.id) {
                     let nick = conn.nick_or_star();
@@ -304,6 +311,7 @@ pub(super) fn handle_tagmsg(
                 }
                 // +m: must be voiced or op to send
                 if ch.moderated
+                    && !is_did_authority
                     && !ch.ops.contains(&conn.id)
                     && !ch.halfops.contains(&conn.id)
                     && !ch.voiced.contains(&conn.id)
@@ -470,9 +478,15 @@ pub(super) fn handle_privmsg(
 
     if is_channel {
         // Channel message — enforce +n (no external messages) and +m (moderated)
+        // Resolve sender DID once, before taking the channels lock.
+        let sender_did = state.session_dids.lock().get(&conn.id).cloned();
         {
             let channels = state.channels.lock();
             if let Some(ch) = channels.get(target) {
+                // Founder + persistent DID-ops bypass +m.
+                let is_did_authority = sender_did.as_deref().is_some_and(|d| {
+                    ch.founder_did.as_deref() == Some(d) || ch.did_ops.contains(d)
+                });
                 // +n: must be a member to send
                 if ch.no_ext_msg && !ch.members.contains(&conn.id) {
                     // NOTICE must never generate error replies (RFC 2812 3.3.2)
@@ -491,6 +505,7 @@ pub(super) fn handle_privmsg(
                 }
                 // +m: must be voiced or op to send
                 if ch.moderated
+                    && !is_did_authority
                     && !ch.ops.contains(&conn.id)
                     && !ch.halfops.contains(&conn.id)
                     && !ch.voiced.contains(&conn.id)
