@@ -38,8 +38,15 @@ pub struct ActiveRoom {
 #[cfg(feature = "av-native")]
 impl IrohLiveBackend {
     pub async fn new(endpoint: iroh::Endpoint) -> Result<Self, String> {
+        // NB: do NOT call .with_router() here. iroh-live's internal Router
+        // calls `endpoint.set_alpns(...)` which would replace the freeq
+        // ALPNs (`freeq/iroh/1`, `freeq/s2s/1`) registered at endpoint bind
+        // time, breaking inbound client + S2S dials with TLS
+        // `no_application_protocol`. The unified Router is built in
+        // `crate::iroh::spawn_router`, which calls
+        // `Live::register_protocols` on the shared RouterBuilder so
+        // gossip + MoQ are mounted alongside freeq's protocols.
         let live = iroh_live::Live::builder(endpoint)
-            .with_router()
             .with_gossip()
             .spawn();
         tracing::info!(
