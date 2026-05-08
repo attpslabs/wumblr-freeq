@@ -45,7 +45,7 @@ async fn connect_guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<
         realname: format!("S2S Test ({nick})"),
         tls: false,
         tls_insecure: false,
-        web_token: None,
+        ..Default::default()
     })
     .await
     .unwrap_or_else(|e| panic!("Failed to connect {nick} to {addr}: {e}"));
@@ -57,7 +57,7 @@ async fn connect_guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<
         realname: format!("S2S Test ({nick})"),
         tls: false,
         tls_insecure: false,
-        web_token: None,
+        ..Default::default()
     };
 
     client::connect_with_stream(conn, config, None)

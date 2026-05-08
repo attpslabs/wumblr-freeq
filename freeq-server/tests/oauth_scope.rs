@@ -131,16 +131,24 @@ fn scope_satisfies_login_with_granular_grant() {
 
 #[test]
 fn scope_satisfies_blob_upload_with_granular_grant() {
+    // BlobUpload requires both a blob:* grant AND a repo:blue.irc.media
+    // grant — the upload path creates a record alongside the blob.
     assert!(scope_satisfies_purpose(
-        "atproto blob:image/*",
+        "atproto blob:image/* repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload
     ));
     assert!(scope_satisfies_purpose(
-        "atproto blob:*/*",
+        "atproto blob:*/* repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload
     ));
     // Identity-only grant must NOT be enough for upload.
     assert!(!scope_satisfies_purpose("atproto", OauthPurpose::BlobUpload));
+    // Blob grant alone (no record) must NOT be enough — record creation
+    // would fail at the PDS.
+    assert!(!scope_satisfies_purpose(
+        "atproto blob:image/*",
+        OauthPurpose::BlobUpload
+    ));
 }
 
 #[test]
@@ -204,13 +212,13 @@ fn requested_scopes_are_narrow_not_transition_generic() {
 #[test]
 fn scope_predicate_handles_extra_whitespace() {
     // Real PDS responses sometimes have multiple spaces; tabs are unusual
-    // but let's be tolerant.
+    // but let's be tolerant. BlobUpload needs blob: + repo:blue.irc.media.
     assert!(scope_satisfies_purpose(
-        "atproto    blob:image/*",
+        "atproto    blob:image/*    repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
     ));
     assert!(scope_satisfies_purpose(
-        "atproto\tblob:image/*",
+        "atproto\tblob:image/*\trepo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
     ));
     assert!(scope_satisfies_purpose("\n  atproto  \n", OauthPurpose::Login));
@@ -245,13 +253,14 @@ fn scope_predicate_accepts_blob_image_subtype_grant() {
     // of the wildcard. We accept it — the user has SOME image-upload
     // permission. NOTE: this is intentionally permissive; the upload
     // path doesn't enforce per-MIME beyond what the PDS itself enforces
-    // at the uploadBlob call.
+    // at the uploadBlob call. The repo:blue.irc.media grant is still
+    // required for the accompanying record creation.
     assert!(scope_satisfies_purpose(
-        "atproto blob:image/png",
+        "atproto blob:image/png repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
     ));
     assert!(scope_satisfies_purpose(
-        "atproto blob:image/jpeg",
+        "atproto blob:image/jpeg repo:blue.irc.media?action=create",
         OauthPurpose::BlobUpload,
     ));
 }

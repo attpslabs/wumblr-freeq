@@ -55,7 +55,7 @@ async fn guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<Event>) 
         realname: format!("S2S Adversarial ({nick})"),
         tls: false,
         tls_insecure: false,
-        web_token: None,
+        ..Default::default()
     })
     .await
     .unwrap_or_else(|e| panic!("Connect {nick}→{addr}: {e}"));
@@ -69,7 +69,7 @@ async fn guest(addr: &str, nick: &str) -> (ClientHandle, mpsc::Receiver<Event>) 
             realname: format!("S2S Adversarial ({nick})"),
             tls: false,
             tls_insecure: false,
-            web_token: None,
+            ..Default::default()
         },
         None,
     )
