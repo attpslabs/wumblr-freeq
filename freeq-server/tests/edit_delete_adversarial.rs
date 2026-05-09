@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
@@ -49,15 +48,6 @@ async fn run(addr: SocketAddr, f: impl FnOnce(SocketAddr) + Send + 'static) {
 
 struct C { reader: BufReader<TcpStream>, writer: TcpStream }
 impl C {
-    fn new(addr: SocketAddr, nick: &str) -> Self {
-        let s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let w = s.try_clone().unwrap();
-        let mut c = Self { reader: BufReader::new(s), writer: w };
-        c.tx(&format!("NICK {nick}"));
-        c.tx(&format!("USER {nick} 0 * :test"));
-        c
-    }
     fn with_caps(addr: SocketAddr, nick: &str) -> Self {
         let s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -527,7 +517,7 @@ async fn dm_edit_by_recipient_rejected() {
         // Bob tries to edit Alice's DM
         bob.send_edit("dmr_a", &msgid, "bob edited alice's dm");
         // Should be rejected
-        let fail = bob.maybe(|l| l.contains("FAIL"), 2000);
+        let _ = bob.maybe(|l| l.contains("FAIL"), 2000);
         // Either FAIL or silently dropped — either way, alice shouldn't see it
     }).await;
 }

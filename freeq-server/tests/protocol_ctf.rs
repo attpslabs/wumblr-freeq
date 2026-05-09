@@ -174,7 +174,7 @@ impl C {
 async fn ctf_19_unauthenticated_attacker_cannot_overwrite_anothers_prekey_bundle() {
     let victim_key = PrivateKey::generate_ed25519();
     let resolver = resolver_with(vec![(DID_VICTIM, &victim_key)]);
-    let (irc, web, state, _h) = start(resolver).await;
+    let (irc, web, _, _h) = start(resolver).await;
 
     // 1. Victim authenticates so the server has a session_dids entry
     //    for them. (The bug is that the upload endpoint considers

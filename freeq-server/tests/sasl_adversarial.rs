@@ -15,7 +15,6 @@ use freeq_sdk::client::{self, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 use freeq_sdk::event::Event;
-use tokio::sync::mpsc;
 
 const DID_A: &str = "did:plc:sasl_test_alice";
 const DID_B: &str = "did:plc:sasl_test_bob";
@@ -213,7 +212,6 @@ async fn sasl_unknown_did_returns_904() {
 
 #[tokio::test]
 async fn sasl_three_failures_disconnect() {
-    let key = PrivateKey::generate_ed25519();
     let resolver = make_resolver(vec![]);
     let (addr, _h) = start(resolver).await;
     run(addr, move |addr| {
@@ -393,7 +391,7 @@ async fn sasl_double_challenge_request() {
 
         // Request challenge twice — second should replace first
         c.tx("AUTHENTICATE ATPROTO-CHALLENGE");
-        let challenge1 = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge 1");
+        c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge 1");
         c.tx("AUTHENTICATE ATPROTO-CHALLENGE");
         let challenge2 = c.rx(|l| l.starts_with("AUTHENTICATE "), "challenge 2");
 
@@ -456,7 +454,7 @@ async fn sasl_empty_authenticate_parameter() {
         // Send AUTHENTICATE with empty parameter
         c.tx("AUTHENTICATE ");
         // Should get 904 or be silently ignored
-        let r = c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 1000);
+        let _ = c.maybe(|l| l.split_whitespace().nth(1) == Some("904"), 1000);
         // Either way, should be able to continue
         c.tx("CAP END");
         c.num("001");

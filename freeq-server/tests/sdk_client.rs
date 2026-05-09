@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
-use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
+use freeq_sdk::client::{self, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
 use freeq_sdk::did::{self, DidResolver};
 use freeq_sdk::event::Event;

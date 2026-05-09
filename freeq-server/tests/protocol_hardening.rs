@@ -243,7 +243,7 @@ async fn nick_no_param() {
         // NICK with no argument
         c.tx("NICK");
         // Should get 431 ERR_NONICKNAMEGIVEN
-        let result = c.maybe(|l| {
+        let _ = c.maybe(|l| {
             let n = l.split_whitespace().nth(1).unwrap_or("");
             n == "431"
         }, 1000);
@@ -578,7 +578,7 @@ async fn nick_empty_string() {
         // Try changing to empty nick via trailing colon
         c.tx("NICK :");
         // Should get 431 ERR_NONICKNAMEGIVEN or 432 ERR_ERRONEUSNICKNAME
-        let result = c.maybe(|l| {
+        let _ = c.maybe(|l| {
             let n = l.split_whitespace().nth(1).unwrap_or("");
             n == "431" || n == "432"
         }, 1000);
@@ -596,7 +596,7 @@ async fn nick_empty_string() {
 async fn per_ip_connection_limit() {
     run(|addr| {
         // Open 20 connections (the per-IP limit)
-        let mut clients: Vec<C> = (0..20).map(|i| {
+        let clients: Vec<C> = (0..20).map(|i| {
             let mut c = C::new(addr, &format!("iplim{i:02}"));
             c.reg();
             c
@@ -699,7 +699,7 @@ async fn userhost_command() {
         c.reg(); c.drain();
         c.tx("USERHOST uhtest");
         // Should get 302 RPL_USERHOST or be silently dropped
-        let result = c.maybe(|l| {
+        let _ = c.maybe(|l| {
             let n = l.split_whitespace().nth(1).unwrap_or("");
             n == "302" || n == "421" // 421 = ERR_UNKNOWNCOMMAND
         }, 1000);
@@ -763,7 +763,7 @@ async fn nick_change_multi_channel_broadcast() {
         b.rx(|l| l.contains("NICK") && l.contains("mc_alice_new"), "Bob sees nick change");
 
         // Carol (in both channels) should see it exactly once
-        let first = c.rx(|l| l.contains("NICK") && l.contains("mc_alice_new"), "Carol sees nick change");
+        c.rx(|l| l.contains("NICK") && l.contains("mc_alice_new"), "Carol sees nick change");
         // Carol should NOT get a duplicate
         let dup = c.maybe(|l| l.contains("NICK") && l.contains("mc_alice_new"), 300);
         assert!(dup.is_none(), "Carol should NOT get duplicate nick change notification");

@@ -5,7 +5,6 @@
 //! These target the critical path through which every web user authenticates.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use freeq_sdk::did::DidResolver;
 

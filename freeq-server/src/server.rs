@@ -4070,7 +4070,6 @@ mod s2s_adversarial_tests {
             ..Default::default()
         };
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let db_key = [0u8; 32];
         Arc::new(SharedState {
             server_name: config.server_name.clone(),
             challenge_store: crate::sasl::ChallengeStore::new(60),
@@ -4730,77 +4729,6 @@ mod s2s_adversarial_tests {
         ).await.expect("timeout waiting for DM").expect("channel closed");
         assert!(msg.contains("hey bob, private msg"), "Bob should receive DM text, got: {msg}");
         assert!(msg.contains("PRIVMSG bob"), "Should be addressed to bob, got: {msg}");
-    }
-
-    fn test_state_with_db() -> Arc<SharedState> {
-        let config = crate::config::ServerConfig {
-            listen_addr: "127.0.0.1:0".to_string(),
-            server_name: "test-s2s".to_string(),
-            challenge_timeout_secs: 60,
-            ..Default::default()
-        };
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let db = crate::db::Db::open_memory().unwrap();
-        Arc::new(SharedState {
-            server_name: config.server_name.clone(),
-            challenge_store: crate::sasl::ChallengeStore::new(60),
-            did_resolver: freeq_sdk::did::DidResolver::static_map(HashMap::new()),
-            connections: Mutex::new(HashMap::new()),
-            nick_to_session: Mutex::new(NickMap::new()),
-            session_dids: Mutex::new(HashMap::new()),
-            did_sessions: Mutex::new(HashMap::new()),
-            did_nicks: Mutex::new(HashMap::new()),
-            nick_owners: Mutex::new(HashMap::new()),
-            session_handles: Mutex::new(HashMap::new()),
-            channels: Mutex::new(HashMap::new()),
-            cap_message_tags: Mutex::new(HashSet::new()),
-            cap_multi_prefix: Mutex::new(HashSet::new()),
-            cap_echo_message: Mutex::new(HashSet::new()),
-            cap_server_time: Mutex::new(HashSet::new()),
-            cap_batch: Mutex::new(HashSet::new()),
-            cap_account_notify: Mutex::new(HashSet::new()),
-            cap_extended_join: Mutex::new(HashSet::new()),
-            cap_away_notify: Mutex::new(HashSet::new()),
-            cap_account_tag: Mutex::new(HashSet::new()),
-            server_opers: Mutex::new(HashSet::new()),
-            session_actor_class: Mutex::new(HashMap::new()),
-            provenance_declarations: Mutex::new(HashMap::new()),
-            agent_presence: Mutex::new(HashMap::new()),
-            agent_heartbeats: Mutex::new(HashMap::new()),
-            oauth_pending: Mutex::new(HashMap::new()),
-            oauth_complete: Mutex::new(HashMap::new()),
-            web_auth_tokens: Mutex::new(HashMap::new()),
-            web_sessions: Mutex::new(HashMap::new()),
-            login_pending: Mutex::new(HashMap::new()),
-            linked_identities: Mutex::new(HashMap::new()),
-            login_completions: Mutex::new(HashMap::new()),
-            session_iroh_ids: Mutex::new(HashMap::new()),
-            session_away: Mutex::new(HashMap::new()),
-            server_iroh_id: Mutex::new(Some("test-server-id".to_string())),
-            iroh_endpoint: Mutex::new(None),
-            iroh_router: Mutex::new(None),
-            av_sessions: Mutex::new(crate::av::AvSessionManager::new()),
-            av_media: Mutex::new(None),
-            s2s_manager: Mutex::new(None),
-            cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
-            db: Some(Mutex::new(db)),
-            config,
-            plugin_manager: crate::plugin::PluginManager::new(),
-            policy_engine: None,
-            prekey_bundles: Mutex::new(HashMap::new()),
-            msg_timestamps: Mutex::new(HashMap::new()),
-            ip_connections: Mutex::new(HashMap::new()),
-            msg_signing_key: signing_key,
-            boot_time: std::time::Instant::now(),
-            boot_timestamp: chrono::Utc::now(),
-            session_msg_keys: Mutex::new(HashMap::new()),
-            did_msg_keys: Mutex::new(HashMap::new()),
-            session_client_info: Mutex::new(HashMap::new()),
-            upload_tokens: Mutex::new(HashMap::new()),
-            ghost_sessions: Mutex::new(HashMap::new()),
-            spawned_agents: Mutex::new(HashMap::new()),
-            rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
-        })
     }
 
 }

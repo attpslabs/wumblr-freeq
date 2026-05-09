@@ -35,7 +35,7 @@ fn start_deadlock_detector() {
 use freeq_sdk::auth::{ChallengeSigner, KeySigner};
 use freeq_sdk::client::{self, ConnectConfig};
 use freeq_sdk::crypto::PrivateKey;
-use freeq_sdk::did::{self, DidResolver};
+use freeq_sdk::did::DidResolver;
 use freeq_sdk::event::Event;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -67,24 +67,6 @@ async fn start_test_server_with_db(
     };
     let server = freeq_server::server::Server::with_resolver(config, resolver);
     server.start().await.unwrap()
-}
-
-async fn start_test_server_with_web(
-    resolver: DidResolver,
-) -> (
-    std::net::SocketAddr,
-    std::net::SocketAddr,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-) {
-    let config = freeq_server::config::ServerConfig {
-        listen_addr: "127.0.0.1:0".to_string(),
-        web_addr: Some("127.0.0.1:0".to_string()),
-        server_name: "test-server".to_string(),
-        challenge_timeout_secs: 60,
-        ..Default::default()
-    };
-    let server = freeq_server::server::Server::with_resolver(config, resolver);
-    server.start_with_web().await.unwrap()
 }
 
 async fn start_test_server_with_web_and_db(
@@ -236,7 +218,7 @@ async fn expect_no_event(
 async fn did_key_auth_ed25519() {
     let (addr, server_handle) = start_test_server(empty_resolver()).await;
 
-    let (did, handle, mut events) = connect_did_key(addr, "keybot").await;
+    let (did, handle, _) = connect_did_key(addr, "keybot").await;
 
     assert!(did.starts_with("did:key:"));
 
@@ -873,7 +855,7 @@ async fn multiple_agents_different_classes() {
 async fn full_agent_lifecycle() {
     let (addr, server_handle) = start_test_server(empty_resolver()).await;
 
-    let (did, handle, mut events) = connect_did_key(addr, "lifecycle").await;
+    let (_, handle, mut events) = connect_did_key(addr, "lifecycle").await;
 
     // 1. Register as agent
     handle.register_agent("agent").await.unwrap();

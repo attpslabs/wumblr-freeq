@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use freeq_sdk::auth::{self, ChallengeSigner, KeySigner};
@@ -197,7 +196,7 @@ async fn deleted_messages_excluded_from_chathistory() {
 
         // Alice sends two messages
         alice.tx("PRIVMSG #delhist :keep this");
-        let m1 = bob.rx(|l| l.contains("keep this"), "msg1");
+        bob.rx(|l| l.contains("keep this"), "msg1");
         alice.tx("PRIVMSG #delhist :delete this");
         let m2 = bob.rx(|l| l.contains("delete this"), "msg2");
         let del_msgid = C::extract_msgid(&m2);
@@ -249,7 +248,6 @@ async fn edited_message_shows_new_text_in_history() {
 
         // History should contain the edit (either as separate edit entry or updated text)
         let has_edit = msgs.iter().any(|m| m.contains("edited text"));
-        let has_original = msgs.iter().any(|m| m.contains("original text") && !m.contains("edited"));
         // The edit should be visible in history
         assert!(has_edit, "Edited text should appear in history: {msgs:?}");
     }).await;

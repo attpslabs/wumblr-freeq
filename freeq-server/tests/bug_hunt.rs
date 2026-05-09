@@ -140,7 +140,7 @@ impl C {
     c.tx("JOIN #nametest"); c.num("366"); c.drain();
     c.tx("NAMES");
     // Should either list all visible channels or return 366 end
-    let r = c.maybe(|l| {
+    let _ = c.maybe(|l| {
         let n = l.split_whitespace().nth(1).unwrap_or("");
         n == "353" || n == "366"
     }, 1000);
@@ -267,7 +267,7 @@ impl C {
     q.tx("WHOIS wh_a,wh_b");
     // Should get 311 for BOTH nicks, or at least one
     let first = q.maybe(|l| l.split_whitespace().nth(1) == Some("311"), 1000);
-    if let Some(ref f) = first {
+    if first.is_some() {
         let second = q.maybe(|l| l.split_whitespace().nth(1) == Some("311"), 500);
         if second.is_none() {
             panic!("BUG: WHOIS only processes first nick in comma-separated list");
@@ -448,7 +448,7 @@ impl C {
     let mut c = C::new(a, "modenoex");
     c.reg(); c.drain();
     c.tx("MODE #doesntexist");
-    let r = c.maybe(|l| {
+    let _ = c.maybe(|l| {
         let n = l.split_whitespace().nth(1).unwrap_or("");
         n == "442" || n == "403" || n == "324"
     }, 1000);
@@ -463,7 +463,7 @@ impl C {
     c.reg(); c.drain();
     c.tx("TOPIC #doesntexist2");
     // Should get 442 or 403
-    let r = c.maybe(|l| {
+    let _ = c.maybe(|l| {
         let n = l.split_whitespace().nth(1).unwrap_or("");
         n == "442" || n == "403" || n == "331"
     }, 1000);
@@ -593,7 +593,7 @@ impl C {
     q.reg(); q.drain();
     q.tx("WHO whonicka");
     // Should get 352 for the nick, then 315
-    let r = q.maybe(|l| l.split_whitespace().nth(1) == Some("352"), 1000);
+    let _ = q.maybe(|l| l.split_whitespace().nth(1) == Some("352"), 1000);
     // Either returns results or 315 end
     q.num("315");
 }).await; }
