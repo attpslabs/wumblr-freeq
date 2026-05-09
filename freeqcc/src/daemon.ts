@@ -8,7 +8,7 @@ import { loadOrPromptOwner } from "./owner.js";
 import { loadOrMintDelegation } from "./delegation.js";
 import { connect, type Connected } from "./connect.js";
 import { evaluate, newGateState, type GateState } from "./gate.js";
-import { dispatchToClaude } from "./dispatch.js";
+import { dispatchToClaudeStreaming } from "./dispatch.js";
 import { logRefused } from "./audit.js";
 
 export interface DaemonOptions {
@@ -146,19 +146,137 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
       return;
     }
 
-    // Dispatch — set executing presence, run claude, send reply, set idle.
+    // Dispatch — set executing presence, stream claude into the chat as it
+    // produces tokens, then mark final.
     conn.client.raw("PRESENCE :state=executing;status=responding to owner");
+    console.log(`[dispatch] ${fromNick} → ${replyTarget}: ${text.slice(0, 80)}`);
+
+    // Streaming bookkeeping. The first PRIVMSG carries +freeq.at/streaming=1
+    // and the SDK auto-includes msgid in tags. Server overwrites msgid with
+    // its own; we recover the assigned msgid via echo-message (SDK emits a
+    // self message event with msg.id once the server has acked).
+    let streamMsgId: string | null = null;
+    let streamSent = false;
+    let pendingFlush: NodeJS.Timeout | null = null;
+    let lastFlushedText = "";
+    let latestText = "";
+    const FLUSH_INTERVAL_MS = 500;
+
+    // Listen for our own echo to capture the server-assigned msgid.
+    const onEcho = (
+      _channel: string,
+      msg: { id?: string; isSelf?: boolean; tags?: Record<string, string> },
+    ): void => {
+      if (!msg.isSelf || streamMsgId) return;
+      if (msg.tags?.["+freeq.at/streaming"] !== "1") return;
+      if (msg.id) streamMsgId = msg.id;
+    };
+    conn.client.on("message", onEcho);
+
+    const sendStreamingPrivmsg = (chunkText: string): void => {
+      // Initial: tag streaming=1, no edit ref. SDK assigns msgid via echo.
+      const safe = chunkText.replace(/[\r\n]/g, " ").slice(0, 1500) || "…";
+      conn.client.raw(
+        `@+freeq.at/streaming=1 PRIVMSG ${replyTarget} :${safe}`,
+      );
+      streamSent = true;
+      lastFlushedText = chunkText;
+    };
+
+    const sendStreamingEdit = (chunkText: string, isFinal: boolean): void => {
+      if (!streamMsgId) return; // can't edit without msgid yet
+      const safe = chunkText.replace(/[\r\n]/g, " ").slice(0, 1500) || "…";
+      const tag = isFinal
+        ? `+draft/edit=${streamMsgId}`
+        : `+draft/edit=${streamMsgId};+freeq.at/streaming=1`;
+      conn.client.raw(`@${tag} PRIVMSG ${replyTarget} :${safe}`);
+      lastFlushedText = chunkText;
+    };
+
+    const flush = (isFinal: boolean): void => {
+      if (latestText === lastFlushedText && !isFinal) return;
+      if (!streamSent) {
+        sendStreamingPrivmsg(latestText);
+      } else {
+        sendStreamingEdit(latestText, isFinal);
+      }
+    };
+
+    const scheduleFlush = (): void => {
+      if (pendingFlush) return;
+      pendingFlush = setTimeout(() => {
+        pendingFlush = null;
+        flush(false);
+      }, FLUSH_INTERVAL_MS);
+    };
+
     try {
-      console.log(`[dispatch] ${fromNick} → ${replyTarget}: ${text.slice(0, 80)}`);
-      const { reply, durationMs } = await dispatchToClaude(text);
-      const safeReply = reply || "(claude returned empty)";
-      conn.client.sendMessage(replyTarget, safeReply);
-      console.log(`[reply] ${durationMs}ms: ${safeReply.slice(0, 80)}`);
-    } catch (err) {
-      const message = (err as Error).message;
-      conn.client.sendMessage(replyTarget, `(error invoking claude: ${message.slice(0, 200)})`);
-      console.error(`[dispatch error]`, err);
+      await dispatchToClaudeStreaming(text, {
+        onChunk: (accumulated) => {
+          latestText = accumulated;
+          if (!streamSent) {
+            // First chunk: send immediately so msgid lookup starts.
+            sendStreamingPrivmsg(accumulated);
+          } else {
+            scheduleFlush();
+          }
+        },
+        onComplete: async (final, _sessionId, durationMs) => {
+          if (pendingFlush) {
+            clearTimeout(pendingFlush);
+            pendingFlush = null;
+          }
+          latestText = final || latestText || "(claude returned empty)";
+          if (!streamSent) {
+            // Never streamed (model returned only the result event).
+            // Fire one PRIVMSG with the final text, no streaming tag.
+            const safe = latestText.replace(/[\r\n]/g, " ").slice(0, 1500);
+            conn.client.raw(`PRIVMSG ${replyTarget} :${safe}`);
+          } else {
+            // We sent a streaming PRIVMSG but the echo with the server-
+            // assigned msgid may not have arrived yet. Wait up to 2s; if
+            // no msgid, fall back to a fresh PRIVMSG (the streaming-tagged
+            // first chunk will look incomplete to clients, but at least
+            // the user gets the final reply).
+            const deadline = Date.now() + 2000;
+            while (!streamMsgId && Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            if (streamMsgId) {
+              flush(true); // final edit clears the streaming tag
+            } else {
+              const safe = latestText.replace(/[\r\n]/g, " ").slice(0, 1500);
+              conn.client.raw(`PRIVMSG ${replyTarget} :${safe}`);
+              console.warn(
+                `[stream] msgid never arrived via echo — sent fallback PRIVMSG`,
+              );
+            }
+          }
+          console.log(
+            `[reply] ${durationMs}ms: ${latestText.slice(0, 80)}`,
+          );
+        },
+        onError: (err) => {
+          if (pendingFlush) {
+            clearTimeout(pendingFlush);
+            pendingFlush = null;
+          }
+          const message = (err as Error).message;
+          if (streamSent && streamMsgId) {
+            conn.client.raw(
+              `@+draft/edit=${streamMsgId} PRIVMSG ${replyTarget} :(claude error: ${message.slice(0, 200)})`,
+            );
+          } else {
+            conn.client.sendMessage(
+              replyTarget,
+              `(error invoking claude: ${message.slice(0, 200)})`,
+            );
+          }
+          console.error(`[dispatch error]`, err);
+        },
+      });
     } finally {
+      conn.client.off("message", onEcho);
       conn.client.raw("PRESENCE :state=online");
     }
   };
