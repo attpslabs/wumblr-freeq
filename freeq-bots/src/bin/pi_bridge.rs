@@ -104,6 +104,7 @@ async fn run_once(cfg: Config) -> anyhow::Result<()> {
         tls: cfg.server_addr.ends_with(":6697") || cfg.server_addr.ends_with(":443"),
         tls_insecure: false,
         web_token,
+        websocket_url: None,
     };
 
     let (handle, mut events) = client::connect(config, None);

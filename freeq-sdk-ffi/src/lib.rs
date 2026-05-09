@@ -584,9 +584,6 @@ fn convert_event(event: &freeq_sdk::event::Event) -> FreeqEvent {
             info: info.clone(),
         },
         Event::RawLine(_) => FreeqEvent::Notice { text: String::new() },
-        _ => FreeqEvent::Notice {
-            text: String::new(),
-        },
     }
 }
 
@@ -1000,9 +997,7 @@ pub struct FreeqAv {
 }
 
 #[cfg(not(feature = "av"))]
-pub struct FreeqAv {
-    connected: Mutex<bool>,
-}
+pub struct FreeqAv;
 
 #[cfg(feature = "av")]
 impl FreeqAv {

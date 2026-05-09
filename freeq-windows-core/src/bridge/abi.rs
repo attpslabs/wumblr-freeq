@@ -195,6 +195,7 @@ pub unsafe extern "C" fn freeq_win_connect(handle: u64) -> i32 {
                 tls: core.tls,
                 tls_insecure: false,
                 web_token,
+                websocket_url: None,
             };
 
             let (client_handle, mut event_rx) = freeq_sdk::client::connect(config, None);

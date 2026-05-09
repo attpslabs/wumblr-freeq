@@ -336,6 +336,7 @@ async fn run_bot(
         tls,
         tls_insecure: false,
         web_token: None,
+        websocket_url: None,
     };
 
     let (handle, mut events) = client::connect(config, None);

@@ -24,13 +24,13 @@ async fn main() -> Result<()> {
         tls: true,
         tls_insecure: false,
         web_token: None,
+        websocket_url: None,
     };
 
     let conn = client::establish_connection(&config).await?;
     let (handle, mut events) = client::connect_with_stream(conn, config, None);
 
     // Wait for registration, then join
-    let mut joined = false;
     loop {
         match events.recv().await {
             Some(Event::Registered { nick }) => {
@@ -39,7 +39,6 @@ async fn main() -> Result<()> {
             }
             Some(Event::Joined { channel: ch, nick }) => {
                 eprintln!("Joined {ch} as {nick}");
-                joined = true;
                 break;
             }
             Some(Event::ServerNotice { text }) => {
@@ -53,9 +52,6 @@ async fn main() -> Result<()> {
             }
             None => anyhow::bail!("Event channel closed"),
         }
-    }
-    if !joined {
-        anyhow::bail!("Failed to join {channel}");
     }
 
     // Small delay for server to settle

@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
         tls: args.tls,
         tls_insecure: false,
         web_token: None,
+        websocket_url: None,
     })
     .await?;
 
@@ -115,6 +116,7 @@ async fn main() -> Result<()> {
         tls: args.tls,
         tls_insecure: false,
         web_token: None,
+        websocket_url: None,
     };
 
     let (handle, mut events) = client::connect_with_stream(conn, config, None);

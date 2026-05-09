@@ -186,6 +186,7 @@ async fn main() -> Result<()> {
         tls: args.tls || args.server.ends_with(":6697"),
         tls_insecure: false,
         web_token: None,
+        websocket_url: None,
     };
 
     let reconnect = ReconnectConfig {

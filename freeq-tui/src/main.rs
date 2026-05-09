@@ -279,6 +279,7 @@ async fn main() -> Result<()> {
             tls: resolved.tls,
             tls_insecure: resolved.tls_insecure,
             web_token: None,
+            websocket_url: None,
         })
         .await?
     };
@@ -291,6 +292,7 @@ async fn main() -> Result<()> {
         tls: resolved.tls,
         tls_insecure: resolved.tls_insecure,
         web_token: None,
+        websocket_url: None,
     };
 
     let (mut handle, mut events) =

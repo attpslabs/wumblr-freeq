@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
             tls: args.tls,
             tls_insecure: args.tls,
             web_token: None,
+            websocket_url: None,
         };
 
         let (handle, events) = freeq_sdk::client::connect(config, None);

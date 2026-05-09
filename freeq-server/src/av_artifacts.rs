@@ -79,7 +79,7 @@ impl SummaryBackend for StubSummaryBackend {
 pub async fn generate_session_artifacts(
     session: &AvSession,
     state: &std::sync::Arc<crate::server::SharedState>,
-    transcript_backend: &dyn TranscriptBackend,
+    _transcript_backend: &dyn TranscriptBackend,
     summary_backend: &dyn SummaryBackend,
 ) {
     let session_id = &session.id;
