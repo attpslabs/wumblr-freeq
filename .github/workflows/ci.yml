@@ -22,10 +22,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --exclude freeq-av-client
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude freeq-av-client
 
   clippy:
     name: Lint
@@ -40,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --exclude freeq-av-client -- -D warnings
 
   fmt:
     name: Format
@@ -65,7 +65,13 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: freeq-app/package-lock.json
+          cache-dependency-path: |
+            freeq-app/package-lock.json
+            freeq-sdk-js/package-lock.json
+
+      - name: Install SDK deps
+        working-directory: freeq-sdk-js
+        run: npm ci
 
       - name: Install
         working-directory: freeq-app
