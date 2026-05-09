@@ -50,6 +50,23 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
   console.log(`✓ connected as ${conn.nick}`);
   console.log(`  DM @${conn.nick} from @${owner.handle} to talk to your local Claude Code.`);
 
+  // ── Bot's own channel ──
+  // The freeq web client creates / uses #<bot-nick> as the conversation
+  // surface for bots, so messages a user thinks they're DMing actually
+  // land there. Auto-join so we receive them. Channel messages from the
+  // owner are routed through the same gate as DMs.
+  const botChannel = `#${conn.nick}`;
+  conn.client.raw(`JOIN ${botChannel}`);
+  console.log(`  Auto-joined ${botChannel} (alternate conversation surface).`);
+
+  // ── Raw wire debug (FREEQCC_DEBUG_RAW=1) ──
+  if (process.env.FREEQCC_DEBUG_RAW === "1") {
+    conn.client.on("raw", (line: string) => {
+      // Dump every incoming line. Noisy but invaluable when DMs go missing.
+      console.log(`[raw] ${line}`);
+    });
+  }
+
   // ── Owner-DID gate + claude dispatch (phase 6) ──
   //
   // We track sender DIDs via the SDK's `memberDid` event (fires on WHOIS).
@@ -76,6 +93,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     fromNick: string,
     text: string,
     msgTags: Record<string, string>,
+    replyTarget: string,
   ): Promise<void> => {
     // Try to resolve sender DID synchronously: account-tag, then cache.
     const didFromTag = msgTags["account"];
@@ -116,7 +134,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
       const refusalText = senderDid
         ? `I'm @${owner.handle}'s agent. I only respond to them.`
         : `I'm @${owner.handle}'s agent and I couldn't verify your identity. I only respond to authenticated users on @${owner.handle}'s allowlist.`;
-      conn.client.sendMessage(fromNick, refusalText);
+      conn.client.sendMessage(replyTarget, refusalText);
       await logRefused({
         ts: new Date().toISOString(),
         fromNick,
@@ -131,14 +149,14 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     // Dispatch — set executing presence, run claude, send reply, set idle.
     conn.client.raw("PRESENCE :state=executing;status=responding to owner");
     try {
-      console.log(`[dispatch] ${fromNick}: ${text.slice(0, 80)}`);
+      console.log(`[dispatch] ${fromNick} → ${replyTarget}: ${text.slice(0, 80)}`);
       const { reply, durationMs } = await dispatchToClaude(text);
       const safeReply = reply || "(claude returned empty)";
-      conn.client.sendMessage(fromNick, safeReply);
+      conn.client.sendMessage(replyTarget, safeReply);
       console.log(`[reply] ${durationMs}ms: ${safeReply.slice(0, 80)}`);
     } catch (err) {
       const message = (err as Error).message;
-      conn.client.sendMessage(fromNick, `(error invoking claude: ${message.slice(0, 200)})`);
+      conn.client.sendMessage(replyTarget, `(error invoking claude: ${message.slice(0, 200)})`);
       console.error(`[dispatch error]`, err);
     } finally {
       conn.client.raw("PRESENCE :state=online");
@@ -157,11 +175,18 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
       },
     ) => {
       if (msg.isSelf) return;
-      if (channel.startsWith("#") || channel.startsWith("&")) return;
-      // channel === fromNick on a DM. Use msg.from as the canonical sender.
-      void handleDm(msg.from, msg.text, msg.tags ?? {}).catch((e) => {
-        console.error("[handleDm error]", e);
-      });
+      const isChannel = channel.startsWith("#") || channel.startsWith("&");
+      // Treat the bot's own channel (#<bot-nick>) as a DM surface — that's
+      // where freeq web clients actually deliver "DMs to a bot". Other
+      // channels: ignore.
+      if (isChannel && channel.toLowerCase() !== botChannel.toLowerCase()) return;
+      // For DMs `channel === fromNick`. For #bot-channel `channel === botChannel`.
+      // Either way, msg.from is the canonical sender nick.
+      void handleDm(msg.from, msg.text, msg.tags ?? {}, isChannel ? channel : msg.from).catch(
+        (e) => {
+          console.error("[handleDm error]", e);
+        },
+      );
     },
   );
 
