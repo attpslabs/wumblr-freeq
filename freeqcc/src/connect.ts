@@ -54,6 +54,13 @@ export async function connect(opts: ConnectOptions): Promise<Connected> {
       token: "",
       pdsUrl: "",
     },
+    // The agent already has a long-lived ed25519 identity (its did:key);
+    // skip the SDK's auto-mint of a separate per-session MSGSIG key. The
+    // server's resolve_signature() path will server-sign on our behalf
+    // when we send messages without a client signature, which is fine
+    // for v1.0. (Future: wire opts.identity.didKey through to a real
+    // client signer.)
+    autoMsgSig: false,
   });
 
   // ── Lifecycle: announce identity each time we become ready ──
@@ -66,6 +73,14 @@ export async function connect(opts: ConnectOptions): Promise<Connected> {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
+    }
+
+    // Reclaim-rename: freeq's ghost-session reclaim adopts the previous
+    // nick for multi-device continuity (registration.rs "Adopt the ghost's
+    // nick"). If the user asked for a different nick this run, force the
+    // rename now.
+    if (client.nick && client.nick !== opts.nick) {
+      client.raw(`NICK ${opts.nick}`);
     }
 
     // PROVENANCE: send the FreeqBotDelegation/v1 cert as base64url JSON.
