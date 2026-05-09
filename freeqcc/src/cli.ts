@@ -2,8 +2,8 @@
 // freeqcc CLI: launch | status | stop | doctor.
 import { Command } from "commander";
 import prompts from "prompts";
-import { execSync } from "node:child_process";
-import { readFile, writeFile, unlink, stat } from "node:fs/promises";
+import { execSync, spawn } from "node:child_process";
+import { open, readFile, writeFile, unlink, stat } from "node:fs/promises";
 import { paths, ensureDir } from "./paths.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { loadOrPromptOwner } from "./owner.js";
@@ -24,7 +24,11 @@ program
   .description("Launch the freeqcc agent (first run prompts for handle + bot nick).")
   .option("--nick <nick>", "Override the bot nick (otherwise loaded from config or prompted)")
   .option("--server <url>", "Override the freeq WebSocket URL")
-  .action(async (opts: { nick?: string; server?: string }) => {
+  .option(
+    "--detach",
+    "Fork into the background (logs to ~/.freeqcc/daemon.log). Prompts complete in the foreground first.",
+  )
+  .action(async (opts: { nick?: string; server?: string; detach?: boolean }) => {
     const owner = await loadOrPromptOwner();
     const config = await loadConfig();
     const cliOverride = opts.nick;
@@ -60,6 +64,26 @@ program
     } else if (cliOverride && cliOverride !== stored) {
       // User passed --nick that differs from stored config — persist the new one.
       await saveConfig({ nick, serverUrl: opts.server ?? config?.serverUrl });
+    }
+
+    if (opts.detach) {
+      // Fork a fresh `freeqcc launch` subprocess (without --detach), wired
+      // to the log file. Parent exits after printing the child pid; child
+      // writes its own pid file inside the spawned action.
+      await ensureDir();
+      const logFh = await open(paths.daemonLog, "a", 0o600);
+      const args = process.argv.slice(2).filter((a) => a !== "--detach");
+      const child = spawn(process.argv0, [process.argv[1], ...args], {
+        detached: true,
+        stdio: ["ignore", logFh.fd, logFh.fd],
+        env: { ...process.env, FREEQCC_DETACHED: "1" },
+      });
+      child.unref();
+      await logFh.close();
+      console.log(`freeqcc launched (pid ${child.pid}); logs → ${paths.daemonLog}`);
+      console.log(`  freeqcc status   — show live state`);
+      console.log(`  freeqcc stop     — clean shutdown`);
+      return;
     }
 
     // Write our pid before connecting so `freeqcc status` and `stop` work.
