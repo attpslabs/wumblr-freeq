@@ -33,6 +33,9 @@ export interface DispatchCapability {
   controlSock: string;
   token: string;
   isOwner: boolean;
+  /** Action names this dispatch's sender is allowed to invoke. Owner has the
+   *  full set; allowlisted DIDs get whatever was granted; others get []. */
+  grantedActions: string[];
   replyTarget: string;
 }
 
@@ -47,19 +50,25 @@ DIFFERENT target than where you're replying, change nick), use the Bash tool to 
 
     freeqcc send <action> [args...]
 
-Available actions:
+Action vocabulary:
   freeqcc send join "#channel"
   freeqcc send part "#channel" ["reason"]
   freeqcc send privmsg "<target>" "<text>"   # for messages to OTHER targets
   freeqcc send notice "<target>" "<text>"
   freeqcc send nick "<newnick>"
 
-Each call exits 0 on success, non-zero on error (with stderr explaining why).
-The capability token in your env is single-dispatch — it expires when this turn ends.
-Don't try to persist or share it.
+The set of actions YOU specifically are allowed to invoke for THIS turn is in \
+\`$FREEQCC_DISPATCH_GRANTED_ACTIONS\` (comma-separated). If the action the user \
+asks for isn't in that list, do NOT call \`freeqcc send\` for it — the daemon \
+will refuse with "action not granted". Instead, politely tell the user what \
+you're allowed to do and suggest they ask the bot's owner to grant the missing \
+capability via \`freeqcc grant <their-did> <action>\`.
 
-If FREEQCC_DISPATCH_IS_OWNER is "0" the daemon will refuse all actions; you should \
-politely decline IRC-action requests and explain that only the bot's owner can authorize them.
+If \`$FREEQCC_DISPATCH_GRANTED_ACTIONS\` is empty, you can chat but can't drive any \
+IRC actions; tell the user that.
+
+The capability token in your env is single-dispatch — it expires when this turn \
+ends. Don't try to persist or share it.
 `;
 
 interface SessionFile {
@@ -223,6 +232,7 @@ async function runStreaming(
     childEnv.FREEQCC_DISPATCH_TOKEN = capability.token;
     childEnv.FREEQCC_DISPATCH_IS_OWNER = capability.isOwner ? "1" : "0";
     childEnv.FREEQCC_DISPATCH_REPLY_TARGET = capability.replyTarget;
+    childEnv.FREEQCC_DISPATCH_GRANTED_ACTIONS = capability.grantedActions.join(",");
   }
 
   const startedAt = Date.now();

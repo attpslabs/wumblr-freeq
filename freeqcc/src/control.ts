@@ -18,8 +18,15 @@ import { randomUUID } from "node:crypto";
 import { paths, ensureDir } from "./paths.js";
 
 export interface TokenContext {
+  /** Marker only; auth decisions are made via `actions` below. */
   isOwner: boolean;
+  /** Action names this token is allowed to invoke. Owner gets the full set
+   *  (see allowlist.OWNER_ACTIONS); allowlisted DIDs get their granted set;
+   *  anyone else gets [] (and never reaches a control-socket request). */
+  actions: Set<string>;
   replyTarget: string;
+  /** Sender DID — for log lines and audit. */
+  senderDid: string | null;
   expiresAt: number; // ms epoch
 }
 
@@ -28,9 +35,13 @@ const HARD_TTL_MS = 10 * 60 * 1000; // 10 minutes
 export class TokenStore {
   private map = new Map<string, TokenContext>();
 
-  mint(ctx: Omit<TokenContext, "expiresAt">): string {
+  mint(ctx: Omit<TokenContext, "expiresAt" | "actions"> & { actions: Iterable<string> }): string {
     const token = randomUUID();
-    this.map.set(token, { ...ctx, expiresAt: Date.now() + HARD_TTL_MS });
+    this.map.set(token, {
+      ...ctx,
+      actions: new Set(ctx.actions),
+      expiresAt: Date.now() + HARD_TTL_MS,
+    });
     return token;
   }
 
@@ -87,14 +98,6 @@ export interface IrcSink {
   raw(line: string): void;
   readonly nick: string;
 }
-
-const OWNER_ONLY_ACTIONS = new Set([
-  "join",
-  "part",
-  "privmsg",
-  "notice",
-  "nick",
-]);
 
 function asString(v: unknown, name: string): string {
   if (typeof v !== "string") throw new Error(`bad args: ${name} must be a string`);
@@ -225,14 +228,20 @@ export async function startControlServer(opts: ControlServerOptions): Promise<Co
       if (!ctx) {
         return reply({ ok: false, error: "invalid or expired token" });
       }
-      if (OWNER_ONLY_ACTIONS.has(action) && !ctx.isOwner) {
-        log(`[control] denied non-owner action: ${action}`);
-        return reply({ ok: false, error: "owner-only action" });
+      if (!ctx.actions.has(action)) {
+        const grants = Array.from(ctx.actions);
+        log(`[control] denied: action '${action}' not granted to ${ctx.senderDid ?? "(no DID)"} (granted: ${grants.join(",") || "none"})`);
+        const have = grants.length > 0 ? grants.join(", ") : "none";
+        return reply({
+          ok: false,
+          error: `action '${action}' not granted; you have: ${have}`,
+        });
       }
 
       try {
         const result = runAction(action, args, opts.sink);
-        log(`[control] ${ctx.isOwner ? "owner" : "allowlisted"} ran ${action} ${JSON.stringify(args).slice(0, 200)}`);
+        const role = ctx.isOwner ? "owner" : (ctx.senderDid ?? "allowlisted");
+        log(`[control] ${role} ran ${action} ${JSON.stringify(args).slice(0, 200)}`);
         reply({ ok: true, ...result });
       } catch (err) {
         const msg = (err as Error).message;

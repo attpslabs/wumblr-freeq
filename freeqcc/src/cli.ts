@@ -234,6 +234,97 @@ program
     }
   });
 
+// ── grants / grant / revoke ──────────────────────────────────────────
+//
+// Edits ~/.freeqcc/allowlist.json. The running daemon fs.watches this file
+// and reloads on change — no restart needed.
+
+program
+  .command("grants")
+  .description("List allowlisted DIDs and the actions each is granted.")
+  .action(async () => {
+    const { loadAllowlist, OWNER_ACTIONS } = await import("./allowlist.js");
+    const owner = await safeLoadOwner();
+    if (owner) {
+      console.log(`owner:    ${owner.did}  [${OWNER_ACTIONS.join(", ")}]`);
+    }
+    const al = await loadAllowlist();
+    if (al.length === 0) {
+      console.log("(no extra DIDs in allowlist)");
+      return;
+    }
+    for (const e of al) {
+      const acts = e.actions && e.actions.length > 0 ? e.actions.join(", ") : "chat-only";
+      console.log(`${e.did}${e.label ? `  (${e.label})` : ""}  [${acts}]`);
+    }
+  });
+
+program
+  .command("grant <did> <action>")
+  .description(
+    "Grant <did> the right to invoke <action>. Adds the entry if new. " +
+      "Action must be one of: join, part, privmsg, notice, nick.",
+  )
+  .option("--label <label>", "Optional human-readable label")
+  .action(async (did: string, action: string, opts: { label?: string }) => {
+    const { loadAllowlist, saveAllowlist, OWNER_ACTIONS } = await import(
+      "./allowlist.js"
+    );
+    if (!OWNER_ACTIONS.includes(action)) {
+      console.error(
+        `unknown action '${action}'. Known: ${OWNER_ACTIONS.join(", ")}.`,
+      );
+      process.exit(1);
+    }
+    if (!did.startsWith("did:")) {
+      console.error(`'${did}' doesn't look like a DID (expected did:plc:… or did:key:…)`);
+      process.exit(1);
+    }
+    const al = await loadAllowlist();
+    let entry = al.find((e) => e.did === did);
+    if (!entry) {
+      entry = { did, label: opts.label, actions: [] };
+      al.push(entry);
+    } else if (opts.label && !entry.label) {
+      entry.label = opts.label;
+    }
+    entry.actions = entry.actions ?? [];
+    if (!entry.actions.includes(action)) entry.actions.push(action);
+    await saveAllowlist(al);
+    console.log(
+      `granted ${action} to ${did}${entry.label ? ` (${entry.label})` : ""}`,
+    );
+    console.log("(running daemon reloads the allowlist automatically)");
+  });
+
+program
+  .command("revoke <did> [action]")
+  .description(
+    "Revoke a single <action> from <did>, or remove the entry entirely if no action is given.",
+  )
+  .action(async (did: string, action: string | undefined) => {
+    const { loadAllowlist, saveAllowlist } = await import("./allowlist.js");
+    const al = await loadAllowlist();
+    const idx = al.findIndex((e) => e.did === did);
+    if (idx === -1) {
+      console.log(`no allowlist entry for ${did}`);
+      return;
+    }
+    if (!action) {
+      al.splice(idx, 1);
+      await saveAllowlist(al);
+      console.log(`removed ${did} from allowlist entirely`);
+    } else {
+      const entry = al[idx];
+      const before = entry.actions?.length ?? 0;
+      entry.actions = (entry.actions ?? []).filter((a) => a !== action);
+      const after = entry.actions.length;
+      await saveAllowlist(al);
+      if (before === after) console.log(`${did} did not have '${action}'; nothing changed`);
+      else console.log(`revoked ${action} from ${did}`);
+    }
+  });
+
 // ── send (capability-token IRC actions) ──────────────────────────────
 
 program
