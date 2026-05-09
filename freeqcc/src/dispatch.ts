@@ -212,7 +212,10 @@ async function runStreaming(
     // — visible to the user as the bot saying "I can't, my hands are tied".
     args.push("--allowedTools", "Bash(freeqcc send:*)");
   }
-  args.push(text);
+  // We pipe the prompt via stdin instead of passing as a positional arg
+  // because `--allowedTools` is variadic and would slurp the prompt token.
+  // claude --print accepts stdin transparently when no positional prompt
+  // is given.
 
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   if (capability) {
@@ -227,9 +230,12 @@ async function runStreaming(
 
   await new Promise<void>((resolve) => {
     const proc = spawn("claude", args, {
-      stdio: ["ignore", "pipe", "pipe"],
+      // Prompt via stdin (see comment above re: --allowedTools variadic).
+      stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
     });
+    proc.stdin.write(text);
+    proc.stdin.end();
     let stdoutBuffer = "";
     let stderrBuffer = "";
 
