@@ -81,6 +81,8 @@ export interface EvaluateArgs {
   /** Sender's nick, used as a refusal-cooldown key when DID is unknown. */
   senderNick: string;
   ownerDid: string;
+  /** Optional extra allowed DIDs (multi-DID allowlist). Owner is always allowed. */
+  allowedDids?: string[];
   now?: number;
   cooldownMs?: number;
   hourlyTurnCap?: number;
@@ -93,11 +95,16 @@ export function evaluate(args: EvaluateArgs): GateDecision {
   const hourlyTurnCap = args.hourlyTurnCap ?? DEFAULT_LIMITS.hourlyTurnCap;
   const refusalCooldownMs = args.refusalCooldownMs ?? DEFAULT_LIMITS.refusalCooldownMs;
   const { state, senderDid, senderNick, ownerDid } = args;
+  const allowedDids = args.allowedDids ?? [];
 
   const refusalKey = senderDid ?? `unknown:${senderNick.toLowerCase()}`;
 
-  // Non-owner — refuse once per refusalCooldownMs, silent thereafter.
-  if (senderDid !== ownerDid) {
+  const isAllowed =
+    senderDid !== null &&
+    (senderDid === ownerDid || allowedDids.includes(senderDid));
+
+  // Non-allowed — refuse once per refusalCooldownMs, silent thereafter.
+  if (!isAllowed) {
     const last = state.lastRefusalAt.get(refusalKey);
     if (last !== undefined && now - last < refusalCooldownMs) {
       return { kind: "silent" };

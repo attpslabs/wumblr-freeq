@@ -10,6 +10,7 @@ import { connect, type Connected } from "./connect.js";
 import { evaluate, loadGateState, saveGateState, type GateState } from "./gate.js";
 import { dispatchToClaudeStreaming } from "./dispatch.js";
 import { logRefused } from "./audit.js";
+import { loadAllowlist, type AllowlistEntry } from "./allowlist.js";
 import { paths, ensureDir } from "./paths.js";
 import { writeFile } from "node:fs/promises";
 
@@ -95,6 +96,14 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
   // For an unknown sender we fire WHOIS, queue the message for up to 3s,
   // and dispatch (or refuse) once the DID resolves.
   const gateState: GateState = await loadGateState();
+  const allowlist: AllowlistEntry[] = await loadAllowlist();
+  if (allowlist.length > 0) {
+    console.log(`allowlist:      ${allowlist.length} extra DID(s) allowed beyond owner`);
+    for (const e of allowlist) {
+      console.log(`  - ${e.did}${e.label ? ` (${e.label})` : ""}`);
+    }
+  }
+  const allowedDids = allowlist.map((e) => e.did);
   const persistGate = (): void => {
     saveGateState(gateState).catch((err) => {
       console.warn(`[gate] persist failed: ${(err as Error).message}`);
@@ -154,14 +163,16 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
       senderDid,
       senderNick: fromNick,
       ownerDid: owner.did,
+      allowedDids,
     });
 
     if (decision.kind === "silent") {
       return;
     }
     if (decision.kind === "refuse") {
+      const allowlistMode = allowedDids.length > 0;
       const refusalText = senderDid
-        ? `I'm @${owner.handle}'s agent. I only respond to them.`
+        ? `I'm @${owner.handle}'s agent. I only respond to ${allowlistMode ? "owner + allowlisted DIDs" : "them"}.`
         : `I'm @${owner.handle}'s agent and I couldn't verify your identity. I only respond to authenticated users on @${owner.handle}'s allowlist.`;
       conn.client.sendMessage(replyTarget, refusalText);
       await logRefused({
@@ -323,6 +334,21 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     }
   };
 
+  // Per-channel cooldown for @mention replies in non-bot channels.
+  const channelMentionCooldown = new Map<string, number>();
+  const MENTION_COOLDOWN_MS = 60_000;
+
+  const isMention = (text: string): boolean => {
+    const lower = text.toLowerCase();
+    const nickLower = conn.nick.toLowerCase();
+    return (
+      lower.includes(`@${nickLower}`) ||
+      // Some clients omit the @; match a word-boundary nick so "yokota-bot" matches
+      // but "yokota-bot-something" doesn't.
+      new RegExp(`(^|\\s)${nickLower.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}(\\s|[,.!?:;]|$)`, "i").test(text)
+    );
+  };
+
   conn.client.on(
     "message",
     (
@@ -336,17 +362,42 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     ) => {
       if (msg.isSelf) return;
       const isChannel = channel.startsWith("#") || channel.startsWith("&");
-      // Treat the bot's own channel (#<bot-nick>) as a DM surface — that's
-      // where freeq web clients actually deliver "DMs to a bot". Other
-      // channels: ignore.
-      if (isChannel && channel.toLowerCase() !== botChannel.toLowerCase()) return;
-      // For DMs `channel === fromNick`. For #bot-channel `channel === botChannel`.
-      // Either way, msg.from is the canonical sender nick.
-      void handleDm(msg.from, msg.text, msg.tags ?? {}, isChannel ? channel : msg.from).catch(
-        (e) => {
+
+      if (!isChannel) {
+        // Direct DM — sender nick is the conversation partner.
+        void handleDm(msg.from, msg.text, msg.tags ?? {}, msg.from).catch((e) => {
           console.error("[handleDm error]", e);
-        },
-      );
+        });
+        return;
+      }
+
+      // Channel message. The bot's own channel (#<bot-nick>) is treated as
+      // a DM surface — every message goes through the gate as if it were a
+      // DM. This mirrors how freeq web clients deliver "DMs to a bot".
+      if (channel.toLowerCase() === botChannel.toLowerCase()) {
+        void handleDm(msg.from, msg.text, msg.tags ?? {}, channel).catch((e) => {
+          console.error("[handleDm error]", e);
+        });
+        return;
+      }
+
+      // Other channels: only respond when explicitly @mentioned. Per-channel
+      // 60s cooldown to prevent the bot from replying to every message in
+      // a busy channel during a thread it's involved in.
+      if (!isMention(msg.text)) return;
+      const lastReply = channelMentionCooldown.get(channel.toLowerCase()) ?? 0;
+      if (Date.now() - lastReply < MENTION_COOLDOWN_MS) {
+        console.log(`[mention cooldown] ${channel}: silent (last reply ${Math.round((Date.now() - lastReply) / 1000)}s ago)`);
+        return;
+      }
+      channelMentionCooldown.set(channel.toLowerCase(), Date.now());
+      // Strip the @<bot-nick> prefix from the text so claude doesn't see it
+      const stripped = msg.text
+        .replace(new RegExp(`@?${conn.nick.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\b[,:]?\\s*`, "i"), "")
+        .trim();
+      void handleDm(msg.from, stripped || msg.text, msg.tags ?? {}, channel).catch((e) => {
+        console.error("[handleDm error]", e);
+      });
     },
   );
 

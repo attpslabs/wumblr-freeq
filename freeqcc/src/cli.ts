@@ -155,6 +155,21 @@ program
           const provenance = json.provenance as Record<string, unknown> | undefined;
           console.log(`actor.online:   ${json.online}`);
           console.log(`actor.nick:     ${json.nick ?? "(none)"}`);
+          // Surface a 433 collision: configured nick != server-confirmed nick.
+          // Common case: SDK appended `_` because the requested nick was
+          // taken; user should rotate (`freeqcc stop && freeqcc launch
+          // --nick something-else --detach`).
+          if (
+            config?.nick &&
+            json.nick &&
+            json.nick !== config.nick
+          ) {
+            console.log(
+              `⚠ NICK MISMATCH: config wants '${config.nick}' but server registered us as '${json.nick}'.\n` +
+                `  Likely a 433 collision (your preferred nick is taken). Stop the daemon, rerun launch\n` +
+                `  with --nick <something-else>, or check who owns it via 'curl https://irc.freeq.at/api/v1/users/${encodeURIComponent(config.nick)}/whois'.`,
+            );
+          }
           if (provenance) {
             console.log(
               `provenance:     verified=${provenance._verified} (${provenance._verification_reason})`,
@@ -315,13 +330,39 @@ program
       fail(`claude is not on PATH — install Claude Code from https://claude.ai/code`);
     }
 
-    // Server reachability
+    // Server reachability + PKI round-trip check
     try {
       const r = await fetch("https://irc.freeq.at/api/v1/health");
       if (r.ok) ok(`server reachable: ${r.status}`);
       else fail(`server health: ${r.status}`);
     } catch (e) {
       fail(`server unreachable: ${(e as Error).message}`);
+    }
+
+    if (agent) {
+      try {
+        const url = `https://irc.freeq.at/api/v1/actors/${encodeURIComponent(agent.did)}`;
+        const r = await fetch(url);
+        if (r.status === 404) {
+          ok(`actor endpoint: 404 (agent has never connected — that's fine if you haven't launched yet)`);
+        } else if (r.ok) {
+          const data = (await r.json()) as { online?: boolean; provenance?: { _verified?: boolean; _verification_reason?: string } };
+          if (data.online) ok(`server sees agent online`);
+          else ok(`server has agent record (currently offline)`);
+          if (data.provenance) {
+            const v = data.provenance._verified;
+            const reason = data.provenance._verification_reason ?? "(no reason)";
+            if (v) ok(`provenance verified server-side: ${reason}`);
+            else ok(`provenance stored unverified (v1.0 expected): ${reason}`);
+          } else {
+            ok(`agent has no provenance record (not yet submitted)`);
+          }
+        } else {
+          fail(`actor endpoint returned ${r.status}`);
+        }
+      } catch (e) {
+        fail(`actor endpoint check failed: ${(e as Error).message}`);
+      }
     }
 
     console.log(problems === 0 ? "\nAll checks passed." : `\n${problems} problem(s) found.`);

@@ -14,6 +14,9 @@ export const paths = {
   daemonLog: join(FREEQCC_DIR, "daemon.log"),
   refusedLog: join(FREEQCC_DIR, "refused.log"),
   config: join(FREEQCC_DIR, "config.json"),
+  allowlist: join(FREEQCC_DIR, "allowlist.json"),
+  telemetry: join(FREEQCC_DIR, "telemetry.json"),
+  gate: join(FREEQCC_DIR, "gate.json"),
 } as const;
 
 export async function ensureDir(): Promise<void> {
