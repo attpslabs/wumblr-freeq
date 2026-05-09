@@ -13,6 +13,15 @@ export const DEFAULT_LIMITS = {
   hourlyTurnCap: 30,
   /** Min ms between refusal NOTICEs to the same sender. */
   refusalCooldownMs: 60 * 60 * 1000, // 1 hour
+  /**
+   * Bot↔bot cycle detection: if more than N rapid back-and-forths happen
+   * with the same counterparty inside the window, force a backoff. Tuned
+   * for "two agents productively troubleshooting together" while catching
+   * runaway loops.
+   */
+  cycleWindowMs: 5 * 60 * 1000, // 5 minutes
+  cycleTurnCap: 10,
+  cycleBackoffMs: 10 * 60 * 1000, // 10 minutes silent after a cycle trip
 };
 
 export type GateDecision =
@@ -24,6 +33,10 @@ export interface GateState {
   lastRefusalAt: Map<string, number>; // sender DID (or "unknown:" + nick) → last refusal ts (ms)
   lastDispatchAt: number; // ms
   dispatchTimestamps: number[]; // ms timestamps within the rolling hour window
+  /** sender DID → recent dispatch timestamps within cycleWindowMs. */
+  perPeerDispatches: Map<string, number[]>;
+  /** sender DID → backoff-until timestamp (cycle trip). */
+  cycleBackoffUntil: Map<string, number>;
 }
 
 export function newGateState(): GateState {
@@ -31,6 +44,8 @@ export function newGateState(): GateState {
     lastRefusalAt: new Map(),
     lastDispatchAt: 0,
     dispatchTimestamps: [],
+    perPeerDispatches: new Map(),
+    cycleBackoffUntil: new Map(),
   };
 }
 
@@ -38,6 +53,8 @@ interface SerializedGateState {
   lastRefusalAt: Array<[string, number]>;
   lastDispatchAt: number;
   dispatchTimestamps: number[];
+  perPeerDispatches?: Array<[string, number[]]>;
+  cycleBackoffUntil?: Array<[string, number]>;
 }
 
 import { readFile, writeFile } from "node:fs/promises";
@@ -61,6 +78,8 @@ export async function loadGateState(): Promise<GateState> {
     dispatchTimestamps: Array.isArray(parsed.dispatchTimestamps)
       ? parsed.dispatchTimestamps
       : [],
+    perPeerDispatches: new Map(parsed.perPeerDispatches ?? []),
+    cycleBackoffUntil: new Map(parsed.cycleBackoffUntil ?? []),
   };
 }
 
@@ -70,6 +89,8 @@ export async function saveGateState(state: GateState): Promise<void> {
     lastRefusalAt: Array.from(state.lastRefusalAt.entries()),
     lastDispatchAt: state.lastDispatchAt,
     dispatchTimestamps: state.dispatchTimestamps,
+    perPeerDispatches: Array.from(state.perPeerDispatches.entries()),
+    cycleBackoffUntil: Array.from(state.cycleBackoffUntil.entries()),
   };
   await writeFile(GATE_FILE, JSON.stringify(serialized) + "\n", { mode: 0o600 });
 }
@@ -116,8 +137,9 @@ export function evaluate(args: EvaluateArgs): GateDecision {
     return { kind: "refuse", reason };
   }
 
-  // Owner — check rate limits. The cooldown only applies when there's a
-  // previous dispatch to cool down from; the first dispatch always goes.
+  // Allowed sender — check rate limits. The cooldown only applies when
+  // there's a previous dispatch to cool down from; first dispatch always
+  // goes.
   if (state.lastDispatchAt > 0 && now - state.lastDispatchAt < cooldownMs) {
     return { kind: "silent" };
   }
@@ -127,6 +149,26 @@ export function evaluate(args: EvaluateArgs): GateDecision {
   state.dispatchTimestamps = state.dispatchTimestamps.filter((t) => t > oneHourAgo);
   if (state.dispatchTimestamps.length >= hourlyTurnCap) {
     return { kind: "silent" };
+  }
+
+  // Bot↔bot cycle detection: per-counterparty.
+  if (senderDid !== null && senderDid !== ownerDid) {
+    const backoffUntil = state.cycleBackoffUntil.get(senderDid) ?? 0;
+    if (now < backoffUntil) {
+      return { kind: "silent" };
+    }
+    const windowMs = DEFAULT_LIMITS.cycleWindowMs;
+    const cap = DEFAULT_LIMITS.cycleTurnCap;
+    const cutoff = now - windowMs;
+    const recent = (state.perPeerDispatches.get(senderDid) ?? []).filter((t) => t > cutoff);
+    if (recent.length >= cap) {
+      // Trip — silence this peer for cycleBackoffMs
+      state.cycleBackoffUntil.set(senderDid, now + DEFAULT_LIMITS.cycleBackoffMs);
+      state.perPeerDispatches.set(senderDid, []); // reset
+      return { kind: "silent" };
+    }
+    recent.push(now);
+    state.perPeerDispatches.set(senderDid, recent);
   }
 
   // Reserve the slot now so concurrent DMs don't race past the cap.
