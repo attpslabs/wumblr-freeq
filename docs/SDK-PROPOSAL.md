@@ -130,7 +130,7 @@ client.reconnect(): void
 client.quit(reason?: string): Promise<void>
 client.raw(line: string): void
 client.setSaslCredentials(creds): void
-runWithReconnect(config, signer, reconnectConfig, handler): Promise<void>
+// runWithReconnect — deferred to @freeq/bot-kit (the reconnect-with-rejoin loop is bot-shaped; the SDK exposes the primitives the loop needs).
 ```
 
 ### Channels
@@ -390,7 +390,7 @@ client.on('raw', (line, parsed) => ...)   // escape hatch
 ### vs. current `@freeq/sdk-js`
 
 **Added (26 outbound methods):**
-`quit`, `joinMany`, `sendAndAwaitEcho`, `sendTagged`, `sendTagmsg`, `sendMedia`, `sendLinkPreview`, `sendReplyInThread`, `startTyping`, `stopTyping`, `registerAgent`, `submitProvenance`, `setPresence`, `sendHeartbeat`, `startHeartbeat`, `requestApproval`, `pauseAgent`, `resumeAgent`, `revokeAgent`, `approveAgent`, `denyAgent`, `emitEvent`, `createTask`, `updateTask`, `completeTask`, `failTask`, `attachEvidence`, `submitManifest`, `spawnAgent`, `despawnAgent`, `sendAsChild`, `submitSpend`, `setBudget`, `requestBudget`, `getDidForNick`, `getNickForDid`, `runWithReconnect`.
+`quit`, `joinMany`, `sendAndAwaitEcho`, `sendTagged`, `sendTagmsg`, `sendMedia`, `sendLinkPreview`, `sendReplyInThread`, `startTyping`, `stopTyping`, `registerAgent`, `submitProvenance`, `setPresence`, `sendHeartbeat`, `startHeartbeat`, `requestApproval`, `pauseAgent`, `resumeAgent`, `revokeAgent`, `approveAgent`, `denyAgent`, `emitEvent`, `createTask`, `updateTask`, `completeTask`, `failTask`, `attachEvidence`, `submitManifest`, `spawnAgent`, `despawnAgent`, `sendAsChild`, `submitSpend`, `setBudget`, `requestBudget`, `getDidForNick`, `getNickForDid`. (`runWithReconnect` deferred to bot-kit.)
 
 **Behavior changes (2):**
 - `whois(nick)` renamed to `requestWhois(nick)` and returns `Promise<WhoisInfo>` (today: fire-and-forget; you have to also listen for the `whois` event). Old `whois(nick)` kept as deprecated alias for one release.
