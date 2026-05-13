@@ -556,6 +556,18 @@ class AppState: ObservableObject {
                 self?.pruneTypingIndicators()
             }
         }
+
+        // Kick off the broker round-trip the moment we know we have a saved
+        // session — well before SwiftUI mounts ContentView. The broker call
+        // then runs in parallel with view hydration instead of waiting for
+        // `.onAppear`. `reconnectSavedSession` is idempotent (guards on
+        // `connectionState == .disconnected`), so a second call from
+        // ContentView.onAppear is a no-op.
+        if hasSavedSession {
+            DispatchQueue.main.async { [weak self] in
+                self?.reconnectSavedSession()
+            }
+        }
     }
 
     // MARK: - Buffer cache hydrate/save
@@ -595,6 +607,12 @@ class AppState: ObservableObject {
     /// no broker token is available, or a fetch is already in flight.
     /// Failures are silent — the cache simply stays at its current value
     /// and the next genuine reconnect will retry through the standard path.
+    /// Web tokens have a ~30 min server TTL. Cache for 28 min — pair with the
+    /// 10-min proactive-refresh window so the cached token transitions to a
+    /// fresh one in the background well before any reconnect needs it. The
+    /// older 25-min cache wasted ~3 min of every token's life forcing broker
+    /// round-trips that didn't need to happen.
+    static let webTokenCacheLifetime: TimeInterval = 28 * 60
     private static let proactiveRefreshLeadTime: TimeInterval = 10 * 60  // 10 min
     private var proactiveRefreshInFlight = false
     private func proactivelyRefreshWebTokenIfStale() {
@@ -611,7 +629,7 @@ class AppState: ObservableObject {
                 let session = try await self.fetchBrokerSession(brokerToken: brokerToken)
                 await MainActor.run {
                     self.cachedWebToken = session.token
-                    self.cachedWebTokenExpiry = Date().addingTimeInterval(25 * 60)
+                    self.cachedWebTokenExpiry = Date().addingTimeInterval(Self.webTokenCacheLifetime)
                     KeychainHelper.save(key: "webToken", value: session.token)
                     UserDefaults.standard.set(
                         String(self.cachedWebTokenExpiry.timeIntervalSince1970),
@@ -685,9 +703,8 @@ class AppState: ObservableObject {
                 await MainActor.run {
                     self.brokerRetryCount = 0
                     self.pendingWebToken = session.token
-                    // Cache for reuse (25 min — conservative vs 30 min server TTL)
                     self.cachedWebToken = session.token
-                    let expiry = Date().addingTimeInterval(25 * 60)
+                    let expiry = Date().addingTimeInterval(Self.webTokenCacheLifetime)
                     self.cachedWebTokenExpiry = expiry
                     KeychainHelper.save(key: "webToken", value: session.token)
                     UserDefaults.standard.set(String(expiry.timeIntervalSince1970), forKey: "freeq.webTokenExpiry")
