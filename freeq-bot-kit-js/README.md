@@ -284,14 +284,7 @@ load: async () => myDb.query('SELECT did, tier FROM users')
 load: [{ did: 'did:plc:alice' }, { did: 'did:plc:bob' }]
 ```
 
-**`save`** — optional persist callback. **If provided, the returned object is mutable** (has `set` / `delete`); if omitted, it's read-only (compile-time, no runtime checks needed).
-
-```ts
-save: async (entries) => {
-  // Caller owns write semantics — atomic tmp+rename for JSON, INSERT ON CONFLICT for SQL, etc.
-  await writeFileAtomic('~/.mybot/access.json', JSON.stringify({ entries }, null, 2));
-}
-```
+**`save`** — optional persist callback. **If provided, the returned object is mutable** (has `set` / `delete`); if omitted, it's read-only (compile-time, no runtime checks needed). Caller owns write semantics — for a file you want atomic write (tmp + rename) so a crash mid-write never leaves a half-truncated file for the watcher to choke on. The [`write-file-atomic`](https://www.npmjs.com/package/write-file-atomic) package does this; `db.replaceAll(entries)` / `kv.set('access', entries)` are the equivalents for other backends.
 
 **`pollMs`** — file-source poll interval. Default `2000`. Ignored for function/array sources.
 

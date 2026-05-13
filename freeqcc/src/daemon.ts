@@ -9,7 +9,7 @@ import { connect, type Connected } from "./connect.js";
 import { evaluate, loadGateState, saveGateState, type GateState } from "./gate.js";
 import { dispatchToClaudeStreaming } from "./dispatch.js";
 import { logRefused } from "./audit.js";
-import { loadAllowlist, actionsFor, type AllowlistEntry } from "./allowlist.js";
+import { actionsFor, createAccessMap, type AllowlistEntry } from "./allowlist.js";
 import { paths, ensureDir } from "./paths.js";
 import { writeFile } from "node:fs/promises";
 import { TokenStore, startControlServer, type ControlServerHandle } from "./control.js";
@@ -112,45 +112,23 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
   // For an unknown sender we fire WHOIS, queue the message for up to 3s,
   // and dispatch (or refuse) once the DID resolves.
   const gateState: GateState = await loadGateState();
-  // Mutable holder so the fs.watch reload can replace the contents.
-  const allowlistState: { current: AllowlistEntry[] } = {
-    current: await loadAllowlist(),
-  };
-  const printAllowlist = (): void => {
-    const al = allowlistState.current;
-    if (al.length === 0) return;
-    console.log(`allowlist:      ${al.length} extra DID(s) allowed beyond owner`);
-    for (const e of al) {
+  // Hot-reloadable access map (replaces the old fs.watch / mtime-poll loop).
+  // createAccessMap wraps bot-kit's createDidMap with freeqcc's JSON format
+  // and atomic-write semantics; the daemon just reacts to changes here.
+  const accessMap = await createAccessMap(paths.allowlist);
+  const printAllowlist = (entries: AllowlistEntry[]): void => {
+    if (entries.length === 0) return;
+    console.log(`allowlist:      ${entries.length} extra DID(s) allowed beyond owner`);
+    for (const e of entries) {
       const acts = e.actions && e.actions.length > 0 ? e.actions.join(",") : "chat-only";
       console.log(`  - ${e.did}${e.label ? ` (${e.label})` : ""} [${acts}]`);
     }
   };
-  printAllowlist();
-
-  // Live-reload allowlist on changes. mtime poll is more robust than
-  // fs.watch (which silently breaks if the file doesn't exist at startup
-  // and doesn't recover; also flaky across editor save patterns).
-  let lastAllowlistMtime = 0;
-  setInterval(async () => {
-    try {
-      const { stat } = await import("node:fs/promises");
-      const s = await stat(paths.allowlist);
-      const mt = s.mtimeMs;
-      if (mt === lastAllowlistMtime) return;
-      lastAllowlistMtime = mt;
-      const reloaded = await loadAllowlist();
-      allowlistState.current = reloaded;
-      console.log(`[allowlist] reloaded — ${reloaded.length} entries`);
-      printAllowlist();
-    } catch (err) {
-      // ENOENT (file deleted) → treat as empty allowlist
-      if ((err as NodeJS.ErrnoException).code === "ENOENT" && allowlistState.current.length > 0) {
-        allowlistState.current = [];
-        lastAllowlistMtime = 0;
-        console.log(`[allowlist] file deleted — allowlist now empty`);
-      }
-    }
-  }, 2000).unref();
+  printAllowlist(accessMap.list());
+  accessMap.onChange((entries) => {
+    console.log(`[allowlist] reloaded — ${entries.length} entries`);
+    printAllowlist(entries);
+  });
   const persistGate = (): void => {
     saveGateState(gateState).catch((err) => {
       console.warn(`[gate] persist failed: ${(err as Error).message}`);
@@ -206,7 +184,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     }
 
     // Re-read allowlist each dispatch so live-reload edits take effect.
-    const allowlist = allowlistState.current;
+    const allowlist = accessMap.list();
     const allowedDids = allowlist.map((e) => e.did);
 
     const decision = evaluate({

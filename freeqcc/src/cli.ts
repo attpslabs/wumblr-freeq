@@ -137,20 +137,23 @@ program
   .command("grants")
   .description("List allowlisted DIDs and the actions each is granted.")
   .action(async () => {
-    const { loadAllowlist, OWNER_ACTIONS } = await import("./allowlist.js");
+    const { createAccessMap, OWNER_ACTIONS } = await import("./allowlist.js");
     const owner = await safeLoadOwner();
     if (owner) {
       console.log(`owner:    ${owner.did}  [${OWNER_ACTIONS.join(", ")}]`);
     }
-    const al = await loadAllowlist();
-    if (al.length === 0) {
+    const access = await createAccessMap(paths.allowlist);
+    const entries = access.list();
+    if (entries.length === 0) {
       console.log("(no extra DIDs in allowlist)");
+      access.close();
       return;
     }
-    for (const e of al) {
+    for (const e of entries) {
       const acts = e.actions && e.actions.length > 0 ? e.actions.join(", ") : "chat-only";
       console.log(`${e.did}${e.label ? `  (${e.label})` : ""}  [${acts}]`);
     }
+    access.close();
   });
 
 program
@@ -162,9 +165,7 @@ program
   )
   .option("--label <label>", "Optional human-readable label")
   .action(async (did: string, action: string, opts: { label?: string }) => {
-    const { loadAllowlist, saveAllowlist, ALL_ACTIONS } = await import(
-      "./allowlist.js"
-    );
+    const { createAccessMap, ALL_ACTIONS } = await import("./allowlist.js");
     if (!ALL_ACTIONS.includes(action)) {
       console.error(
         `unknown action '${action}'. Known: ${ALL_ACTIONS.join(", ")}.`,
@@ -175,21 +176,22 @@ program
       console.error(`'${did}' doesn't look like a DID (expected did:plc:… or did:key:…)`);
       process.exit(1);
     }
-    const al = await loadAllowlist();
-    let entry = al.find((e) => e.did === did);
-    if (!entry) {
-      entry = { did, label: opts.label, actions: [] };
-      al.push(entry);
-    } else if (opts.label && !entry.label) {
-      entry.label = opts.label;
-    }
-    entry.actions = entry.actions ?? [];
-    if (!entry.actions.includes(action)) entry.actions.push(action);
-    await saveAllowlist(al);
+    const access = await createAccessMap(paths.allowlist);
+    const existing = access.get(did);
+    const entry = existing
+      ? {
+          did,
+          label: existing.label ?? opts.label,
+          actions: existing.actions ?? [],
+        }
+      : { did, label: opts.label, actions: [] };
+    if (!entry.actions!.includes(action)) entry.actions!.push(action);
+    await access.set(entry);
     console.log(
       `granted ${action} to ${did}${entry.label ? ` (${entry.label})` : ""}`,
     );
     console.log("(running daemon reloads the allowlist automatically)");
+    access.close();
   });
 
 program
@@ -198,29 +200,30 @@ program
     "Revoke a single <action> from <did>, or remove the entry entirely if no action is given.",
   )
   .action(async (did: string, action: string | undefined) => {
-    const { loadAllowlist, saveAllowlist } = await import("./allowlist.js");
-    const al = await loadAllowlist();
-    const idx = al.findIndex((e) => e.did === did);
-    if (idx === -1) {
+    const { createAccessMap } = await import("./allowlist.js");
+    const access = await createAccessMap(paths.allowlist);
+    const entry = access.get(did);
+    if (!entry) {
       console.log(`no allowlist entry for ${did}`);
+      access.close();
       return;
     }
-    const entry = al[idx]!;
     if (action) {
       const before = entry.actions?.length ?? 0;
-      entry.actions = (entry.actions ?? []).filter((a) => a !== action);
-      const after = entry.actions.length;
-      if (before === after) {
+      const nextActions = (entry.actions ?? []).filter((a) => a !== action);
+      if (nextActions.length === before) {
         console.log(`${did} didn't have action '${action}'`);
+        access.close();
         return;
       }
+      await access.set({ ...entry, actions: nextActions });
       console.log(`revoked ${action} from ${did}`);
     } else {
-      al.splice(idx, 1);
+      await access.delete(did);
       console.log(`removed ${did} from allowlist`);
     }
-    await saveAllowlist(al);
     console.log("(running daemon reloads the allowlist automatically)");
+    access.close();
   });
 
 program

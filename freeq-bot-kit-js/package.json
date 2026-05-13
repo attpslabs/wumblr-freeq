@@ -40,7 +40,13 @@
   "engines": {
     "node": ">=22"
   },
-  "keywords": ["freeq", "bot", "agent", "at-protocol", "did-key"],
+  "keywords": [
+    "freeq",
+    "bot",
+    "agent",
+    "at-protocol",
+    "did-key"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
