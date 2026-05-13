@@ -28,6 +28,112 @@ struct ChatMessage: Identifiable, Equatable {
     }
 }
 
+// MARK: - Local buffer cache
+//
+// Persists the last N messages per channel/DM (plus channel topics and DM
+// peer list) to `Library/Application Support/freeq/buffers.json` so cold
+// launch can render the user's recent context instantly — before SASL +
+// JOIN + CHATHISTORY round-trips have completed. Saved on scene-background,
+// disconnect, and logout. CHATHISTORY from the wire dedupes against the
+// hydrated state via `ChannelState.appendIfNew`.
+
+private struct CachedReactions: Codable {
+    let byEmoji: [String: [String]]
+    init(_ r: [String: Set<String>]) {
+        var d: [String: [String]] = [:]
+        for (k, v) in r { d[k] = Array(v) }
+        self.byEmoji = d
+    }
+    func toDict() -> [String: Set<String>] {
+        var d: [String: Set<String>] = [:]
+        for (k, v) in byEmoji { d[k] = Set(v) }
+        return d
+    }
+}
+
+private struct CachedMessage: Codable {
+    let id: String
+    let from: String
+    let text: String
+    let isAction: Bool
+    let timestamp: Date
+    let replyTo: String?
+    let isEdited: Bool
+    let isDeleted: Bool
+    let isSigned: Bool
+    let reactions: CachedReactions
+
+    init(_ m: ChatMessage) {
+        self.id = m.id
+        self.from = m.from
+        self.text = m.text
+        self.isAction = m.isAction
+        self.timestamp = m.timestamp
+        self.replyTo = m.replyTo
+        self.isEdited = m.isEdited
+        self.isDeleted = m.isDeleted
+        self.isSigned = m.isSigned
+        self.reactions = CachedReactions(m.reactions)
+    }
+
+    func toChatMessage() -> ChatMessage {
+        var m = ChatMessage(
+            id: id, from: from, text: text, isAction: isAction,
+            timestamp: timestamp, replyTo: replyTo, isSigned: isSigned)
+        m.isEdited = isEdited
+        m.isDeleted = isDeleted
+        m.reactions = reactions.toDict()
+        return m
+    }
+}
+
+private struct CachedBuffer: Codable {
+    let name: String
+    let isDM: Bool
+    let topic: String?
+    let messages: [CachedMessage]
+}
+
+private struct BufferCacheRoot: Codable {
+    let version: Int
+    let buffers: [CachedBuffer]
+}
+
+enum BufferCacheStore {
+    static let version = 1
+    static let maxMessagesPerBuffer = 50
+
+    static func cacheURL() -> URL? {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = appSupport.appendingPathComponent("freeq", isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch { return nil }
+        }
+        return dir.appendingPathComponent("buffers.json")
+    }
+
+    fileprivate static func load() -> BufferCacheRoot? {
+        guard let url = cacheURL(),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(BufferCacheRoot.self, from: data)
+    }
+
+    fileprivate static func save(_ root: BufferCacheRoot) {
+        guard let url = cacheURL() else { return }
+        guard let data = try? JSONEncoder().encode(root) else { return }
+        // `.completeFileProtection` matches the Keychain's
+        // `kSecAttrAccessibleAfterFirstUnlock` accessibility class: data is
+        // encrypted at rest and only readable while the device is unlocked.
+        try? data.write(to: url, options: [.atomic, .completeFileProtection])
+    }
+
+    static func clear() {
+        guard let url = cacheURL() else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 /// A channel with its messages and members.
 class ChannelState: ObservableObject, Identifiable {
     let name: String
@@ -437,12 +543,67 @@ class AppState: ObservableObject {
         }
         isDarkTheme = UserDefaults.standard.object(forKey: "freeq.darkTheme") as? Bool ?? true
 
+        // Hydrate channels/DMs from on-disk cache so the UI can render the
+        // last session's context before the network round-trips complete.
+        hydrateBuffersFromCache()
+
         // Prune stale typing indicators every 3 seconds
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             DispatchQueue.main.async {
                 self?.pruneTypingIndicators()
             }
         }
+    }
+
+    // MARK: - Buffer cache hydrate/save
+
+    /// Read cached channels/DMs from disk and populate `channels` and
+    /// `dmBuffers`. CHATHISTORY from the wire dedupes against the hydrated
+    /// state via `ChannelState.appendIfNew(msg:)`.
+    private func hydrateBuffersFromCache() {
+        guard let root = BufferCacheStore.load() else { return }
+        guard root.version == BufferCacheStore.version else {
+            // Future migration hook — discard incompatible caches rather
+            // than crashing on a partial decode.
+            BufferCacheStore.clear()
+            return
+        }
+        for cb in root.buffers {
+            let buffer = cb.isDM
+                ? getOrCreateDM(cb.name)
+                : getOrCreateChannel(cb.name)
+            if let topic = cb.topic, !topic.isEmpty {
+                buffer.topic = topic
+            }
+            for cm in cb.messages {
+                buffer.appendIfNew(cm.toChatMessage())
+            }
+            // The most recent cached message sets a reasonable lastActivity
+            // so the sidebar sort order on cold launch matches what the user
+            // saw last session, instead of dumping everything to the bottom.
+            if let last = buffer.messages.last {
+                buffer.lastActivity = last.timestamp
+            }
+        }
+    }
+
+    /// Snapshot all channels/DMs and write to disk. Safe to call from any
+    /// thread; the snapshot is taken synchronously on the calling thread.
+    /// `flushBuffersToCache()` is the only entry point — `handleScenePhase`,
+    /// `disconnect`, and `logout` all call it.
+    func flushBuffersToCache() {
+        let snapshot: [CachedBuffer] = (channels + dmBuffers).map { buf in
+            let isDM = !(buf.name.hasPrefix("#") || buf.name.hasPrefix("&"))
+            let tail = buf.messages.suffix(BufferCacheStore.maxMessagesPerBuffer)
+            return CachedBuffer(
+                name: buf.name,
+                isDM: isDM,
+                topic: buf.topic.isEmpty ? nil : buf.topic,
+                messages: tail.map(CachedMessage.init)
+            )
+        }
+        let root = BufferCacheRoot(version: BufferCacheStore.version, buffers: snapshot)
+        BufferCacheStore.save(root)
     }
 
     /// Reconnect with saved session (requires SASL web-token).
@@ -596,6 +757,10 @@ class AppState: ObservableObject {
     }
 
     func disconnect() {
+        // Persist the current buffer state before tearing down. Without this,
+        // a Guest-fallback retry or manual disconnect drops the last session
+        // and the next cold launch hydrates from a stale cache.
+        flushBuffersToCache()
         client?.disconnect()
         DispatchQueue.main.async {
             self.connectionState = .disconnected
@@ -620,6 +785,9 @@ class AppState: ObservableObject {
         cachedWebToken = nil
         cachedWebTokenExpiry = .distantPast
         SpotlightIndexer.clear()
+        // Drop the on-disk buffer cache — never leak the previous user's
+        // messages into a fresh sign-in.
+        BufferCacheStore.clear()
         DispatchQueue.main.async {
             self.authenticatedDID = nil
             self.nick = ""
@@ -947,10 +1115,13 @@ class AppState: ObservableObject {
                 reconnectSavedSession()
             }
         case .background:
-            // Going to background — nothing for now (WebSocket dies naturally)
-            break
+            // Going to background — WebSocket dies naturally. Persist the
+            // buffer cache here so the next cold launch can hydrate with
+            // the latest state. iOS also calls .inactive shortly before
+            // .background; we save on both for belt-and-suspenders.
+            flushBuffersToCache()
         case .inactive:
-            break
+            flushBuffersToCache()
         @unknown default:
             break
         }
