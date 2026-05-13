@@ -590,6 +590,45 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Background-refresh the cached web token if it's within
+    /// `proactiveRefreshLeadTime` of expiry. No-op if the cache is fresh,
+    /// no broker token is available, or a fetch is already in flight.
+    /// Failures are silent — the cache simply stays at its current value
+    /// and the next genuine reconnect will retry through the standard path.
+    private static let proactiveRefreshLeadTime: TimeInterval = 10 * 60  // 10 min
+    private var proactiveRefreshInFlight = false
+    private func proactivelyRefreshWebTokenIfStale() {
+        guard !proactiveRefreshInFlight else { return }
+        guard let brokerToken else { return }
+        // Threshold: cached token's remaining lifetime < 10 minutes.
+        let remaining = cachedWebTokenExpiry.timeIntervalSinceNow
+        guard remaining < Self.proactiveRefreshLeadTime else { return }
+        proactiveRefreshInFlight = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { Task { @MainActor in self.proactiveRefreshInFlight = false } }
+            do {
+                let session = try await self.fetchBrokerSession(brokerToken: brokerToken)
+                await MainActor.run {
+                    self.cachedWebToken = session.token
+                    self.cachedWebTokenExpiry = Date().addingTimeInterval(25 * 60)
+                    KeychainHelper.save(key: "webToken", value: session.token)
+                    UserDefaults.standard.set(
+                        String(self.cachedWebTokenExpiry.timeIntervalSince1970),
+                        forKey: "freeq.webTokenExpiry")
+                    authLog.info("proactive web-token refresh succeeded")
+                }
+            } catch {
+                // Genuine 401 may have wiped credentials inside fetchBrokerSession;
+                // that already flips the UI via @Published. Otherwise stay quiet —
+                // the existing token is still valid for several more minutes.
+                await MainActor.run {
+                    authLog.notice("proactive web-token refresh failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+        }
+    }
+
     /// Snapshot all channels/DMs and write to disk. Safe to call from any
     /// thread; the snapshot is taken synchronously on the calling thread.
     /// `flushBuffersToCache()` is the only entry point — `handleScenePhase`,
@@ -1111,6 +1150,14 @@ class AppState: ObservableObject {
             // nothing — and on a slow broker, lights up the user-visible
             // reconnect UI for what was a working connection.
             if let c = client, c.isConnected() {
+                // Even with a healthy transport, if the cached web token is
+                // about to expire we want a fresh one ready *before* the
+                // next reconnect (e.g., the user is on a flaky train and
+                // the WebSocket drops 20 minutes from now). A reactive
+                // fetch on that drop would block reconnect on the broker;
+                // a proactive fetch here means the next reconnect uses a
+                // cached fresh token and bypasses the broker entirely.
+                proactivelyRefreshWebTokenIfStale()
                 return
             }
             if connectionState == .disconnected && hasSavedSession {
