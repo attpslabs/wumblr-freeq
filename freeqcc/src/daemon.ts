@@ -3,9 +3,8 @@
 //
 // Phase 5 wires connect + announce + heartbeat. The DM gate + claude
 // dispatch (phase 6) hangs off the returned client.
-import { loadOrCreateIdentity } from "./identity.js";
+import { loadOrCreateIdentity, loadOrMintDelegation } from "@freeq/bot-kit";
 import { loadOrPromptOwner } from "./owner.js";
-import { loadOrMintDelegation } from "./delegation.js";
 import { connect, type Connected } from "./connect.js";
 import { evaluate, loadGateState, saveGateState, type GateState } from "./gate.js";
 import { dispatchToClaudeStreaming } from "./dispatch.js";
@@ -50,9 +49,13 @@ function deriveDefaultNick(handle: string): string {
 }
 
 export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
-  const agent = await loadOrCreateIdentity();
+  const agent = await loadOrCreateIdentity({ seedPath: paths.agentKey });
   const owner = await loadOrPromptOwner();
-  const delegation = await loadOrMintDelegation({ agent, owner });
+  const delegation = await loadOrMintDelegation({
+    certPath: paths.delegation,
+    agentDid: agent.did,
+    ownerDid: owner.did,
+  });
   const nick = opts.nick ?? deriveDefaultNick(owner.handle);
 
   console.log("─── freeqcc daemon ───");
@@ -65,7 +68,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
 
   const conn = await connect({
     identity: agent,
-    owner,
+    ownerDid: owner.did,
     delegation,
     nick,
     serverUrl: opts.serverUrl,

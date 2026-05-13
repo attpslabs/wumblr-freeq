@@ -19,7 +19,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@freeq/sdk": "file:../freeq-sdk-js",
+    "@freeq/bot-kit": "file:../freeq-bot-kit-js",
     "commander": "^14.0.1",
     "prompts": "^2.4.2"
   },

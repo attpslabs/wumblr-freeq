@@ -14,8 +14,7 @@ import { open, readFile, writeFile, unlink, stat } from "node:fs/promises";
 import { paths, ensureDir } from "./paths.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { loadOrPromptOwner } from "./owner.js";
-import { loadOrCreateIdentity } from "./identity.js";
-import { loadDelegation } from "./delegation.js";
+import { loadOrCreateIdentity, loadDelegation } from "@freeq/bot-kit";
 import { runDaemon } from "./daemon.js";
 
 const program = new Command();
@@ -122,7 +121,7 @@ program
     const config = await loadConfig();
     const owner = await safeLoadOwner();
     const agent = await safeLoadIdentity();
-    const cert = await loadDelegation().catch(() => null);
+    const cert = await loadDelegation({ certPath: paths.delegation }).catch(() => null);
     const pidAlive = await readPid();
 
     console.log("─── freeqcc status ───");
@@ -465,7 +464,7 @@ program
     else fail(`no config.json or missing nick`);
 
     // Delegation
-    const cert = await loadDelegation().catch((e) => {
+    const cert = await loadDelegation({ certPath: paths.delegation }).catch((e) => {
       fail(`delegation cert is malformed: ${(e as Error).message}`);
       return null;
     });
@@ -558,7 +557,7 @@ async function safeLoadOwner(): Promise<{ handle: string; did: string } | null> 
 async function safeLoadIdentity(): Promise<{ did: string } | null> {
   try {
     await stat(paths.agentKey);
-    return await loadOrCreateIdentity();
+    return await loadOrCreateIdentity({ seedPath: paths.agentKey });
   } catch {
     return null;
   }

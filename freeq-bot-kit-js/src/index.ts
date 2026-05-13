@@ -19,7 +19,27 @@ export type {
   FreeqBotStopOptions,
 } from "./bot.js";
 
-// AgentIdentity and DelegationCert are surfaced as `bot.identity` /
-// `bot.delegation` properties, so consumers may need the types.
-export type { AgentIdentity } from "./identity.js";
-export type { DelegationCert } from "./delegation.js";
+// Re-export the SDK surface that bot consumers commonly need, so they can
+// depend on @freeq/bot-kit alone. (Bots that need anything not re-exported
+// here can still depend on @freeq/sdk directly.)
+export { FreeqClient, fetchProfile } from "@freeq/sdk";
+export type { FreeqEvents, NickCollisionPolicy, TransportState } from "@freeq/sdk";
+
+// Low-level helpers — for callers that want to read identity/cert state
+// (e.g. a CLI's `status` command) without constructing a FreeqBot.
+export { loadOrCreateIdentity } from "./identity.js";
+export type {
+  AgentIdentity,
+  LoadOrCreateIdentityOptions,
+} from "./identity.js";
+export {
+  loadDelegation,
+  loadOrMintDelegation,
+  buildDelegation,
+} from "./delegation.js";
+export type {
+  DelegationCert,
+  LoadDelegationOptions,
+  LoadOrMintDelegationOptions,
+  BuildDelegationOptions,
+} from "./delegation.js";
