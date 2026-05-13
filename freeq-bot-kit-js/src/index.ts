@@ -57,3 +57,15 @@ export type {
   DoctorCheck,
   DoctorResult,
 } from "./daemon-cli.js";
+
+// Hot-reloadable, DID-keyed map. Backs allowlists, banlists, roles,
+// tiers, friends — same primitive, different wiring. See README.
+export { createDidMap } from "./did-map.js";
+export type {
+  DidMapSource,
+  DidMapSave,
+  DidMapBaseOptions,
+  DidMapMutableOptions,
+  DidMapReadOnly,
+  DidMapMutable,
+} from "./did-map.js";

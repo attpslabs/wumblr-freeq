@@ -198,6 +198,176 @@ await cli.parseAsync(process.argv);
 
 **Two-callback launch model:** `preflight` runs in foreground (prompts ok) and re-runs idempotently in the detached child after fork. `runDaemon` only runs in the daemon process and receives `preflight`'s return value. Signal handlers (SIGINT/SIGTERM) are wired by the scaffold; the returned handle's `stop(reason)` is invoked on shutdown.
 
+## DID maps (allowlists, banlists, roles, tiers)
+
+`createDidMap` is a hot-reloadable, DID-keyed map. The canonical use is an **allowlist** — the set of DIDs your bot will respond to — but the same primitive backs banlists, role registries, tier flags, friends lists, or any other DID-keyed collection. The framework owns the mechanism (load, watch, atomic in-memory swap, parse-error retention, change notify). The caller owns the meaning.
+
+### Allowlist (the canonical use case)
+
+```ts
+import { createDidMap } from '@freeq/bot-kit';
+
+interface AllowEntry { did: string; label?: string; }
+
+const access = await createDidMap<AllowEntry>({
+  load: {
+    path: '~/.mybot/allowlist.json',
+    parse: (raw) => (JSON.parse(raw) as { allowed: AllowEntry[] }).allowed ?? [],
+  },
+});
+
+bot.on('message', (channel, msg) => {
+  if (msg.isSelf) return;
+  if (!access.has(msg.senderDid)) return;     // silent ignore for non-allowed
+  // ... handle the message ...
+});
+```
+
+That's it. The file at `~/.mybot/allowlist.json` is `mtime`-polled (default every 2s); operator edits (via a CLI, hand-edits, or deploy) are picked up live with no restart. ENOENT means empty allowlist. Half-written or invalid JSON during a reload is logged as a warning and the previous good state is retained — so a typo doesn't silently wipe all your grants.
+
+### Banlist
+
+Same primitive, opposite wiring:
+
+```ts
+const banned = await createDidMap({ load: { path: '~/.mybot/banlist.json', parse: JSON.parse } });
+
+bot.on('message', (channel, msg) => {
+  if (banned.has(msg.senderDid)) return;      // silent drop
+  // ...
+});
+```
+
+### Tiered access (one map, two checks)
+
+```ts
+interface Entry { did: string; tier: 'basic' | 'sensitive'; }
+
+const access = await createDidMap<Entry>({
+  load: { path: '~/.mybot/access.json', parse: JSON.parse },
+});
+
+bot.on('command', (msg) => {
+  if (!access.has(msg.senderDid)) return refuse('not allowed');
+  if (isSensitive(msg.command) && access.get(msg.senderDid)?.tier !== 'sensitive') {
+    return refuse('basic tier — sensitive commands require upgrade');
+  }
+  run(msg.command);
+});
+```
+
+### Roles / capability flags
+
+```ts
+interface Entry { did: string; roles: string[]; }
+const roles = await createDidMap<Entry>({ load: { path: 'roles.json', parse: JSON.parse } });
+
+if (roles.get(senderDid)?.roles.includes('moderator')) { /* ... */ }
+```
+
+### API
+
+```ts
+createDidMap<T extends { did: string }>(opts): Promise<DidMap<T>>
+```
+
+**`load`** — discriminated source, three variants:
+
+```ts
+// File-backed (mtime-poll auto-watches)
+load: { path: string; parse: (raw: string) => T[] }
+
+// Async loader (DB, env, fetch, anything else)
+load: async () => myDb.query('SELECT did, tier FROM users')
+
+// Static array (tests, hard-coded lists)
+load: [{ did: 'did:plc:alice' }, { did: 'did:plc:bob' }]
+```
+
+**`save`** — optional persist callback. **If provided, the returned object is mutable** (has `set` / `delete`); if omitted, it's read-only (compile-time, no runtime checks needed).
+
+```ts
+save: async (entries) => {
+  // Caller owns write semantics — atomic tmp+rename for JSON, INSERT ON CONFLICT for SQL, etc.
+  await writeFileAtomic('~/.mybot/access.json', JSON.stringify({ entries }, null, 2));
+}
+```
+
+**`pollMs`** — file-source poll interval. Default `2000`. Ignored for function/array sources.
+
+**Returned object:**
+
+```ts
+interface DidMapReadOnly<T> {
+  has(did: string): boolean;
+  get(did: string): T | null;
+  list(): T[];                          // snapshot copy
+  reload(): Promise<void>;              // force re-read; no-op for arrays
+  onChange(cb: (entries: T[]) => void): () => void;   // returns disposer
+  close(): void;
+}
+
+interface DidMapMutable<T> extends DidMapReadOnly<T> {
+  set(entry: T): Promise<void>;         // upsert by DID; awaits save first
+  delete(did: string): Promise<boolean>; // returns false if did wasn't present
+}
+```
+
+### When `save` is and isn't needed
+
+`save` is **only** called when the bot's own code invokes `map.set(...)` or `map.delete(...)`. Omit it when:
+
+- The file is managed externally (operator-edited, written by a separate CLI subcommand, deploy pipeline).
+- The bot reads from a DB but writes happen elsewhere (admin UI, API, cron).
+- The map is a test fixture or hard-coded list.
+- You want grants that don't survive restart (rare but valid).
+
+Provide `save` when you want **in-band mutation**: a `!grant @alice` DM command handler, a `!ban @bob` in-channel moderator action, a time-based expiry sweeper, etc.
+
+```ts
+// Owner-dynamic !grant flow
+const access = await createDidMap<Entry>({
+  load: { path: 'access.json', parse: JSON.parse },
+  save: async (entries) => atomicWriteJson('access.json', { entries }),
+});
+
+bot.on('dm', async (msg) => {
+  if (msg.from !== ownerDid) return;
+  if (msg.text.startsWith('!grant ')) {
+    const did = await resolveHandle(msg.text.slice(7));
+    await access.set({ did, tier: 'basic' });
+    bot.reply(msg, `granted ${did}`);
+  }
+});
+```
+
+### Failure modes
+
+| Situation | Behavior |
+|---|---|
+| File missing on initial load (file source) | Empty map, no error |
+| File deleted after start | Map becomes empty, `onChange` fires with `[]` |
+| File present but `parse` throws on init | `createDidMap` rejects — bot can't start with unknown state |
+| `parse` throws on a reload | Previous state retained, warning logged, polling continues |
+| `save` throws | `set`/`delete` rejects; in-memory state unchanged |
+| Function `load` throws on init | `createDidMap` rejects |
+| Function `load` throws on `.reload()` | Reload rejects, previous state retained |
+
+### Composition: allowlist + banlist (deny wins)
+
+```ts
+const allowed = await createDidMap({ load: { path: 'allowed.json', parse: JSON.parse } });
+const banned  = await createDidMap({ load: { path: 'banned.json',  parse: JSON.parse } });
+
+function classify(did: string): 'banned' | 'unknown' | 'ok' {
+  if (banned.has(did)) return 'banned';
+  if (!allowed.has(did)) return 'unknown';
+  return 'ok';
+}
+```
+
+Two instances, two files, caller composes the policy. The framework takes no position on which list "wins" — that's wiring.
+
 ## What this package does NOT do
 
 Deliberately out of scope:
@@ -205,7 +375,7 @@ Deliberately out of scope:
 - **Owner config / handle resolution.** Caller provides `ownerDid`. Bot-kit doesn't prompt or persist owner.json.
 - **Signal handlers (when not using `createDaemonCLI`).** `process.on('SIGINT', ...)` is process-global; if you're using `FreeqBot` directly without the CLI scaffold, the application owns it. The README's quick example shows the snippet.
 - **Reconnect logic.** Already in the SDK transport (`@freeq/sdk`'s `Transport` does exponential-backoff auto-reconnect and re-emits `'ready'` on resume). Bot-kit's announce loop is already bound to every `'ready'` so reconnects re-announce automatically.
-- **DM dispatch / capability gating / ACLs.** Application logic. Use `bot.on('message', ...)` and the SDK directly.
+- **DM dispatch / capability gating / ACLs.** Application logic. Use `bot.on('message', ...)` + `createDidMap` for the membership question; bot-kit doesn't pick what "allowed" means.
 - **did:key rotation.** Bot-specific (e.g. freeqcc also wipes per-DID claude sessions). Write a `rotate-key` subcommand on the returned `Command`.
 - **Manifest building.** Bot-kit takes a pre-built TOML string. Compose your manifest however you like.
 
