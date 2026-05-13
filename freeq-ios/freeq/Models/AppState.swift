@@ -1375,11 +1375,15 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             let tags = Dictionary(uniqueKeysWithValues: tagMsg.tags.map { ($0.key, $0.value) })
             let target = tagMsg.target
             let from = tagMsg.from
+            let isSelf = from.lowercased() == state.nick.lowercased()
+            // For DMs, an echoed TAGMSG from ourselves carries target=peer, from=self —
+            // route to the peer's DM buffer, not a DM keyed by our own nick.
+            let dmBuffer = isSelf ? target : from
+            let bufferName = target.hasPrefix("#") ? target : dmBuffer
 
             // Typing indicators
             if let typing = tags["+typing"] {
-                if from.lowercased() != state.nick.lowercased() {
-                    let bufferName = target.hasPrefix("#") ? target : from
+                if !isSelf {
                     let ch = bufferName.hasPrefix("#") ? state.getOrCreateChannel(bufferName) : state.getOrCreateDM(bufferName)
                     if typing == "active" {
                         ch.typingUsers[from] = Date()
@@ -1391,21 +1395,18 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
 
             // Message deletion
             if let deleteId = tags["+draft/delete"] {
-                let bufferName = target.hasPrefix("#") ? target : from
                 let ch = bufferName.hasPrefix("#") ? state.getOrCreateChannel(bufferName) : state.getOrCreateDM(bufferName)
                 ch.applyDelete(msgId: deleteId)
             }
 
             // Reactions
             if let emoji = tags["+react"], let replyId = tags["+reply"] {
-                let bufferName = target.hasPrefix("#") ? target : from
                 let ch = bufferName.hasPrefix("#") ? state.getOrCreateChannel(bufferName) : state.getOrCreateDM(bufferName)
                 ch.applyReaction(msgId: replyId, emoji: emoji, from: from)
             }
 
             // Reaction removal (toggle off)
             if let emoji = tags["+freeq.at/unreact"], let replyId = tags["+reply"] {
-                let bufferName = target.hasPrefix("#") ? target : from
                 let ch = bufferName.hasPrefix("#") ? state.getOrCreateChannel(bufferName) : state.getOrCreateDM(bufferName)
                 ch.removeReaction(msgId: replyId, emoji: emoji, from: from)
             }
