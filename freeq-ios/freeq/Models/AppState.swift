@@ -447,8 +447,11 @@ class AppState: ObservableObject {
     @Published var lightboxURL: URL? = nil
     /// Pending web-token for SASL auth (from AT Protocol OAuth)
     var pendingWebToken: String? = nil
-    /// Persistent broker session token
-    var brokerToken: String? = nil
+    /// Persistent broker session token. `@Published` so credential changes
+    /// (sign-in, automatic wipe past grace, explicit logout) immediately
+    /// re-evaluate `hasSavedSession` and flip the root UI between
+    /// MainTabView and ConnectView.
+    @Published var brokerToken: String? = nil
     /// Cached web-token + expiry (reuse across reconnects within TTL)
     fileprivate var cachedWebToken: String? = nil
     fileprivate var cachedWebTokenExpiry: Date = .distantPast
