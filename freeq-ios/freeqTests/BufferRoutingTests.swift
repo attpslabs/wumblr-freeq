@@ -13,12 +13,14 @@ import XCTest
 final class BufferRoutingTests: XCTestCase {
 
     private func makeState() -> AppState {
-        // AppState() reads UserDefaults / Keychain in init. For tests we want
-        // a clean slate per test, so blow those away first.
+        // AppState() reads UserDefaults / Keychain / on-disk buffer cache in
+        // init. For tests we want a clean slate per test, so blow those
+        // away first.
         for k in ["freeq.nick", "freeq.server", "freeq.channels", "freeq.readPositions",
                   "freeq.unreadCounts", "freeq.mutedChannels"] {
             UserDefaults.standard.removeObject(forKey: k)
         }
+        BufferCacheStore.clear()
         return AppState()
     }
 
@@ -232,11 +234,13 @@ final class DMSelfEchoRoutingTests: XCTestCase {
     private let peer = "bob"
 
     private func makeState() -> AppState {
-        // Wipe persisted prefs so each test gets a clean slate.
+        // Wipe persisted prefs + on-disk buffer cache so each test gets a
+        // clean slate (the cache is hydrated in AppState.init()).
         for k in ["freeq.nick", "freeq.server", "freeq.channels", "freeq.readPositions",
                   "freeq.unreadCounts", "freeq.mutedChannels"] {
             UserDefaults.standard.removeObject(forKey: k)
         }
+        BufferCacheStore.clear()
         let s = AppState()
         s.nick = me
         return s
