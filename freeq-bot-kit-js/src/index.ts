@@ -85,3 +85,15 @@ export type {
   DidResolverOptions,
   ResolveOpts,
 } from "./did-resolver.js";
+
+// Rate-limit + cycle-detection gate. Caller-owned persistence via
+// optional load/save callbacks (same pattern as createDidMap).
+export { createTurnGate } from "./turn-gate.js";
+export type {
+  CreateTurnGateOptions,
+  CyclePolicy,
+  EvaluateArgs as TurnGateEvaluateArgs,
+  GateDecision,
+  TurnGate,
+  TurnGateState,
+} from "./turn-gate.js";

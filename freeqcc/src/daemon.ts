@@ -6,7 +6,9 @@
 import { loadOrCreateIdentity, loadOrMintDelegation } from "@freeq/bot-kit";
 import { loadOrPromptOwner } from "./owner.js";
 import { connect, type Connected } from "./connect.js";
-import { evaluate, loadGateState, saveGateState, type GateState } from "./gate.js";
+import { createTurnGate, type TurnGateState } from "@freeq/bot-kit";
+import { readFile } from "node:fs/promises";
+import writeFileAtomic from "write-file-atomic";
 import { dispatchToClaudeStreaming } from "./dispatch.js";
 import { logRefused } from "./audit.js";
 import { actionsFor, createAccessMap, type AllowlistEntry } from "./allowlist.js";
@@ -111,7 +113,29 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
   // We track sender DIDs via the SDK's `memberDid` event (fires on WHOIS).
   // For an unknown sender we fire WHOIS, queue the message for up to 3s,
   // and dispatch (or refuse) once the DID resolves.
-  const gateState: GateState = await loadGateState();
+  // Rate-limit + cycle-detection gate (bot-kit-owned semantics). State
+  // is persisted to ~/.freeqcc/gate.json via write-file-atomic so a
+  // crash mid-write never leaves a half-truncated state file.
+  const gatePath = paths.dir + "/gate.json";
+  const gate = await createTurnGate({
+    load: async () => {
+      try {
+        return JSON.parse(await readFile(gatePath, "utf8")) as TurnGateState;
+      } catch {
+        return {
+          lastRefusalAt: [],
+          lastDispatchAt: 0,
+          dispatchTimestamps: [],
+          perPeerDispatches: [],
+          cycleBackoffUntil: [],
+        };
+      }
+    },
+    save: async (state) =>
+      writeFileAtomic(gatePath, JSON.stringify(state, null, 2) + "\n", {
+        mode: 0o600,
+      }),
+  });
   // Hot-reloadable access map (replaces the old fs.watch / mtime-poll loop).
   // createAccessMap wraps bot-kit's createDidMap with freeqcc's JSON format
   // and atomic-write semantics; the daemon just reacts to changes here.
@@ -130,7 +154,7 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     printAllowlist(entries);
   });
   const persistGate = (): void => {
-    saveGateState(gateState).catch((err) => {
+    void gate.persist().catch((err) => {
       console.warn(`[gate] persist failed: ${(err as Error).message}`);
     });
   };
@@ -161,12 +185,23 @@ export async function runDaemon(opts: DaemonOptions = {}): Promise<Connected> {
     const allowlist = accessMap.list();
     const allowedDids = allowlist.map((e) => e.did);
 
-    const decision = evaluate({
-      state: gateState,
+    // freeqcc's policy: owner is always allowed; allowlisted DIDs are
+    // allowed; everyone else is refused. The gate doesn't know about
+    // owner / allowlist — caller passes refusalReason when rejecting.
+    // Owner is also exempt from cycle detection (humans, not bots).
+    const isAllowed =
+      senderDid !== null &&
+      (senderDid === owner.did || allowedDids.includes(senderDid));
+    const refusalReason = isAllowed
+      ? undefined
+      : senderDid
+        ? "non-owner sender"
+        : "could not verify your identity";
+    const decision = gate.evaluate({
       senderDid,
       senderNick: fromNick,
-      ownerDid: owner.did,
-      allowedDids,
+      refusalReason,
+      skipCycleDetection: senderDid === owner.did,
     });
 
     if (decision.kind === "silent") {

@@ -478,6 +478,68 @@ function classify(did: string): 'banned' | 'unknown' | 'ok' {
 
 Two instances, two files, caller composes the policy. The framework takes no position on which list "wins" — that's wiring.
 
+## Rate-limit + cycle-detection gate
+
+`createTurnGate` decides, per incoming request, whether your bot should dispatch, refuse, or stay silent. Three layered rules:
+
+- **Dispatch-to-dispatch cooldown** — at most one dispatch every `cooldownMs`. Off by default; LLM latency is its own rate limiter, and chat bots usually don't need an extra brake.
+- **Rolling hourly cap** — at most `hourlyCap` dispatches in any 60-minute window. Default 30. A burst is fine, but a chatty user can't burn the bot's whole budget.
+- **Per-peer cycle detection** — if the same sender DID back-and-forths more than `cyclePolicy.turnCap` times within `cyclePolicy.windowMs`, force a `cyclePolicy.backoffMs` silence on that peer. Default 10 turns in 5 minutes triggers a 10-minute silence. Stops two bots from spinning in a feedback loop.
+
+The gate also handles **refuse-once-then-silent**: if the caller wants to reject a sender (not on the allowlist, etc.), pass `refusalReason` to `evaluate`. The gate returns `refuse(reason)` the first time, then `silent` for the next hour so the bot doesn't repeat itself.
+
+Who's allowed is the caller's call — the gate doesn't have an allowlist. Compose with `bot.resolveSenderDid` + a `createDidMap` to make that decision before calling `evaluate`.
+
+### API
+
+```ts
+import { createTurnGate } from '@freeq/bot-kit';
+
+const gate = await createTurnGate({
+  cooldownMs: 0,                 // dispatch-to-dispatch; default 0 (off)
+  hourlyCap: 30,                 // rolling 60-min; default 30
+  refusalCooldownMs: 60 * 60_000, // per-sender; default 1 hour
+  cyclePolicy: {                 // per-peer loop detection; default {5min, 10, 10min}
+    windowMs: 5 * 60_000,
+    turnCap: 10,
+    backoffMs: 10 * 60_000,
+  },
+  // Persistence is opt-in — same pattern as createDidMap. bot-kit
+  // never touches the filesystem. Omit both for in-memory mode.
+  load: async () => readJson('~/.mybot/gate.json'),
+  save: async (state) => writeFileAtomic('~/.mybot/gate.json', JSON.stringify(state)),
+});
+
+// On every inbound message:
+const decision = gate.evaluate({
+  senderDid: did,             // string | null
+  senderNick: msg.from,
+  refusalReason: isAllowed ? undefined : 'not on allowlist',
+  skipCycleDetection: did === ownerDid,  // owners can be chatty without tripping
+});
+
+if (decision.kind === 'silent') return;
+if (decision.kind === 'refuse') return refuse(decision.reason);
+// decision.kind === 'dispatch' — do the work
+
+// Persist whenever — typically after a dispatch / refusal:
+await gate.persist();
+```
+
+### Mode comparison
+
+| Setup | Default | Effect |
+|---|---|---|
+| In-memory only | omit `load` and `save` | State resets on daemon restart; refusal cooldowns lost, hourly cap counter resets |
+| Load only | `load` set, `save` omitted | Restore from prior state at startup; mutations don't write back |
+| Persisted | both `load` and `save` set | Caller chooses the write path (atomic file write, DB, etc.); state survives restarts |
+
+`evaluate` is synchronous and mutates internal state. `persist` is async and just serializes the current state through the configured `save`. There's no auto-persist — caller decides when to write (after each evaluate, on a timer, on shutdown).
+
+### When `skipCycleDetection` matters
+
+A human owner DM-chatting with the bot at 30-second intervals would hit the default cycle detection (10 turns in 5 minutes) and get silenced. Pass `skipCycleDetection: true` for the owner — they're not a bot, they shouldn't trip a bot-loop detector.
+
 ## What this package does NOT do
 
 Deliberately out of scope:
