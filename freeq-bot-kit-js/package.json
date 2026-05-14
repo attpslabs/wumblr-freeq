@@ -23,6 +23,7 @@
     "lint": "eslint src/",
     "example:echo": "tsx examples/echo-bot.ts",
     "example:daemon": "tsx examples/daemon.ts",
+    "example:gated": "tsx examples/gated-bot.ts",
     "example:streaming": "tsx examples/streaming.ts",
     "example:url-worker": "tsx examples/url-fetch-worker.ts",
     "example:fire-task": "tsx examples/fire-task.ts"
@@ -33,9 +34,11 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/write-file-atomic": "^4.0.3",
     "tsx": "^4.19.2",
     "typescript": "~5.9.3",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.2",
+    "write-file-atomic": "^8.0.0"
   },
   "engines": {
     "node": ">=22"
