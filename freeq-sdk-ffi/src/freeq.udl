@@ -213,7 +213,7 @@ callback interface AvEventHandler {
 
 interface FreeqAv {
     [Throws=FreeqError]
-    constructor(string server_url, string session_id, string nick, AvEventHandler handler);
+    constructor(string server_url, string session_id, string nick, string instance_id, AvEventHandler handler);
 
     void leave();
 

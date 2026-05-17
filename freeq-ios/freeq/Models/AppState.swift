@@ -335,16 +335,26 @@ class AppState: ObservableObject {
     /// when the camera is off.
     var localPreviewCapture: CallCameraCapture? { cameraCapture }
 
+    /// Per-call instance identifier — short random hex generated when we
+    /// start or join an AV session. Sent on every av-join/av-leave TAGMSG
+    /// as `+freeq.at/av-instance=<id>`, and used by the SDK to suffix the
+    /// MoQ broadcast path so two devices on the same DID don't collide.
+    fileprivate var currentAvInstance: String? = nil
+
     func startCall(channel: String, sessionId: String) {
         guard client != nil else { return }
         // Use HTTPS API base — MoQ SFU lives behind the same reverse proxy.
         let serverUrl = ServerConfig.apiBaseUrl
+
+        let instance = Self.generateAvInstanceId()
+        currentAvInstance = instance
 
         do {
             avSession = try FreeqAv(
                 serverUrl: serverUrl,
                 sessionId: sessionId,
                 nick: nick,
+                instanceId: instance,
                 handler: AvCallbackHandler(appState: self)
             )
             DispatchQueue.main.async {
@@ -353,22 +363,36 @@ class AppState: ObservableObject {
                 self.currentCallSessionId = sessionId
                 self.startCallActivity(channel: channel, sessionId: sessionId)
             }
-            // Tell peers we joined this session.
-            try? client?.sendRaw(line: "@+freeq.at/av-join;+freeq.at/av-id=\(sessionId) TAGMSG \(channel)")
+            // Tell peers we joined this session — instance suffix lets the
+            // server allocate a per-device participant slot.
+            try? client?.sendRaw(
+                line: "@+freeq.at/av-join;+freeq.at/av-id=\(sessionId);+freeq.at/av-instance=\(instance) TAGMSG \(channel)"
+            )
         } catch {
             print("[av] Failed to start call: \(error)")
+            currentAvInstance = nil
         }
+    }
+
+    /// 8-char lowercase hex. Short enough to keep broadcast paths readable;
+    /// 4 bytes of entropy is plenty for collision avoidance within a session.
+    private static func generateAvInstanceId() -> String {
+        var bytes = [UInt8](repeating: 0, count: 4)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     func leaveCall() {
         // Send av-leave for the channel we're currently in, if any.
         if let channel = currentCallChannel, let sessionId = currentCallSessionId {
-            try? client?.sendRaw(line: "@+freeq.at/av-leave;+freeq.at/av-id=\(sessionId) TAGMSG \(channel)")
+            let instanceTag = currentAvInstance.map { ";+freeq.at/av-instance=\($0)" } ?? ""
+            try? client?.sendRaw(line: "@+freeq.at/av-leave;+freeq.at/av-id=\(sessionId)\(instanceTag) TAGMSG \(channel)")
         }
         cameraCapture?.stop()
         cameraCapture = nil
         avSession?.leave()
         avSession = nil
+        currentAvInstance = nil
         DispatchQueue.main.async {
             self.isInCall = false
             self.isMuted = false

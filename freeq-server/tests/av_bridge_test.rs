@@ -749,13 +749,13 @@ async fn stale_session_auto_ends_on_new_create() {
 
     // Create first session
     let s1 = mgr
-        .create_session(Some("#test"), "did:plc:alice", "alice", None)
+        .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
         .expect("create first session");
     let s1_id = s1.id.clone();
     tracing::info!("Created session {s1_id}");
 
     // Alice leaves — session has 0 active participants but is still "Active"
-    let (_, should_end) = mgr.leave_session(&s1_id, "did:plc:alice").expect("leave");
+    let (_, should_end) = mgr.leave_session(&s1_id, "did:plc:alice", None).expect("leave");
     assert!(should_end, "Session should auto-end when last participant leaves");
 
     // But if leave_session auto-ends, the second create should just work.
@@ -766,16 +766,16 @@ async fn stale_session_auto_ends_on_new_create() {
 
     let mut mgr2 = freeq_server::av::AvSessionManager::new();
     let s2 = mgr2
-        .create_session(Some("#test"), "did:plc:bob", "bob", None)
+        .create_session(Some("#test"), "did:plc:bob", "bob", None, None)
         .expect("create session");
     let s2_id = s2.id.clone();
 
     // Bob "leaves" properly
-    mgr2.leave_session(&s2_id, "did:plc:bob").expect("leave");
+    mgr2.leave_session(&s2_id, "did:plc:bob", None).expect("leave");
 
     // Now Carol can create a new session on the same channel
     let s3 = mgr2
-        .create_session(Some("#test"), "did:plc:carol", "carol", None)
+        .create_session(Some("#test"), "did:plc:carol", "carol", None, None)
         .expect("should succeed — old session was auto-ended");
     assert_ne!(s3.id, s2_id);
     tracing::info!("✓ New session created after stale session auto-ended");
@@ -788,11 +788,11 @@ async fn active_session_blocks_new_create() {
 
     let mut mgr = freeq_server::av::AvSessionManager::new();
 
-    mgr.create_session(Some("#test"), "did:plc:alice", "alice", None)
+    mgr.create_session(Some("#test"), "did:plc:alice", "alice", None, None)
         .expect("create");
 
     // Alice is still active — creating another should fail
-    let result = mgr.create_session(Some("#test"), "did:plc:bob", "bob", None);
+    let result = mgr.create_session(Some("#test"), "did:plc:bob", "bob", None, None);
     assert!(result.is_err(), "Should fail: channel already has active session");
     assert!(
         result.unwrap_err().contains("already has an active session"),
@@ -814,7 +814,7 @@ async fn phantom_participant_session_auto_ends() {
 
     // Create session with alice
     let s1 = mgr
-        .create_session(Some("#test"), "guest:alice", "alice", None)
+        .create_session(Some("#test"), "guest:alice", "alice", None, None)
         .expect("create");
     let s1_id = s1.id.clone();
 
@@ -832,7 +832,7 @@ async fn phantom_participant_session_auto_ends() {
 
     // New session should succeed
     let s2 = mgr
-        .create_session(Some("#test"), "guest:bob", "bob", None)
+        .create_session(Some("#test"), "guest:bob", "bob", None, None)
         .expect("should work — old session ended");
     assert_ne!(s2.id, s1_id);
     tracing::info!("✓ Phantom participant session properly cleaned up");
@@ -844,20 +844,20 @@ async fn rejoin_after_leave() {
     let mut mgr = freeq_server::av::AvSessionManager::new();
 
     let s = mgr
-        .create_session(Some("#test"), "did:plc:alice", "alice", None)
+        .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
         .expect("create");
     let sid = s.id.clone();
 
     // Bob joins
-    mgr.join_session(&sid, "did:plc:bob", "bob").expect("join");
+    mgr.join_session(&sid, "did:plc:bob", "bob", None).expect("join");
     assert_eq!(mgr.active_participant_count(&sid), 2);
 
     // Bob leaves
-    mgr.leave_session(&sid, "did:plc:bob").expect("leave");
+    mgr.leave_session(&sid, "did:plc:bob", None).expect("leave");
     assert_eq!(mgr.active_participant_count(&sid), 1);
 
     // Bob rejoins
-    mgr.join_session(&sid, "did:plc:bob", "bob").expect("rejoin should work");
+    mgr.join_session(&sid, "did:plc:bob", "bob", None).expect("rejoin should work");
     assert_eq!(mgr.active_participant_count(&sid), 2);
 }
 
@@ -867,16 +867,16 @@ async fn multiple_leave_rejoin_cycles() {
     let mut mgr = freeq_server::av::AvSessionManager::new();
 
     let s = mgr
-        .create_session(Some("#test"), "did:plc:alice", "alice", None)
+        .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
         .expect("create");
     let sid = s.id.clone();
 
     for i in 0..5 {
-        mgr.join_session(&sid, "did:plc:bob", "bob")
+        mgr.join_session(&sid, "did:plc:bob", "bob", None)
             .unwrap_or_else(|e| panic!("join cycle {i}: {e}"));
         assert_eq!(mgr.active_participant_count(&sid), 2, "cycle {i}: after join");
 
-        mgr.leave_session(&sid, "did:plc:bob")
+        mgr.leave_session(&sid, "did:plc:bob", None)
             .unwrap_or_else(|e| panic!("leave cycle {i}: {e}"));
         assert_eq!(mgr.active_participant_count(&sid), 1, "cycle {i}: after leave");
     }

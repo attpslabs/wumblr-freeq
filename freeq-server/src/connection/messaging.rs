@@ -1827,6 +1827,7 @@ fn handle_av_tagmsg(
     match av_tag {
         "+freeq.at/av-start" => {
             let title = tags.get("+freeq.at/av-title").map(|s| s.as_str());
+            let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
             let channel = if target.starts_with('#') || target.starts_with('&') {
                 Some(target)
             } else {
@@ -1834,7 +1835,7 @@ fn handle_av_tagmsg(
             };
 
             let mut mgr = state.av_sessions.lock();
-            match mgr.create_session(channel, &did, &nick, title) {
+            match mgr.create_session(channel, &did, &nick, title, instance_id) {
                 Ok(session) => {
                     let session_id = session.id.clone();
                     let participant_count = mgr.active_participant_count(&session_id);
@@ -1956,8 +1957,14 @@ fn handle_av_tagmsg(
                 return;
             }
 
+            // Per-device suffix: clients send a short random `av-instance`
+            // tag so two devices on the same DID get separate participant
+            // slots and distinct MoQ broadcast paths. Older clients omit
+            // it; the manager falls back to one-slot-per-DID for them.
+            let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
+
             let mut mgr = state.av_sessions.lock();
-            match mgr.join_session(&session_id, &did, &nick) {
+            match mgr.join_session(&session_id, &did, &nick, instance_id) {
                 Ok(session) => {
                     let participant_count = mgr.active_participant_count(&session_id);
                     let channel = session.channel.clone();
@@ -2024,8 +2031,9 @@ fn handle_av_tagmsg(
         }
 
         "+freeq.at/av-leave" => {
+            let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
             let mut mgr = state.av_sessions.lock();
-            match mgr.leave_session(&session_id, &did) {
+            match mgr.leave_session(&session_id, &did, instance_id) {
                 Ok((session, should_end)) => {
                     let participant_count = if should_end { 0 } else {
                         mgr.active_participant_count(&session_id)

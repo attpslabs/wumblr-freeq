@@ -54,6 +54,25 @@ pub struct AvParticipant {
     pub left_at: Option<i64>,
     pub role: ParticipantRole,
     pub tracks: Vec<TrackInfo>,
+    /// Per-connection identifier so the same DID can join from multiple
+    /// devices in the same session. Each client generates a short random
+    /// suffix at join time, sends it via the `+freeq.at/av-instance` tag,
+    /// and uses it when constructing the MoQ broadcast path
+    /// (`{session_id}/{nick}~{instance_id}`). Older clients that don't
+    /// send the tag get `None`, and the participant is keyed by bare DID
+    /// (legacy behaviour — one slot per DID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+/// Compute the participants-map key for a (DID, instance_id) pair.
+/// With an instance_id we produce `did#instance` so the same DID can hold
+/// multiple slots; without one we fall back to plain DID for legacy clients.
+pub fn participant_key(did: &str, instance_id: Option<&str>) -> String {
+    match instance_id {
+        Some(iid) if !iid.is_empty() => format!("{did}#{iid}"),
+        _ => did.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,12 +171,18 @@ impl AvSessionManager {
     }
 
     /// Create a new session. Returns the session or an error message.
+    ///
+    /// `creator_instance_id` is the per-device suffix from the creator's
+    /// `+freeq.at/av-instance` tag (None for legacy clients). It's used to
+    /// key the creator's participant slot just like `join_session` does, so
+    /// the creator can later join from a second device without colliding.
     pub fn create_session(
         &mut self,
         channel: Option<&str>,
         creator_did: &str,
         creator_nick: &str,
         title: Option<&str>,
+        creator_instance_id: Option<&str>,
     ) -> Result<AvSession, String> {
         // Check: only one active session per channel.
         // If the existing session has no active participants (all left/disconnected),
@@ -193,8 +218,9 @@ impl AvSessionManager {
         let now = chrono::Utc::now().timestamp();
 
         let mut participants = HashMap::new();
+        let creator_key = participant_key(creator_did, creator_instance_id);
         participants.insert(
-            creator_did.to_string(),
+            creator_key,
             AvParticipant {
                 did: creator_did.to_string(),
                 nick: creator_nick.to_string(),
@@ -202,6 +228,7 @@ impl AvSessionManager {
                 left_at: None,
                 role: ParticipantRole::Host,
                 tracks: vec![],
+                instance_id: creator_instance_id.map(|s| s.to_string()),
             },
         );
 
@@ -230,11 +257,16 @@ impl AvSessionManager {
     }
 
     /// Join an existing session. Returns updated session or error.
+    ///
+    /// `instance_id` lets the same DID hold multiple slots (one per device);
+    /// pass `None` for clients that don't send a `+freeq.at/av-instance` tag
+    /// (one slot per DID, legacy behaviour).
     pub fn join_session(
         &mut self,
         session_id: &str,
         did: &str,
         nick: &str,
+        instance_id: Option<&str>,
     ) -> Result<AvSession, String> {
         let session = self
             .sessions
@@ -257,14 +289,18 @@ impl AvSessionManager {
         }
 
         let now = chrono::Utc::now().timestamp();
+        let key = participant_key(did, instance_id);
 
-        // If already a participant who left, rejoin
-        if let Some(p) = session.participants.get_mut(did) {
+        // If this exact (did, instance_id) slot exists, rejoin in place;
+        // otherwise insert a new slot. Two clients from the same DID end up
+        // in two different slots so each one's MoQ broadcast is discoverable.
+        if let Some(p) = session.participants.get_mut(&key) {
             p.left_at = None;
             p.joined_at = now;
+            p.nick = nick.to_string();
         } else {
             session.participants.insert(
-                did.to_string(),
+                key,
                 AvParticipant {
                     did: did.to_string(),
                     nick: nick.to_string(),
@@ -272,6 +308,7 @@ impl AvSessionManager {
                     left_at: None,
                     role: ParticipantRole::Speaker,
                     tracks: vec![],
+                    instance_id: instance_id.map(|s| s.to_string()),
                 },
             );
         }
@@ -279,19 +316,32 @@ impl AvSessionManager {
         Ok(self.sessions.get(session_id).unwrap().clone())
     }
 
-    /// Leave a session. Returns (session, should_end) — session ends if no active participants remain.
+    /// Leave a session. Returns (session, should_end) — session ends if no
+    /// active participants remain.
+    ///
+    /// `instance_id` selects which device's slot to mark as left; pass `None`
+    /// for legacy clients (matches the bare-DID slot).
     pub fn leave_session(
         &mut self,
         session_id: &str,
         did: &str,
+        instance_id: Option<&str>,
     ) -> Result<(AvSession, bool), String> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("Session {session_id} not found"))?;
 
-        if let Some(p) = session.participants.get_mut(did) {
+        let key = participant_key(did, instance_id);
+        if let Some(p) = session.participants.get_mut(&key) {
             p.left_at = Some(chrono::Utc::now().timestamp());
+        } else if instance_id.is_some() {
+            // Older clients may have joined this session before sending an
+            // instance_id was a thing; fall back to the bare-DID slot so
+            // half-instrumented sessions don't strand participants.
+            if let Some(p) = session.participants.get_mut(did) {
+                p.left_at = Some(chrono::Utc::now().timestamp());
+            }
         }
 
         let active_count = session
@@ -404,6 +454,9 @@ impl AvSessionManager {
         }
 
         let mut participants = HashMap::new();
+        // S2S session creation doesn't yet carry the creator's instance_id,
+        // so this stays bare-DID-keyed. Local av-join from a second device
+        // for the same federated session will still get its own slot.
         participants.insert(
             created_by_did.to_string(),
             AvParticipant {
@@ -413,6 +466,7 @@ impl AvSessionManager {
                 left_at: None,
                 role: ParticipantRole::Host,
                 tracks: vec![],
+                instance_id: None,
             },
         );
 
@@ -439,6 +493,8 @@ impl AvSessionManager {
     }
 
     pub fn apply_remote_session_joined(&mut self, session_id: &str, did: &str, nick: &str) {
+        // S2S doesn't yet carry instance_id; use the bare-DID slot. When the
+        // S2S protocol grows the field, switch to `participant_key(did, iid)`.
         if let Some(session) = self.sessions.get_mut(session_id) {
             let now = chrono::Utc::now().timestamp();
             session
@@ -455,14 +511,23 @@ impl AvSessionManager {
                     left_at: None,
                     role: ParticipantRole::Speaker,
                     tracks: vec![],
+                    instance_id: None,
                 });
         }
     }
 
     pub fn apply_remote_session_left(&mut self, session_id: &str, did: &str) {
+        // Mark every slot for this DID as left — S2S leaves don't carry an
+        // instance_id, so we have to assume the whole remote user dropped.
         if let Some(session) = self.sessions.get_mut(session_id) {
-            if let Some(p) = session.participants.get_mut(did) {
-                p.left_at = Some(chrono::Utc::now().timestamp());
+            let now = chrono::Utc::now().timestamp();
+            for (key, p) in session.participants.iter_mut() {
+                if p.left_at.is_some() {
+                    continue;
+                }
+                if key == did || p.did == did {
+                    p.left_at = Some(now);
+                }
             }
         }
     }
@@ -475,38 +540,49 @@ impl AvSessionManager {
         self.end_session_inner(session_id, ended_by);
     }
 
-    /// Leave all active sessions for a DID. Returns vec of (session_id, channel, nick, should_end).
+    /// Leave all active slots belonging to a DID — used on connection drop.
+    /// With multi-device support each device has its own instance-keyed slot,
+    /// so we have to scan every participant whose `did` matches (not just
+    /// the bare-DID key) and mark each one left. Returns one tuple per
+    /// session where the DID had at least one active slot.
     pub fn leave_all_for_did(&mut self, did: &str) -> Vec<(String, Option<String>, String, bool)> {
-        let session_ids: Vec<String> = self
-            .sessions
-            .iter()
-            .filter(|(_, s)| {
-                matches!(s.state, AvSessionState::Active)
-                    && s.participants
-                        .get(did)
-                        .map(|p| p.left_at.is_none())
-                        .unwrap_or(false)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
+        let now = chrono::Utc::now().timestamp();
         let mut results = Vec::new();
+
+        let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in session_ids {
-            let nick = self
-                .sessions
-                .get(&session_id)
-                .and_then(|s| s.participants.get(did))
-                .map(|p| p.nick.clone())
-                .unwrap_or_default();
-            match self.leave_session(&session_id, did) {
-                Ok((session, should_end)) => {
-                    let channel = session.channel.clone();
-                    results.push((session_id, channel, nick, should_end));
-                }
-                Err(e) => {
-                    tracing::warn!(session_id = %session_id, did = %did, error = %e, "Failed to leave AV session on disconnect");
+            let Some(session) = self.sessions.get_mut(&session_id) else { continue; };
+            if !matches!(session.state, AvSessionState::Active) {
+                continue;
+            }
+            let mut any_left = false;
+            let mut representative_nick = String::new();
+            for p in session.participants.values_mut() {
+                if p.did == did && p.left_at.is_none() {
+                    p.left_at = Some(now);
+                    if representative_nick.is_empty() {
+                        representative_nick = p.nick.clone();
+                    }
+                    any_left = true;
                 }
             }
+            if !any_left {
+                continue;
+            }
+            let active_count = session
+                .participants
+                .values()
+                .filter(|p| p.left_at.is_none())
+                .count();
+            let should_end = active_count == 0;
+            if should_end {
+                self.end_session_inner(&session_id, Some(did));
+            }
+            let channel = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.channel.clone());
+            results.push((session_id, channel, representative_nick, should_end));
         }
         results
     }
@@ -531,14 +607,14 @@ mod tests {
     fn create_and_join_session() {
         let mut mgr = AvSessionManager::new();
         let session = mgr
-            .create_session(Some("#test"), "did:plc:alice", "alice", Some("standup"))
+            .create_session(Some("#test"), "did:plc:alice", "alice", Some("standup"), None)
             .unwrap();
         assert_eq!(session.created_by, "did:plc:alice");
         assert!(matches!(session.state, AvSessionState::Active));
         assert_eq!(session.participants.len(), 1);
 
         let id = session.id.clone();
-        mgr.join_session(&id, "did:plc:bob", "bob").unwrap();
+        mgr.join_session(&id, "did:plc:bob", "bob", None).unwrap();
         let session = mgr.get(&id).unwrap();
         assert_eq!(session.participants.len(), 2);
         assert_eq!(mgr.active_participant_count(&id), 2);
@@ -547,10 +623,10 @@ mod tests {
     #[test]
     fn one_session_per_channel() {
         let mut mgr = AvSessionManager::new();
-        mgr.create_session(Some("#test"), "did:plc:alice", "alice", None)
+        mgr.create_session(Some("#test"), "did:plc:alice", "alice", None, None)
             .unwrap();
         let err = mgr
-            .create_session(Some("#test"), "did:plc:bob", "bob", None)
+            .create_session(Some("#test"), "did:plc:bob", "bob", None, None)
             .unwrap_err();
         assert!(err.contains("already has an active session"));
     }
@@ -559,11 +635,11 @@ mod tests {
     fn leave_and_auto_end() {
         let mut mgr = AvSessionManager::new();
         let session = mgr
-            .create_session(Some("#test"), "did:plc:alice", "alice", None)
+            .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
             .unwrap();
         let id = session.id.clone();
 
-        let (_, should_end) = mgr.leave_session(&id, "did:plc:alice").unwrap();
+        let (_, should_end) = mgr.leave_session(&id, "did:plc:alice", None).unwrap();
         assert!(should_end);
         let session = mgr.get(&id).unwrap();
         assert!(matches!(session.state, AvSessionState::Ended { .. }));
@@ -573,10 +649,10 @@ mod tests {
     fn end_session_marks_all_left() {
         let mut mgr = AvSessionManager::new();
         let session = mgr
-            .create_session(Some("#test"), "did:plc:alice", "alice", None)
+            .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
             .unwrap();
         let id = session.id.clone();
-        mgr.join_session(&id, "did:plc:bob", "bob").unwrap();
+        mgr.join_session(&id, "did:plc:bob", "bob", None).unwrap();
 
         mgr.end_session(&id, Some("did:plc:alice")).unwrap();
         let session = mgr.get(&id).unwrap();
@@ -587,17 +663,17 @@ mod tests {
     fn rejoin_after_leaving() {
         let mut mgr = AvSessionManager::new();
         let session = mgr
-            .create_session(Some("#test"), "did:plc:alice", "alice", None)
+            .create_session(Some("#test"), "did:plc:alice", "alice", None, None)
             .unwrap();
         let id = session.id.clone();
-        mgr.join_session(&id, "did:plc:bob", "bob").unwrap();
+        mgr.join_session(&id, "did:plc:bob", "bob", None).unwrap();
 
         // Bob leaves (alice still in, so session doesn't end)
-        mgr.leave_session(&id, "did:plc:bob").unwrap();
+        mgr.leave_session(&id, "did:plc:bob", None).unwrap();
         assert_eq!(mgr.active_participant_count(&id), 1);
 
         // Bob rejoins
-        mgr.join_session(&id, "did:plc:bob", "bob").unwrap();
+        mgr.join_session(&id, "did:plc:bob", "bob", None).unwrap();
         assert_eq!(mgr.active_participant_count(&id), 2);
     }
 
@@ -606,7 +682,7 @@ mod tests {
         let mut mgr = AvSessionManager::new();
         assert!(mgr.active_session_for_channel("#test").is_none());
 
-        mgr.create_session(Some("#test"), "did:plc:alice", "alice", None)
+        mgr.create_session(Some("#test"), "did:plc:alice", "alice", None, None)
             .unwrap();
         assert!(mgr.active_session_for_channel("#test").is_some());
         assert!(mgr.active_session_for_channel("#TEST").is_some()); // case insensitive
@@ -640,13 +716,64 @@ mod tests {
     }
 
     #[test]
+    fn multi_instance_same_did() {
+        // The bug this fix addresses: one user joining from two devices
+        // (same DID, different instance_id) must produce two participant
+        // slots so each device's MoQ broadcast is independently discoverable.
+        let mut mgr = AvSessionManager::new();
+        let id = mgr
+            .create_session(
+                Some("#test"),
+                "did:plc:alice",
+                "alice",
+                None,
+                Some("iphone"),
+            )
+            .unwrap()
+            .id;
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("web"))
+            .unwrap();
+        let s = mgr.get(&id).unwrap();
+        assert_eq!(s.participants.len(), 2, "two slots for one DID");
+        assert_eq!(mgr.active_participant_count(&id), 2);
+
+        let instances: std::collections::HashSet<_> = s
+            .participants
+            .values()
+            .filter_map(|p| p.instance_id.clone())
+            .collect();
+        assert_eq!(instances.len(), 2);
+        assert!(instances.contains("iphone"));
+        assert!(instances.contains("web"));
+
+        // Leaving one instance keeps the other active.
+        mgr.leave_session(&id, "did:plc:alice", Some("iphone"))
+            .unwrap();
+        assert_eq!(mgr.active_participant_count(&id), 1);
+        let s = mgr.get(&id).unwrap();
+        let still_in: Vec<_> = s
+            .participants
+            .values()
+            .filter(|p| p.left_at.is_none())
+            .filter_map(|p| p.instance_id.clone())
+            .collect();
+        assert_eq!(still_in, vec!["web".to_string()]);
+
+        // Connection-drop cleanup (no instance_id) cleans every slot.
+        let results = mgr.leave_all_for_did("did:plc:alice");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].3, "session should end when last slot drops");
+        assert_eq!(mgr.active_participant_count(&id), 0);
+    }
+
+    #[test]
     fn prune_ended_sessions() {
         let mut mgr = AvSessionManager::new();
         let session = mgr
-            .create_session(Some("#old"), "did:plc:alice", "alice", None)
+            .create_session(Some("#old"), "did:plc:alice", "alice", None, None)
             .unwrap();
         let id = session.id.clone();
-        mgr.leave_session(&id, "did:plc:alice").unwrap();
+        mgr.leave_session(&id, "did:plc:alice", None).unwrap();
 
         // Session just ended — should not be pruned with max_age > 0
         mgr.prune_ended(3600);

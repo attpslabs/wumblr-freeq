@@ -2615,6 +2615,9 @@ impl Db {
                     left_at: row.get(3)?,
                     role: serde_json::from_str(&role_str).unwrap_or(ParticipantRole::Speaker),
                     tracks: vec![],
+                    // Pre-instance-id sessions in the DB: hydrate as None.
+                    // New sessions write/read via the DB schema separately.
+                    instance_id: None,
                 })
             })?.filter_map(|r| r.ok()).collect();
             for p in participants {

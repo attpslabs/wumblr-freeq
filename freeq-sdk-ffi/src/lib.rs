@@ -1089,11 +1089,21 @@ mod av_impl {
         server_url: String,
         session_id: String,
         nick: String,
+        instance_id: String,
         handler: Box<dyn AvEventHandler>,
     ) -> Result<State, FreeqError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let broadcast_name = format!("{session_id}/{nick}");
+        // Broadcast path includes a per-call instance suffix so two devices
+        // signed in as the same DID/nick get distinct MoQ paths. Matches the
+        // `+freeq.at/av-instance` tag the client sent on av-join — the
+        // server records that suffix in its participants list, so peers
+        // know the right path to subscribe to.
+        let broadcast_name = if instance_id.is_empty() {
+            format!("{session_id}/{nick}")
+        } else {
+            format!("{session_id}/{nick}~{instance_id}")
+        };
         let moq_url: url::Url = format!("{server_url}/av/moq")
             .parse()
             .map_err(|_| FreeqError::InvalidArgument)?;
@@ -1347,9 +1357,10 @@ impl FreeqAv {
         server_url: String,
         session_id: String,
         nick: String,
+        instance_id: String,
         handler: Box<dyn AvEventHandler>,
     ) -> Result<Self, FreeqError> {
-        let state = av_impl::connect(server_url, session_id, nick, handler)?;
+        let state = av_impl::connect(server_url, session_id, nick, instance_id, handler)?;
         Ok(Self {
             state: Mutex::new(Some(state)),
         })
@@ -1411,6 +1422,7 @@ impl FreeqAv {
         _server_url: String,
         _session_id: String,
         _nick: String,
+        _instance_id: String,
         _handler: Box<dyn AvEventHandler>,
     ) -> Result<Self, FreeqError> {
         Err(FreeqError::ConnectionFailed) // AV not compiled in
@@ -1496,6 +1508,7 @@ mod tests {
             "http://127.0.0.1:19999".to_string(), // no server here
             "test-session".to_string(),
             "test-nick".to_string(),
+            "test-instance".to_string(),
             handler,
         );
 

@@ -587,13 +587,14 @@ open class FreeqAv: FreeqAvProtocol, @unchecked Sendable {
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
         return try! rustCall { uniffi_freeq_sdk_ffi_fn_clone_freeqav(self.pointer, $0) }
     }
-public convenience init(serverUrl: String, sessionId: String, nick: String, handler: AvEventHandler)throws  {
+public convenience init(serverUrl: String, sessionId: String, nick: String, instanceId: String, handler: AvEventHandler)throws  {
     let pointer =
         try rustCallWithError(FfiConverterTypeFreeqError_lift) {
     uniffi_freeq_sdk_ffi_fn_constructor_freeqav_new(
         FfiConverterString.lower(serverUrl),
         FfiConverterString.lower(sessionId),
         FfiConverterString.lower(nick),
+        FfiConverterString.lower(instanceId),
         FfiConverterCallbackInterfaceAvEventHandler_lower(handler),$0
     )
 }
@@ -3199,7 +3200,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqp2p_shutdown() != 50660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_freeq_sdk_ffi_checksum_constructor_freeqav_new() != 34209) {
+    if (uniffi_freeq_sdk_ffi_checksum_constructor_freeqav_new() != 1846) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_constructor_freeqclient_new() != 42979) {

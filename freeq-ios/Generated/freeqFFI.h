@@ -308,7 +308,7 @@ void uniffi_freeq_sdk_ffi_fn_free_freeqav(void*_Nonnull ptr, RustCallStatus *_No
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_CONSTRUCTOR_FREEQAV_NEW
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_CONSTRUCTOR_FREEQAV_NEW
-void*_Nonnull uniffi_freeq_sdk_ffi_fn_constructor_freeqav_new(RustBuffer server_url, RustBuffer session_id, RustBuffer nick, uint64_t handler, RustCallStatus *_Nonnull out_status
+void*_Nonnull uniffi_freeq_sdk_ffi_fn_constructor_freeqav_new(RustBuffer server_url, RustBuffer session_id, RustBuffer nick, RustBuffer instance_id, uint64_t handler, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQAV_IS_CONNECTED

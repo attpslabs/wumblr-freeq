@@ -228,6 +228,25 @@ export function unpinMessage(channel: string, msgid: string) {
 
 let pendingAvStart: { channel: string; did: string } | null = null;
 
+/// Per-call random suffix. Sent on every av-start/av-join/av-leave as the
+/// `+freeq.at/av-instance` tag and used to build the MoQ broadcast path
+/// (`{sessionId}/{nick}~{instance}`), so two devices signed in as the same
+/// DID get distinct participant slots and broadcasts.
+let currentAvInstance: string | null = null;
+
+function generateAvInstanceId(): string {
+  // 4 random bytes → 8 lowercase hex chars. Plenty of entropy for
+  // collision avoidance within a session; short enough that broadcast
+  // paths stay readable in logs.
+  const buf = new Uint8Array(4);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function getAvInstanceId(): string | null {
+  return currentAvInstance;
+}
+
 export async function startAvSession(channel: string, title?: string) {
   const store = useStore.getState();
   if (!store.authDid) {
@@ -256,14 +275,22 @@ export async function startAvSession(channel: string, title?: string) {
 
   store.addSystemMessage(channel, 'Starting voice session...');
   pendingAvStart = { channel, did: store.authDid };
-  const tags: Record<string, string> = { '+freeq.at/av-start': '' };
+  currentAvInstance = generateAvInstanceId();
+  const tags: Record<string, string> = {
+    '+freeq.at/av-start': '',
+    '+freeq.at/av-instance': currentAvInstance,
+  };
   if (title) tags['+freeq.at/av-title'] = title;
   client?.raw(format('TAGMSG', [channel], tags));
   store.setAvAudioActive(true);
 }
 
 export function joinAvSession(channel: string, sessionId?: string) {
-  const tags: Record<string, string> = { '+freeq.at/av-join': '' };
+  if (!currentAvInstance) currentAvInstance = generateAvInstanceId();
+  const tags: Record<string, string> = {
+    '+freeq.at/av-join': '',
+    '+freeq.at/av-instance': currentAvInstance,
+  };
   if (sessionId) {
     tags['+freeq.at/av-id'] = sessionId;
     useStore.getState().setActiveAvSession(sessionId);
@@ -276,7 +303,9 @@ export function leaveAvSession(channel: string, sessionId: string) {
     '+freeq.at/av-leave': '',
     '+freeq.at/av-id': sessionId,
   };
+  if (currentAvInstance) tags['+freeq.at/av-instance'] = currentAvInstance;
   client?.raw(format('TAGMSG', [channel], tags));
+  currentAvInstance = null;
   useStore.getState().setActiveAvSession(null);
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { useStore } from '../store';
-import { getNick, leaveAvSession } from '../irc/client';
+import { getAvInstanceId, getNick, leaveAvSession } from '../irc/client';
 import { loadMoqComponents } from '../lib/moq-loader';
 import { getCachedProfile } from '../lib/profiles';
 
@@ -81,7 +81,13 @@ export function CallPanel() {
       container.appendChild(pub);
       publishElRef.current = pub;
 
-      const broadcastName = `${sessionId}/${myNick}`;
+      // Include the per-call instance suffix the IRC layer generated for
+      // our av-join TAGMSG so this device's path is unique even if the
+      // same DID is also publishing from another tab/device.
+      const myInstance = getAvInstanceId();
+      const broadcastName = myInstance
+        ? `${sessionId}/${myNick}~${myInstance}`
+        : `${sessionId}/${myNick}`;
       pub.setAttribute('url', moqOrigin);
       pub.setAttribute('name', broadcastName);
       pub.setAttribute('source', 'camera');
@@ -147,27 +153,49 @@ export function CallPanel() {
       const data = await resp.json();
       if (!data.participants) return;
 
-      const nicks: string[] = data.participants
-        .map((p: { nick: string }) => p.nick)
-        .filter((n: string) => n.toLowerCase() !== myNick.toLowerCase());
+      const myInstance = getAvInstanceId();
 
-      setParticipants(nicks);
+      // Each participant slot is identified by (nick, instance_id). Two
+      // devices on the same DID return two entries with the same nick but
+      // different instance_id — and we have to subscribe to each path
+      // independently. The watcher map is keyed by the full broadcast key
+      // so the per-slot lifecycle works.
+      type Slot = { nick: string; broadcastKey: string; broadcastName: string };
+      const slots: Slot[] = data.participants
+        .filter((p: { nick: string; instance_id?: string | null }) => {
+          // Skip *our own* slot (matching nick AND matching instance_id).
+          if (p.nick.toLowerCase() !== myNick.toLowerCase()) return true;
+          if (myInstance && p.instance_id && p.instance_id === myInstance) return false;
+          if (!myInstance && !p.instance_id) return false;
+          // Same nick, different instance — that's another device of ours.
+          // Subscribe so the user hears themselves across devices (useful
+          // for verifying the call is wired up at all).
+          return true;
+        })
+        .map((p: { nick: string; instance_id?: string | null }) => {
+          const broadcastKey = p.instance_id ? `${p.nick}~${p.instance_id}` : p.nick;
+          const broadcastName = `${sessionId}/${broadcastKey}`;
+          return { nick: p.nick, broadcastKey, broadcastName };
+        });
+
+      setParticipants(slots.map((s) => s.nick));
 
       const container = watchContainerRef.current;
       if (!container) return;
 
-      for (const nick of nicks) {
-        if (watchersRef.current.has(nick)) continue;
+      const liveKeys = new Set(slots.map((s) => s.broadcastKey));
 
-        const retries = retryCountRef.current.get(nick) || 0;
+      for (const slot of slots) {
+        if (watchersRef.current.has(slot.broadcastKey)) continue;
+
+        const retries = retryCountRef.current.get(slot.broadcastKey) || 0;
         if (retries > 0) {
           const skipCycles = Math.min(retries, 3);
-          retryCountRef.current.set(nick, retries - skipCycles);
+          retryCountRef.current.set(slot.broadcastKey, retries - skipCycles);
           if (retries > skipCycles) continue;
         }
 
-        const broadcastName = `${sessionId}/${nick}`;
-        console.log('[call] Subscribing to:', broadcastName);
+        console.log('[call] Subscribing to:', slot.broadcastName);
 
         const watchEl = document.createElement('moq-watch');
         const canvas = document.createElement('canvas');
@@ -177,29 +205,30 @@ export function CallPanel() {
 
         watchEl.setAttribute('jitter', '100');
         watchEl.setAttribute('url', moqOrigin);
-        watchEl.setAttribute('name', broadcastName);
+        watchEl.setAttribute('name', slot.broadcastName);
 
+        const key = slot.broadcastKey;
         watchEl.addEventListener('error', () => {
-          console.log('[call] Watch error for', nick, '— will retry');
-          watchersRef.current.delete(nick);
-          const count = retryCountRef.current.get(nick) || 0;
-          retryCountRef.current.set(nick, Math.min(count + 1, 4));
+          console.log('[call] Watch error for', key, '— will retry');
+          watchersRef.current.delete(key);
+          const count = retryCountRef.current.get(key) || 0;
+          retryCountRef.current.set(key, Math.min(count + 1, 4));
           watchEl.setAttribute('url', '');
           watchEl.remove();
         });
 
-        watchersRef.current.set(nick, watchEl);
+        watchersRef.current.set(key, watchEl);
         setTimeout(() => {
-          if (watchersRef.current.has(nick)) retryCountRef.current.delete(nick);
+          if (watchersRef.current.has(key)) retryCountRef.current.delete(key);
         }, 10000);
       }
 
-      for (const [nick, el] of watchersRef.current) {
-        if (!nicks.includes(nick)) {
+      for (const [key, el] of watchersRef.current) {
+        if (!liveKeys.has(key)) {
           el.setAttribute('url', '');
           el.remove();
-          watchersRef.current.delete(nick);
-          retryCountRef.current.delete(nick);
+          watchersRef.current.delete(key);
+          retryCountRef.current.delete(key);
         }
       }
     } catch (e) {
