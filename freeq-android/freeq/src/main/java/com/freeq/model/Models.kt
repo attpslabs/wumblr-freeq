@@ -48,6 +48,21 @@ data class MemberInfo(
 
 // ── Channel state ──
 
+/**
+ * Parse an IRCv3 `time`-tag value (ISO-8601 UTC, e.g.
+ * `2011-10-19T16:40:51.620Z`) to epoch millis. Returns null on
+ * blank/unparseable input so callers can no-op safely.
+ */
+internal fun parseServerTimeMillis(raw: String?): Long? {
+    val s = raw?.trim().orEmpty()
+    if (s.isEmpty()) return null
+    return try {
+        java.time.Instant.parse(s).toEpochMilli()
+    } catch (_: Exception) {
+        null
+    }
+}
+
 class ChannelState(val name: String) {
     val messages = mutableStateListOf<ChatMessage>()
     val members = mutableStateListOf<MemberInfo>()
@@ -80,6 +95,21 @@ class ChannelState(val name: String) {
         // Only real messages (not system join/part) update lastActivityTime
         if (msg.from.isNotEmpty() && msg.timestamp.time > lastActivityTime.value) {
             lastActivityTime.value = msg.timestamp.time
+        }
+    }
+
+    /**
+     * Seed `lastActivityTime` from a CHATHISTORY TARGETS server-time tag.
+     * Mirrors iOS 6dff8b2: a freshly minted DM buffer (no messages yet)
+     * takes the server time unconditionally so the chat list sorts
+     * correctly on cold launch before per-DM history backfills; a buffer
+     * that already has messages only moves forward, never regressing past
+     * in-session activity. No-op on blank/unparseable input.
+     */
+    fun seedActivityFromTarget(serverTime: String?) {
+        val ms = parseServerTimeMillis(serverTime) ?: return
+        if (messages.isEmpty() || ms > lastActivityTime.value) {
+            lastActivityTime.value = ms
         }
     }
 
@@ -1158,8 +1188,11 @@ class AndroidEventHandler(private val state: AppState) : EventHandler {
             }
 
             is FreeqEvent.ChatHistoryTarget -> {
-                // Create DM buffer for each conversation partner
-                state.getOrCreateDM(event.nick)
+                // Create a DM buffer for each conversation partner and seed
+                // its last-activity from the server-time tag so the chat
+                // list orders correctly on cold launch before per-DM
+                // history backfills (matches iOS 70c4ae3/6dff8b2).
+                state.getOrCreateDM(event.nick).seedActivityFromTarget(event.timestamp)
             }
 
             is FreeqEvent.WhoisReply -> {

@@ -187,4 +187,55 @@ class ChannelStateTest {
         val ch = ChannelState("#test")
         assertNull(ch.findMessage("nope"))
     }
+
+    // ── seedActivityFromTarget (CHATHISTORY TARGETS cold-launch ordering) ──
+
+    private fun iso(ms: Long) = java.time.Instant.ofEpochMilli(ms).toString()
+
+    @Test fun parseServerTimeMillis_round_trips_iso8601_utc() {
+        assertEquals(1319042451620L, parseServerTimeMillis("2011-10-19T16:40:51.620Z"))
+        assertEquals(123456789L, parseServerTimeMillis(iso(123456789L)))
+    }
+
+    @Test fun parseServerTimeMillis_returns_null_for_blank_or_garbage() {
+        assertNull(parseServerTimeMillis(null))
+        assertNull(parseServerTimeMillis(""))
+        assertNull(parseServerTimeMillis("   "))
+        assertNull(parseServerTimeMillis("not-a-timestamp"))
+        assertNull(parseServerTimeMillis("2011-10-19 16:40:51")) // no T / no zone
+    }
+
+    @Test fun seedActivityFromTarget_seeds_fresh_buffer_unconditionally() {
+        // A buffer just minted by getOrCreateDM has no messages and
+        // lastActivityTime == 0L; without this it would sort to the bottom
+        // of the chat list until per-DM history backfilled.
+        val ch = ChannelState("alice")
+        ch.seedActivityFromTarget(iso(5_000L))
+        assertEquals(5_000L, ch.lastActivityTime.value)
+    }
+
+    @Test fun seedActivityFromTarget_does_not_regress_in_session_activity() {
+        // Buffer already has a live message newer than the server's
+        // historical TARGETS timestamp; seeding must not move it backward.
+        val ch = ChannelState("alice")
+        ch.appendIfNew(msg(id = "live", from = "alice", timestamp = Date(9_000L)))
+        assertEquals(9_000L, ch.lastActivityTime.value)
+        ch.seedActivityFromTarget(iso(3_000L))
+        assertEquals(9_000L, ch.lastActivityTime.value)
+    }
+
+    @Test fun seedActivityFromTarget_moves_forward_when_server_time_newer() {
+        val ch = ChannelState("alice")
+        ch.appendIfNew(msg(id = "old", from = "alice", timestamp = Date(2_000L)))
+        ch.seedActivityFromTarget(iso(8_000L))
+        assertEquals(8_000L, ch.lastActivityTime.value)
+    }
+
+    @Test fun seedActivityFromTarget_is_noop_on_blank_or_garbage() {
+        val ch = ChannelState("alice")
+        ch.seedActivityFromTarget(null)
+        ch.seedActivityFromTarget("")
+        ch.seedActivityFromTarget("garbage")
+        assertEquals(0L, ch.lastActivityTime.value)
+    }
 }
