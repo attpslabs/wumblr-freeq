@@ -3706,6 +3706,10 @@ fn session_to_json(s: &crate::av::AvSession, mgr: &crate::av::AvSessionManager) 
             "nick": p.nick,
             "role": p.role,
             "joined_at": p.joined_at,
+            // Per-device suffix; required by the web client to build the
+            // MoQ broadcast path `{session_id}/{nick}~{instance_id}` so
+            // two devices on one DID get distinct watch subscriptions.
+            "instance_id": p.instance_id,
         }))
         .collect();
     serde_json::json!({

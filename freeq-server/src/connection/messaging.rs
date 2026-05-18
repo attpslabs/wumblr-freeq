@@ -1963,7 +1963,35 @@ fn handle_av_tagmsg(
             // it; the manager falls back to one-slot-per-DID for them.
             let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
 
+            // Before joining: reap any orphan slots in this session whose
+            // owning IRC connection is gone. Live-set is built from the
+            // (did, instance) pairs that current connections registered on
+            // their own av-join. Without this, a refreshed/crashed tab
+            // leaves a `left_at: None` ghost in the participants list and
+            // peers waste subscriptions on a broadcast nobody publishes.
+            let live: std::collections::HashSet<(String, Option<String>)> = {
+                let per_conn = state.av_instances_per_conn.lock();
+                let dids = state.session_dids.lock();
+                per_conn
+                    .iter()
+                    .flat_map(|(sid, instances)| {
+                        let did_for_sid = dids.get(sid).cloned();
+                        let did_for_sid = did_for_sid.unwrap_or_default();
+                        instances
+                            .iter()
+                            .map(move |inst| (did_for_sid.clone(), Some(inst.clone())))
+                    })
+                    // Always treat the joiner as live, even before we've
+                    // recorded their instance.
+                    .chain(std::iter::once((
+                        did.clone(),
+                        instance_id.map(|s| s.to_string()),
+                    )))
+                    .collect()
+            };
+
             let mut mgr = state.av_sessions.lock();
+            mgr.reap_orphan_slots(&session_id, &live);
             match mgr.join_session(&session_id, &did, &nick, instance_id) {
                 Ok(session) => {
                     let participant_count = mgr.active_participant_count(&session_id);
@@ -1973,6 +2001,18 @@ fn handle_av_tagmsg(
                         state.with_db(|db| db.save_av_session(s));
                     }
                     drop(mgr);
+
+                    // Record this instance against the IRC connection so the
+                    // disconnect handler can clean only this slot — not every
+                    // slot of the same DID across other tabs/devices.
+                    if let Some(inst) = instance_id {
+                        state
+                            .av_instances_per_conn
+                            .lock()
+                            .entry(conn.id.clone())
+                            .or_default()
+                            .insert(inst.to_string());
+                    }
 
                     // Send iroh-live RoomTicket to joiner (for native clients)
                     if let Some(ticket) = &session.iroh_ticket {
@@ -2032,6 +2072,13 @@ fn handle_av_tagmsg(
 
         "+freeq.at/av-leave" => {
             let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
+            // Untrack this instance against the connection so the disconnect
+            // handler doesn't try to leave it a second time.
+            if let Some(inst) = instance_id {
+                if let Some(set) = state.av_instances_per_conn.lock().get_mut(&conn.id) {
+                    set.remove(inst);
+                }
+            }
             let mut mgr = state.av_sessions.lock();
             match mgr.leave_session(&session_id, &did, instance_id) {
                 Ok((session, should_end)) => {

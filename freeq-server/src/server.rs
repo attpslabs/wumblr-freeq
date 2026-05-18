@@ -628,6 +628,11 @@ pub struct SharedState {
     pub agent_presence: Mutex<HashMap<String, crate::connection::AgentPresence>>,
     /// Agent heartbeat tracking: session_id → (last_heartbeat_unix, ttl_seconds).
     pub agent_heartbeats: Mutex<HashMap<String, (i64, u64)>>,
+    /// AV instance_ids actively joined per IRC connection.
+    /// session_id → set of instance_ids the client sent on av-join.
+    /// Used on disconnect to clean only this connection's slots (per-instance)
+    /// and on av-join to reap orphan slots whose IRC connection is gone.
+    pub av_instances_per_conn: Mutex<HashMap<String, HashSet<String>>>,
     /// Pending OAuth sessions: state → OAuthPending.
     pub oauth_pending: Mutex<HashMap<String, OAuthPending>>,
     /// Completed OAuth sessions: state → OAuthResult.
@@ -1194,6 +1199,7 @@ impl Server {
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_presence: Mutex::new(HashMap::new()),
             agent_heartbeats: Mutex::new(HashMap::new()),
+            av_instances_per_conn: Mutex::new(HashMap::new()),
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),
@@ -4115,6 +4121,7 @@ mod s2s_adversarial_tests {
             provenance_declarations: Mutex::new(HashMap::new()),
             agent_presence: Mutex::new(HashMap::new()),
             agent_heartbeats: Mutex::new(HashMap::new()),
+            av_instances_per_conn: Mutex::new(HashMap::new()),
             oauth_pending: Mutex::new(HashMap::new()),
             oauth_complete: Mutex::new(HashMap::new()),
             web_auth_tokens: Mutex::new(HashMap::new()),

@@ -540,6 +540,78 @@ impl AvSessionManager {
         self.end_session_inner(session_id, ended_by);
     }
 
+    /// Leave a single (DID, instance) slot across every active session.
+    /// Used when one specific IRC connection (a single device/tab) drops —
+    /// other devices on the same DID must keep their slots.
+    /// Returns one tuple per session where that slot was marked left:
+    /// `(session_id, channel, nick, should_end)`.
+    pub fn leave_for_did_instance(
+        &mut self,
+        did: &str,
+        instance_id: Option<&str>,
+    ) -> Vec<(String, Option<String>, String, bool)> {
+        let now = chrono::Utc::now().timestamp();
+        let mut results = Vec::new();
+        let key = participant_key(did, instance_id);
+        let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for session_id in session_ids {
+            let Some(session) = self.sessions.get_mut(&session_id) else { continue; };
+            if !matches!(session.state, AvSessionState::Active) {
+                continue;
+            }
+            let nick = match session.participants.get_mut(&key) {
+                Some(p) if p.left_at.is_none() => {
+                    p.left_at = Some(now);
+                    p.nick.clone()
+                }
+                _ => continue,
+            };
+            let active_count = session
+                .participants
+                .values()
+                .filter(|p| p.left_at.is_none())
+                .count();
+            let should_end = active_count == 0;
+            if should_end {
+                self.end_session_inner(&session_id, Some(did));
+            }
+            let channel = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.channel.clone());
+            results.push((session_id, channel, nick, should_end));
+        }
+        results
+    }
+
+    /// Phantom-slot reaper. Given the set of `(did, instance_id)` pairs
+    /// that have a live IRC connection right now, mark every other active
+    /// slot in the named session as left. This is the cure for the
+    /// "page-refresh leaves a ghost participant" class of bug.
+    ///
+    /// Callers should build the live-set by walking current connections
+    /// and reading whatever av-instance they registered on join.
+    pub fn reap_orphan_slots(
+        &mut self,
+        session_id: &str,
+        live: &std::collections::HashSet<(String, Option<String>)>,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        let Some(session) = self.sessions.get_mut(session_id) else { return };
+        if !matches!(session.state, AvSessionState::Active) {
+            return;
+        }
+        for p in session.participants.values_mut() {
+            if p.left_at.is_some() {
+                continue;
+            }
+            let key = (p.did.clone(), p.instance_id.clone());
+            if !live.contains(&key) {
+                p.left_at = Some(now);
+            }
+        }
+    }
+
     /// Leave all active slots belonging to a DID — used on connection drop.
     /// With multi-device support each device has its own instance-keyed slot,
     /// so we have to scan every participant whose `did` matches (not just
@@ -764,6 +836,139 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].3, "session should end when last slot drops");
         assert_eq!(mgr.active_participant_count(&id), 0);
+    }
+
+    /// Phantom-participants bug, observed 2026-05-18 in #avtest:
+    ///
+    /// User joined a brand-new channel from a single web client. UI shows 4
+    /// participant tiles (1 self + 3 "chadfowler.com" ghosts). This test
+    /// pins down the contract we need: when a stale connection is gone, its
+    /// instance_id'd slot must not keep `left_at = None`.
+    ///
+    /// `leave_all_for_did` already does this — but ONLY if the disconnect
+    /// handler actually runs. The bug surfaces when the same DID has live
+    /// connections still up (other tabs/devices) and `leave_all_for_did`
+    /// nukes slots for OTHER instances that are still active.
+    ///
+    /// This test demonstrates the over-broad cleanup: a single
+    /// `leave_all_for_did` for a DID that still has another live instance
+    /// should NOT mark the other instance as left. We want per-instance
+    /// granularity for cleanup.
+    #[test]
+    fn leave_all_for_did_over_broad_kills_live_instances() {
+        let mut mgr = AvSessionManager::new();
+        // iPhone creates the session.
+        let id = mgr
+            .create_session(Some("#avtest"), "did:plc:alice", "alice", None, Some("iphone"))
+            .unwrap()
+            .id;
+        // Web tab joins as same DID, different instance.
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("web"))
+            .unwrap();
+        assert_eq!(mgr.active_participant_count(&id), 2);
+
+        // The iPhone disconnects (its IRC connection closes). The web tab
+        // is STILL alive. Today's `leave_all_for_did` doesn't know that —
+        // it nukes every slot for the DID, including the web one.
+        // What we want is per-instance cleanup keyed on the dying connection.
+        mgr.leave_for_did_instance("did:plc:alice", Some("iphone"));
+
+        // FAILING ASSERTION until we add `leave_for_did_instance` and tie
+        // disconnect cleanup to the specific instance whose connection died.
+        assert_eq!(
+            mgr.active_participant_count(&id),
+            1,
+            "leaving one instance must keep the other alive — got {}",
+            mgr.active_participant_count(&id)
+        );
+        let s = mgr.get(&id).unwrap();
+        let still_in: Vec<_> = s
+            .participants
+            .values()
+            .filter(|p| p.left_at.is_none())
+            .filter_map(|p| p.instance_id.clone())
+            .collect();
+        assert_eq!(still_in, vec!["web".to_string()]);
+    }
+
+    /// REST API contract: `session_to_json` strips `instance_id` from each
+    /// participant. The web client needs it to build per-device broadcast
+    /// paths (`{session}/{nick}~{instance_id}`). Without it every same-DID
+    /// slot collapses to the bare nick and we can't subscribe per-device.
+    ///
+    /// This is a unit test for the data model: `AvParticipant` must expose
+    /// `instance_id` such that the JSON layer can pass it through. The
+    /// matching fix in `web.rs::session_to_json` then has to actually
+    /// include the field.
+    #[test]
+    fn participant_carries_instance_id_for_api_serialization() {
+        let mut mgr = AvSessionManager::new();
+        let id = mgr
+            .create_session(Some("#avtest"), "did:plc:alice", "alice", None, Some("iphone"))
+            .unwrap()
+            .id;
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("web"))
+            .unwrap();
+        let s = mgr.get(&id).unwrap();
+        let instances: std::collections::BTreeSet<_> = s
+            .participants
+            .values()
+            .filter(|p| p.left_at.is_none())
+            .map(|p| p.instance_id.clone().unwrap_or_default())
+            .collect();
+        assert!(instances.contains("iphone"));
+        assert!(instances.contains("web"));
+    }
+
+    /// Stale-slot accumulation: when the same DID joins repeatedly with
+    /// different instance_ids without ever sending av-leave (page refreshes,
+    /// crashes), we end up with N slots even though only the most recent
+    /// has a live connection.
+    ///
+    /// We want a server-side reaper that, given the set of currently-online
+    /// (did, instance_id) pairs, marks any other slot for that DID as left.
+    /// This is the API the disconnect handler should call when it learns
+    /// "this connection died" — but it needs the join handler to record the
+    /// connection→instance mapping in the first place.
+    ///
+    /// FAILING until we implement `reap_orphan_slots`.
+    #[test]
+    fn reap_orphan_slots_clears_phantom_participants() {
+        let mut mgr = AvSessionManager::new();
+        let id = mgr
+            .create_session(Some("#avtest"), "did:plc:alice", "alice", None, Some("tab1"))
+            .unwrap()
+            .id;
+        // Three more tabs joined, none ever sent av-leave (typical browser
+        // tab churn).
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("tab2")).unwrap();
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("tab3")).unwrap();
+        mgr.join_session(&id, "did:plc:alice", "alice", Some("tab4")).unwrap();
+        assert_eq!(mgr.active_participant_count(&id), 4);
+
+        // Only tab4 has a live connection now. Reaper should clean tabs 1-3.
+        let live: std::collections::HashSet<(String, Option<String>)> = [(
+            "did:plc:alice".to_string(),
+            Some("tab4".to_string()),
+        )]
+        .into_iter()
+        .collect();
+        mgr.reap_orphan_slots(&id, &live);
+
+        assert_eq!(
+            mgr.active_participant_count(&id),
+            1,
+            "reaper should leave exactly one live slot — got {}",
+            mgr.active_participant_count(&id)
+        );
+        let s = mgr.get(&id).unwrap();
+        let live_instances: Vec<_> = s
+            .participants
+            .values()
+            .filter(|p| p.left_at.is_none())
+            .filter_map(|p| p.instance_id.clone())
+            .collect();
+        assert_eq!(live_instances, vec!["tab4".to_string()]);
     }
 
     #[test]

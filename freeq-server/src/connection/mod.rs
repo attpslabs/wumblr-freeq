@@ -2510,12 +2510,36 @@ where
         true // Guest sessions are always "last"
     };
 
-    // Clean up AV sessions: leave any active sessions this user is in.
-    // This must happen before ghost mode so sessions don't get stuck with phantom participants.
+    // Clean up AV sessions: leave only THIS connection's instance slots —
+    // not every slot for the DID (the user may have other tabs/devices in
+    // the same call). When the user wasn't using per-instance tags (older
+    // clients), fall back to the legacy whole-DID cleanup.
     {
         let did_for_av = conn.authenticated_did.clone()
             .unwrap_or_else(|| format!("guest:{}", conn.nick.as_deref().unwrap_or("*")));
-        let left_sessions = state.av_sessions.lock().leave_all_for_did(&did_for_av);
+
+        let instances: Vec<String> = state
+            .av_instances_per_conn
+            .lock()
+            .remove(&session_id)
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default();
+
+        let left_sessions = {
+            let mut mgr = state.av_sessions.lock();
+            if instances.is_empty() {
+                // Legacy path — no per-instance bookkeeping for this connection,
+                // so we don't know which slots are ours. Mark all DID slots left.
+                mgr.leave_all_for_did(&did_for_av)
+            } else {
+                let mut out = Vec::new();
+                for inst in &instances {
+                    out.extend(mgr.leave_for_did_instance(&did_for_av, Some(inst)));
+                }
+                out
+            }
+        };
+
         for (av_sid, channel, av_nick, should_end) in &left_sessions {
             if let Some(ch) = channel {
                 let participant_count = state.av_sessions.lock().active_participant_count(av_sid);
