@@ -107,9 +107,18 @@ export function CallPanel() {
   // ── Sync mute state ─────────────────────────────────────────
   useEffect(() => {
     const pub = publishElRef.current;
-    if (pub) {
-      (pub as HTMLElement & { muted?: boolean }).muted = avMuted;
+    if (!pub) return;
+    // Belt + suspenders: set both the DOM attribute and the JS property
+    // — moq-publish's mute implementation has shifted between attribute-
+    // observed and property-observed at various versions, and silently
+    // ignoring one half of that contract surfaces as "the icon toggles
+    // but my voice still goes through".
+    if (avMuted) {
+      pub.setAttribute('muted', '');
+    } else {
+      pub.removeAttribute('muted');
     }
+    (pub as HTMLElement & { muted?: boolean }).muted = avMuted;
   }, [avMuted]);
 
   // ── Sync camera state ───────────────────────────────────────

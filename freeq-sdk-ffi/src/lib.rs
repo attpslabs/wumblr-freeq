@@ -1043,8 +1043,12 @@ mod av_impl {
     /// silently — this is the right behaviour for camera capture (display the
     /// fresh frame, not a backlog).
     pub(super) struct PushVideoSource {
-        pending: Arc<Mutex<Option<VideoFrame>>>,
-        format: Arc<Mutex<VideoFormat>>,
+        pub(super) pending: Arc<Mutex<Option<VideoFrame>>>,
+        pub(super) format: Arc<Mutex<VideoFormat>>,
+        /// Toggled by `set_camera_enabled`. While false, pop_frame returns
+        /// None (encoder idles); the source itself stays registered so the
+        /// catalog keeps advertising the video rendition.
+        pub(super) enabled: Arc<AtomicBool>,
     }
 
     impl VideoSource for PushVideoSource {
@@ -1055,6 +1059,9 @@ mod av_impl {
             self.format.lock().unwrap().clone()
         }
         fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+            if !self.enabled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
             Ok(self.pending.lock().unwrap().take())
         }
         fn start(&mut self) -> anyhow::Result<()> {
@@ -1071,7 +1078,10 @@ mod av_impl {
     };
 
     pub(super) struct State {
-        pub broadcast: LocalBroadcast,
+        /// Held so the producer side of the broadcast (audio + video
+        /// sources, encoder pipelines) stays alive for the call's lifetime.
+        /// Dropping it would tear down the publish path.
+        pub _broadcast: LocalBroadcast,
         // Held to keep audio/video device handles alive for the session.
         pub _audio_backend: iroh_live::media::audio_backend::AudioBackend,
         pub _session: moq_lite::Session,
@@ -1079,8 +1089,11 @@ mod av_impl {
         pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
         pub connected: bool,
         pub muted: Arc<AtomicBool>,
-        // Camera state — populated when set_camera_enabled(true) is first called.
-        pub camera_enabled: bool,
+        /// Gated by `set_camera_enabled`. The video source is registered at
+        /// connect time so the catalog always advertises the rendition;
+        /// the flag just controls whether `pop_frame` actually returns
+        /// pushed frames or short-circuits to None.
+        pub camera_enabled: Arc<AtomicBool>,
         pub pending_frame: Arc<Mutex<Option<VideoFrame>>>,
         pub video_format: Arc<Mutex<VideoFormat>>,
     }
@@ -1109,6 +1122,9 @@ mod av_impl {
             .map_err(|_| FreeqError::InvalidArgument)?;
 
         let muted = Arc::new(AtomicBool::new(false));
+        let pending_frame: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
+        let video_format = Arc::new(Mutex::new(DEFAULT_VIDEO_FORMAT));
+        let camera_enabled_flag = Arc::new(AtomicBool::new(false));
 
         let (session, origin, sub_consumer, audio_backend, broadcast) =
             RUNTIME.block_on(async {
@@ -1130,6 +1146,25 @@ mod av_impl {
                     .audio()
                     .set(muteable, AudioCodec::Opus, [AudioPreset::Hq])
                     .map_err(|_| FreeqError::ConnectionFailed)?;
+
+                // Advertise video in the catalog NOW, before any peer
+                // subscribes. moq-watch (used by the web client) reads the
+                // catalog at sub time; if we wait until the user toggles
+                // their camera on, peers who subscribed earlier never pick
+                // up the video track and silently render a black tile.
+                // The encoder happily idles while pop_frame returns None.
+                let push_source = PushVideoSource {
+                    pending: pending_frame.clone(),
+                    format: video_format.clone(),
+                    enabled: camera_enabled_flag.clone(),
+                };
+                broadcast
+                    .video()
+                    .set_source(push_source, VideoCodec::H264, [VideoPreset::P720])
+                    .map_err(|e| {
+                        tracing::warn!("AV: initial video set_source failed: {e}");
+                        FreeqError::ConnectionFailed
+                    })?;
 
                 let origin = moq_lite::Origin::produce();
                 origin.publish_broadcast(&broadcast_name, broadcast.consume());
@@ -1218,16 +1253,16 @@ mod av_impl {
         });
 
         Ok(State {
-            broadcast,
+            _broadcast: broadcast,
             _audio_backend: audio_backend,
             _session: session,
             _origin: origin,
             shutdown_tx: Some(shutdown_tx),
             connected: true,
             muted,
-            camera_enabled: false,
-            pending_frame: Arc::new(Mutex::new(None)),
-            video_format: Arc::new(Mutex::new(DEFAULT_VIDEO_FORMAT)),
+            camera_enabled: camera_enabled_flag,
+            pending_frame,
+            video_format,
         })
     }
 
@@ -1319,40 +1354,24 @@ mod av_impl {
         }
     }
 
-    pub(super) fn enable_camera(state: &mut State) -> Result<(), FreeqError> {
-        if state.camera_enabled {
+    pub(super) fn enable_camera(state: &State) -> Result<(), FreeqError> {
+        if state.camera_enabled.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        let source = PushVideoSource {
-            pending: state.pending_frame.clone(),
-            format: state.video_format.clone(),
-        };
-        state
-            .broadcast
-            .video()
-            .set_source(source, VideoCodec::H264, [VideoPreset::P720])
-            .map_err(|e| {
-                tracing::warn!("AV: set_source failed: {e}");
-                FreeqError::ConnectionFailed
-            })?;
-        state.camera_enabled = true;
         tracing::info!("AV: camera enabled");
         Ok(())
     }
 
-    pub(super) fn disable_camera(state: &mut State) {
-        if !state.camera_enabled {
+    pub(super) fn disable_camera(state: &State) {
+        if !state.camera_enabled.swap(false, Ordering::Relaxed) {
             return;
         }
-        state.broadcast.video().clear();
-        // Drop any pending frame so a re-enable doesn't show a stale one.
         *state.pending_frame.lock().unwrap() = None;
-        state.camera_enabled = false;
         tracing::info!("AV: camera disabled");
     }
 
     pub(super) fn push_frame(state: &State, bgra: Vec<u8>, width: u32, height: u32, ts_us: u64) {
-        if !state.camera_enabled {
+        if !state.camera_enabled.load(Ordering::Relaxed) {
             return; // drop frames while camera is off
         }
         let expected = (width as usize)
