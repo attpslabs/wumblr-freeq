@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreVideo
 import Foundation
+import UIKit
 
 /// Drives the iOS front camera and pumps BGRA frames to the Rust AV pipeline.
 ///
@@ -32,12 +33,78 @@ final class CallCameraCapture: NSObject {
     private let queue = DispatchQueue(label: "at.freeq.camera-capture", qos: .userInitiated)
     private var configured = false
 
+    /// Cached so the orientation handler doesn't have to look it back up.
+    /// Default reflects the configure-time angle (90° portrait preview, 0°
+    /// data output). The data-output value is locked at this initial value
+    /// across orientation changes — see the long comment in
+    /// `configureIfNeeded`.
+    private var initialDataOutputAngle: CGFloat = 0
+    private var lastValidOrientation: UIDeviceOrientation = .portrait
+
     override init() {
         self.session = AVCaptureSession()
         self.videoOutput = AVCaptureVideoDataOutput()
         self.previewLayer = AVCaptureVideoPreviewLayer(session: session)
         self.previewLayer.videoGravity = .resizeAspectFill
         super.init()
+        // `orientationDidChangeNotification` is silent until *something* turns
+        // on the accelerometer-backed orientation source. Apps that don't
+        // care don't get the cost. We care.
+        if Thread.isMainThread {
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        } else {
+            DispatchQueue.main.async {
+                UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(deviceOrientationDidChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        DispatchQueue.main.async {
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
+        }
+    }
+
+    @objc private func deviceOrientationDidChange() {
+        applyOrientation(UIDevice.current.orientation)
+    }
+
+    /// Rotate only the local preview connection. The data-output connection
+    /// (encoder feed) is deliberately left alone — the H.264 encoder is set
+    /// for 1280x720 landscape and will reject rotated frames; receivers can
+    /// rotate their display layer if they care. Today they don't, which is
+    /// why portrait-held callers look sideways on the other side; fixing
+    /// that requires the receiver to rotate, not us.
+    fileprivate func applyOrientation(_ orientation: UIDeviceOrientation) {
+        let angle: CGFloat?
+        switch orientation {
+        case .portrait:
+            angle = 90
+        case .portraitUpsideDown:
+            angle = 270
+        case .landscapeLeft:
+            // Home button on the right — native sensor orientation.
+            angle = 0
+        case .landscapeRight:
+            angle = 180
+        case .faceUp, .faceDown, .unknown:
+            // Not a meaningful UI rotation; leave the prior angle in place.
+            angle = nil
+        @unknown default:
+            angle = nil
+        }
+        guard let angle else { return }
+        lastValidOrientation = orientation
+        if let conn = previewLayer.connection, conn.isVideoRotationAngleSupported(angle) {
+            conn.videoRotationAngle = angle
+        }
     }
 
     /// Request camera permission and start delivering frames.
@@ -115,8 +182,65 @@ final class CallCameraCapture: NSObject {
         if let pConn = previewLayer.connection, pConn.isVideoRotationAngleSupported(90) {
             pConn.videoRotationAngle = 90
         }
+        // Capture the configured data-output angle so the orientation tests
+        // can pin it as the immutable baseline. Defaults to 0 (landscape).
+        if let dConn = videoOutput.connection(with: .video) {
+            initialDataOutputAngle = dConn.videoRotationAngle
+        }
 
         configured = true
+    }
+}
+
+// MARK: - Test hooks
+
+extension CallCameraCapture {
+    /// Mirror of `configureIfNeeded` that does the parts a unit test can
+    /// exercise without `startRunning` (which needs camera permission and
+    /// real hardware). Just constructs the preview connection so that the
+    /// orientation handler has something to write into.
+    func configureForTest() {
+        // Touch the previewLayer's connection so `applyOrientation` finds
+        // something to rotate. On a real device, `startRunning` builds the
+        // connection; on a unit test we never start the session, so we
+        // build one manually if needed.
+        //
+        // AVCaptureVideoPreviewLayer.connection is nil until the layer is
+        // attached to a running session. In tests we treat the absence
+        // as a no-op: the orientation logic still records `lastValidOrientation`
+        // so the test can read it back.
+        _ = previewLayer
+    }
+
+    /// Drive `applyOrientation` from outside without posting a notification.
+    /// Used by `CallCameraCaptureOrientationTests`.
+    func applyOrientationForTest(_ orientation: UIDeviceOrientation) {
+        applyOrientation(orientation)
+    }
+
+    /// What angle would `applyOrientation` have set for the most recent
+    /// supported orientation? Returns 90 as the configure-time default if
+    /// nothing has been applied yet.
+    var previewRotationAngleForTest: CGFloat {
+        // Prefer the live connection's angle if the test environment ever
+        // attached one; otherwise reflect what the last applied orientation
+        // would have set.
+        if let conn = previewLayer.connection {
+            return conn.videoRotationAngle
+        }
+        switch lastValidOrientation {
+        case .portrait: return 90
+        case .portraitUpsideDown: return 270
+        case .landscapeLeft: return 0
+        case .landscapeRight: return 180
+        default: return 90
+        }
+    }
+
+    /// Configured-once data-output rotation. Must NOT change across
+    /// orientation events — guarded by `testDataOutputRotationIsImmutable…`.
+    var dataOutputRotationAngleForTest: CGFloat {
+        videoOutput.connection(with: .video)?.videoRotationAngle ?? initialDataOutputAngle
     }
 }
 

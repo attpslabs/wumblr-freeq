@@ -32,6 +32,7 @@
 		5B1B81D53A3DE4767C2A498B /* PhoneWatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A31629FF3AFE028388F95C8 /* PhoneWatchBridge.swift */; };
 		5E8956E8A2AEB6B4ED4F5649 /* StepUpAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A82F11FAB31980C3BD38DB /* StepUpAuth.swift */; };
 		60A3F828F885713C7D9FA3FB /* MotdSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5770C0CB2F73315874C61C7 /* MotdSheet.swift */; };
+		62B8CBF5B228608CF2E5BCF6 /* AvSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3200A9C4EB97C507BCBA97D /* AvSessionTests.swift */; };
 		62CD219C257D8D55C7419990 /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0115700FA5AE53FD60E9FEAA /* CoreAudio.framework */; };
 		6B98C423EE9A7D82D1973063 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DDE25216F85C26CCEE21C66 /* NetworkMonitor.swift */; };
 		6CF94674DE60637F09B1C0B1 /* freeqWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59139B7746A5521BDD375C83 /* freeqWatchApp.swift */; };
@@ -139,6 +140,7 @@
 		A725C856D7878BE6382208F3 /* CallLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallLiveActivity.swift; sourceTree = "<group>"; };
 		A968D5C7244372A54881C91E /* ServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerConfig.swift; sourceTree = "<group>"; };
 		B28D17294C06F964661A5E97 /* KeychainHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainHelper.swift; sourceTree = "<group>"; };
+		B3200A9C4EB97C507BCBA97D /* AvSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvSessionTests.swift; sourceTree = "<group>"; };
 		B43788F5890429BF64CC12CC /* freeqLiveActivity.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = freeqLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		B439EEC100CBED133D3260B2 /* freeq.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = freeq.swift; sourceTree = "<group>"; };
 		B46D635B8FB436FDCECA93FE /* FreeqLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreeqLogo.swift; sourceTree = "<group>"; };
@@ -242,6 +244,7 @@
 		226B3BF308D250B9F8004925 /* freeqTests */ = {
 			isa = PBXGroup;
 			children = (
+				B3200A9C4EB97C507BCBA97D /* AvSessionTests.swift */,
 				E69472A0DAAB1972CC0FB351 /* BufferRoutingTests.swift */,
 			);
 			path = freeqTests;
@@ -502,6 +505,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				62B8CBF5B228608CF2E5BCF6 /* AvSessionTests.swift in Sources */,
 				3752BB3B1DC74EFFB3D5FB13 /* BufferRoutingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

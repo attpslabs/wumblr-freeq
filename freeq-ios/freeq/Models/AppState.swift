@@ -269,6 +269,27 @@ enum ConnectionState: Equatable {
     case registered
 }
 
+// MARK: - AV testability shims
+
+/// Minimal interface AppState needs out of the MoQ-backed AV session. The
+/// concrete `FreeqAv` from the Rust SDK conforms via the extension below.
+/// Tests substitute a fake.
+protocol AvSessionDriver: AnyObject {
+    func setMuted(muted: Bool)
+    func setCameraEnabled(enabled: Bool) throws
+    func pushVideoFrame(bgra: [UInt8], width: UInt32, height: UInt32, timestampUs: UInt64)
+    func leave()
+    func isConnected() -> Bool
+}
+
+extension FreeqAv: AvSessionDriver {}
+
+/// Outcome of a REST probe for an active session on a channel.
+enum ActiveSessionProbe {
+    case found(sessionId: String)
+    case none
+}
+
 /// Main application state — bridges the Rust SDK to SwiftUI.
 class AppState: ObservableObject {
     private static let minimumPersistentSessionDuration: TimeInterval = 14 * 24 * 60 * 60  // 14 days
@@ -332,9 +353,27 @@ class AppState: ObservableObject {
     @Published var currentCallChannel: String? = nil
     @Published var currentCallSessionId: String? = nil
     var currentNick: String? { client != nil ? nick : nil }
-    fileprivate var avSession: FreeqAv? = nil
+    /// Active AV session driver. Typed as a protocol so tests can swap in a
+    /// fake — production binds the concrete `FreeqAv` via `avSessionFactory`.
+    internal var avSession: AvSessionDriver? = nil
     /// Channels where we sent `av-start` and are waiting on the server's `started` echo.
-    fileprivate var pendingAvStart: Set<String> = []
+    internal var pendingAvStart: Set<String> = []
+
+    /// Test hook: when set, `sendRaw` lines for AV TAGMSGs are diverted to
+    /// this closure instead of `client?.sendRaw`. Tests use it to capture
+    /// the exact wire payloads we put on the IRC connection.
+    internal var rawSenderForTest: ((String) -> Void)? = nil
+
+    /// Test hook: returns the active session id (or .none) for a channel,
+    /// replacing the live REST probe used in `discoverAndJoinOrStart`. When
+    /// nil (the production default), the REST probe runs normally.
+    internal var activeSessionProbeForTest: ((String) async -> ActiveSessionProbe)? = nil
+
+    /// Test hook: factory for the AV driver. Production builds a `FreeqAv`;
+    /// tests substitute a stub that records calls and re-emits AvEvents via
+    /// the handler. Returning nil from the closure simulates a failed
+    /// constructor (the production path catches and rolls back).
+    internal var avSessionFactory: ((_ serverUrl: String, _ sessionId: String, _ nick: String, _ instanceId: String, _ handler: AvEventHandler) throws -> AvSessionDriver)? = nil
     /// Live Activity tracking the in-call state. Drives the Dynamic Island.
     fileprivate var callActivity: Activity<CallActivityAttributes>? = nil
 
@@ -342,7 +381,7 @@ class AppState: ObservableObject {
     /// capture session itself is started/stopped here. Held across toggles
     /// so we don't pay the AVCaptureSession setup cost more than once per
     /// call.
-    fileprivate var cameraCapture: CallCameraCapture? = nil
+    internal var cameraCapture: CallCameraCapture? = nil
 
     /// Per-nick remote video display layers, keyed by lower-cased nick. Set
     /// by `RemoteVideoTile` when it appears; cleared when the underlying
@@ -362,10 +401,10 @@ class AppState: ObservableObject {
     /// start or join an AV session. Sent on every av-join/av-leave TAGMSG
     /// as `+freeq.at/av-instance=<id>`, and used by the SDK to suffix the
     /// MoQ broadcast path so two devices on the same DID don't collide.
-    fileprivate var currentAvInstance: String? = nil
+    internal var currentAvInstance: String? = nil
 
     func startCall(channel: String, sessionId: String) {
-        guard client != nil else { return }
+        guard client != nil || rawSenderForTest != nil else { return }
         // Use HTTPS API base — MoQ SFU lives behind the same reverse proxy.
         let serverUrl = ServerConfig.apiBaseUrl
 
@@ -387,30 +426,63 @@ class AppState: ObservableObject {
         currentAvInstance = instance
 
         do {
-            avSession = try FreeqAv(
-                serverUrl: serverUrl,
-                sessionId: sessionId,
-                nick: nick,
-                instanceId: instance,
-                handler: AvCallbackHandler(appState: self)
+            let handler = AvCallbackHandler(appState: self)
+            if let factory = avSessionFactory {
+                avSession = try factory(serverUrl, sessionId, nick, instance, handler)
+            } else {
+                avSession = try FreeqAv(
+                    serverUrl: serverUrl,
+                    sessionId: sessionId,
+                    nick: nick,
+                    instanceId: instance,
+                    handler: handler
+                )
+            }
+            // Tell peers we joined this session — instance suffix lets the
+            // server allocate a per-device participant slot. Send BEFORE
+            // flipping `isInCall` so a test observing the synchronously-
+            // captured wire payload sees both the join line and the state
+            // change as a single coherent event.
+            sendRawLine(
+                "@+freeq.at/av-join;+freeq.at/av-id=\(sessionId);+freeq.at/av-instance=\(instance) TAGMSG \(channel)"
             )
-            DispatchQueue.main.async {
+            // Tests run synchronously without a real RunLoop spinning the
+            // main queue; dispatch async would defer state mutation past the
+            // end of the test. Use `runOnMain` so tests see immediate updates.
+            runOnMain {
                 self.isInCall = true
                 self.currentCallChannel = channel
                 self.currentCallSessionId = sessionId
                 self.startCallActivity(channel: channel, sessionId: sessionId)
             }
-            // Tell peers we joined this session — instance suffix lets the
-            // server allocate a per-device participant slot.
-            try? client?.sendRaw(
-                line: "@+freeq.at/av-join;+freeq.at/av-id=\(sessionId);+freeq.at/av-instance=\(instance) TAGMSG \(channel)"
-            )
         } catch {
             print("[av] Failed to start call: \(error)")
             currentAvInstance = nil
             // Hand the audio hardware back to other paths since the call
             // never actually engaged it.
             Self.deactivateVoiceCallSession()
+        }
+    }
+
+    /// Internal raw-send shim. In production this routes to the IRC client;
+    /// tests can swap in `rawSenderForTest` to capture the wire payload.
+    fileprivate func sendRawLine(_ line: String) {
+        if let hook = rawSenderForTest {
+            hook(line)
+            return
+        }
+        try? client?.sendRaw(line: line)
+    }
+
+    /// Run a block on main without an async dispatch. Tests run on the main
+    /// thread without an active RunLoop, so `DispatchQueue.main.async` would
+    /// never fire before the test assertions execute. Production keeps its
+    /// async semantics.
+    fileprivate func runOnMain(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
         }
     }
 
@@ -456,7 +528,7 @@ class AppState: ObservableObject {
         // Send av-leave for the channel we're currently in, if any.
         if let channel = currentCallChannel, let sessionId = currentCallSessionId {
             let instanceTag = currentAvInstance.map { ";+freeq.at/av-instance=\($0)" } ?? ""
-            try? client?.sendRaw(line: "@+freeq.at/av-leave;+freeq.at/av-id=\(sessionId)\(instanceTag) TAGMSG \(channel)")
+            sendRawLine("@+freeq.at/av-leave;+freeq.at/av-id=\(sessionId)\(instanceTag) TAGMSG \(channel)")
         }
         cameraCapture?.stop()
         cameraCapture = nil
@@ -464,7 +536,7 @@ class AppState: ObservableObject {
         avSession = nil
         currentAvInstance = nil
         Self.deactivateVoiceCallSession()
-        DispatchQueue.main.async {
+        runOnMain {
             self.isInCall = false
             self.isMuted = false
             self.isCameraOn = false
@@ -480,6 +552,39 @@ class AppState: ObservableObject {
         isMuted.toggle()
         avSession?.setMuted(muted: isMuted)
         updateCallActivity()
+    }
+
+    /// Test helper: drives the AV event handler synchronously from outside
+    /// the FFI. Production code never calls this; tests use it to simulate
+    /// participant join/leave/disconnect events without standing up a real
+    /// `FreeqAv`.
+    internal func deliverAvEventForTest(_ event: AvEvent) {
+        let handler = AvCallbackHandler(appState: self)
+        handler.onAvEvent(event: event)
+        withExtendedLifetime(handler) {}
+    }
+
+    /// Tear down an in-progress call when the IRC connection itself dropped.
+    /// Unlike `leaveCall`, this does NOT try to send `av-leave` — the wire is
+    /// gone. Otherwise identical: stop capture, close the MoQ session, clear
+    /// UI state.
+    internal func tearDownCallLocallyOnDisconnect() {
+        cameraCapture?.stop()
+        cameraCapture = nil
+        avSession?.leave()
+        avSession = nil
+        currentAvInstance = nil
+        Self.deactivateVoiceCallSession()
+        runOnMain {
+            self.isInCall = false
+            self.isMuted = false
+            self.isCameraOn = false
+            self.callParticipants = []
+            self.participantsWithVideo = []
+            self.currentCallChannel = nil
+            self.currentCallSessionId = nil
+            self.endCallActivity()
+        }
     }
 
     // MARK: - Live Activity (Dynamic Island)
@@ -610,7 +715,22 @@ class AppState: ObservableObject {
         // already running — same pattern as the web client. If we don't do
         // this, blindly sending av-start gets rejected with "channel busy"
         // and the user is stuck with the speaker icon doing nothing.
-        Task { await self.discoverAndJoinOrStart(channel: channel) }
+        //
+        // When the probe hook is installed (tests), run synchronously so
+        // assertions don't race the async Task.
+        if let probe = activeSessionProbeForTest {
+            Task { @MainActor in
+                switch await probe(channel) {
+                case .found(let sessionId):
+                    self.activeAvSessions[channel.lowercased()] = sessionId
+                    self.startCall(channel: channel, sessionId: sessionId)
+                case .none:
+                    self.startFreshAvSession(channel: channel)
+                }
+            }
+        } else {
+            Task { await self.discoverAndJoinOrStart(channel: channel) }
+        }
     }
 
     private func discoverAndJoinOrStart(channel: String) async {
@@ -632,22 +752,20 @@ class AppState: ObservableObject {
                 return
             }
         }
-        // No active session — start a new one. Generate the per-device
-        // instance now so the server can record it on the av-start TAGMSG.
-        let instance = Self.generateAvInstanceId()
+        // No active session — start a new one.
         await MainActor.run {
-            self.currentAvInstance = instance
-            self.pendingAvStart.insert(channel.lowercased())
+            self.startFreshAvSession(channel: channel)
         }
-        do {
-            try client?.sendRaw(line: "@+freeq.at/av-start;+freeq.at/av-instance=\(instance) TAGMSG \(channel)")
-        } catch {
-            print("[av] Failed to send av-start: \(error)")
-            await MainActor.run {
-                self.currentAvInstance = nil
-                self.pendingAvStart.remove(channel.lowercased())
-            }
-        }
+    }
+
+    /// Mint a per-device instance id, mark this channel as pending, and put
+    /// `av-start` on the wire. Factored out so the testable probe-injected
+    /// path can share the same body as the production REST path.
+    fileprivate func startFreshAvSession(channel: String) {
+        let instance = Self.generateAvInstanceId()
+        currentAvInstance = instance
+        pendingAvStart.insert(channel.lowercased())
+        sendRawLine("@+freeq.at/av-start;+freeq.at/av-instance=\(instance) TAGMSG \(channel)")
     }
 
     /// For reply UI
@@ -1935,6 +2053,8 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                target.hasPrefix("#") {
                 let avActor = tags["+freeq.at/av-actor"] ?? from
                 let chanKey = target.lowercased()
+                let inThisCall = state.isInCall
+                    && state.currentCallChannel?.lowercased() == chanKey
                 switch avState {
                 case "started":
                     state.activeAvSessions[chanKey] = avId
@@ -1947,14 +2067,31 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
                 case "ended":
                     state.activeAvSessions.removeValue(forKey: chanKey)
                     state.pendingAvStart.remove(chanKey)
-                    // If we were in this session, tear it down.
-                    if state.isInCall
-                       && state.currentCallChannel?.lowercased() == chanKey {
-                        state.leaveCall()
+                    // If we were in this session, tear it down. But never let
+                    // an `ended` for a channel we're not in (or no longer in)
+                    // accidentally trigger a `leaveCall` on the current call.
+                    if inThisCall {
+                        state.tearDownCallLocallyOnDisconnect()
                     }
-                case "joined", "left":
-                    // Session still active; nothing to update at the channel level.
-                    break
+                case "joined":
+                    // Only mutate the participant roster if we're in this
+                    // call AND the joiner is someone else. (Self-joined is a
+                    // self-echo of our own av-join; FreeqAv ParticipantJoined
+                    // will also fire for everyone else's video tracks.)
+                    if inThisCall
+                       && avActor.lowercased() != state.nick.lowercased()
+                       && !state.callParticipants.contains(where: { $0.lowercased() == avActor.lowercased() }) {
+                        state.callParticipants.append(avActor)
+                    }
+                case "left":
+                    // Same gating: only update if it's a different participant
+                    // and we're in this call. Symmetric with `joined`.
+                    if inThisCall {
+                        state.callParticipants.removeAll { $0.lowercased() == avActor.lowercased() }
+                        state.participantsWithVideo = state.participantsWithVideo.filter {
+                            $0.lowercased() != avActor.lowercased()
+                        }
+                    }
                 default:
                     break
                 }
@@ -2006,6 +2143,16 @@ final class SwiftEventHandler: @unchecked Sendable, EventHandler {
             if !reason.isEmpty && !reason.contains("EOF") {
                 state.errorMessage = "Disconnected: \(reason)"
             }
+            // If we were in a call when the IRC connection dropped, tear it
+            // down locally. The MoQ session is on a separate transport but
+            // peers will only learn we left via the IRC `av-leave` TAGMSG —
+            // which we obviously can't send right now. Surfacing a phantom
+            // in-call state in the UI while the wire is dead is worse than
+            // dropping the call: tap-to-rejoin is one tap, but trying to
+            // mute/leave a zombie call is broken UX.
+            if state.isInCall {
+                state.tearDownCallLocallyOnDisconnect()
+            }
             // FEAT-003: a WebSocket-named failure on this very attempt means
             // the network is hostile to WS — try plain TCP once before going
             // through the broker / showing the user any error UI.
@@ -2038,66 +2185,98 @@ final class AvCallbackHandler: @unchecked Sendable, AvEventHandler {
     }
 
     func onAvEvent(event: AvEvent) {
-        DispatchQueue.main.async { [weak self] in
-            guard let state = self?.appState else { return }
-
-            switch event {
-            case .connected:
-                state.isInCall = true
-                print("[av] Connected to MoQ SFU")
-
-            case .disconnected(let reason):
-                state.isInCall = false
-                state.callParticipants = []
-                state.currentCallChannel = nil
-                state.currentCallSessionId = nil
-                state.endCallActivity()
-                print("[av] Disconnected: \(reason)")
-
-            case .participantJoined(let nick):
-                if !state.callParticipants.contains(nick) {
-                    state.callParticipants.append(nick)
-                }
-                state.updateCallActivity()
-                print("[av] Participant joined: \(nick)")
-
-            case .participantLeft(let nick):
-                state.callParticipants.removeAll { $0 == nick }
-                state.updateCallActivity()
-                print("[av] Participant left: \(nick)")
-
-            case .audioTrackStarted(let nick):
-                print("[av] Audio started: \(nick)")
-
-            case .audioTrackStopped(let nick):
-                print("[av] Audio stopped: \(nick)")
-
-            case .videoTrackStarted(let nick):
-                print("[av] Video started: \(nick)")
-
-            case .videoTrackStopped(let nick):
-                state.participantsWithVideo.remove(nick)
-                print("[av] Video stopped: \(nick)")
-
-            case .videoFrame(let nick, let bgra, let width, let height):
-                // Enqueue directly on the display layer (no SwiftUI re-render
-                // per frame). Mark the nick as having video on the first frame.
-                if let layer = state.videoLayer(for: nick) {
-                    VideoSampleBuffer.enqueue(
-                        bgra: bgra,
-                        width: Int(width),
-                        height: Int(height),
-                        on: layer
-                    )
-                }
-                if state.participantsWithVideo.insert(nick).inserted {
-                    // First frame from this nick — SwiftUI re-renders so the
-                    // tile transitions from avatar to video.
-                }
-
-            case .error(let message):
-                print("[av] Error: \(message)")
+        // FreeqAv delivers events from a background queue. Hop to main for
+        // any state mutation, but stay synchronous when we're already there
+        // (tests drive this synchronously; an async hop would defer past
+        // the assertions).
+        if Thread.isMainThread {
+            handle(event: event)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.handle(event: event)
             }
+        }
+    }
+
+    private func handle(event: AvEvent) {
+        guard let state = self.appState else { return }
+        let myNick = state.nick.lowercased()
+
+        switch event {
+        case .connected:
+            state.isInCall = true
+            print("[av] Connected to MoQ SFU")
+
+        case .disconnected(let reason):
+            state.isInCall = false
+            state.callParticipants = []
+            state.participantsWithVideo = []
+            state.isCameraOn = false
+            state.isMuted = false
+            state.currentCallChannel = nil
+            state.currentCallSessionId = nil
+            state.endCallActivity()
+            print("[av] Disconnected: \(reason)")
+
+        case .participantJoined(let nick):
+            // Own nick is a self-echo from the SFU — never list ourselves as a
+            // remote tile. The call UI renders "You" from a separate code path.
+            if nick.lowercased() == myNick { return }
+            if !state.callParticipants.contains(where: { $0.lowercased() == nick.lowercased() }) {
+                state.callParticipants.append(nick)
+            }
+            state.updateCallActivity()
+            print("[av] Participant joined: \(nick)")
+
+        case .participantLeft(let nick):
+            // Symmetric removal: drop the tile AND the video-active marker.
+            // Leaving the latter behind made the next call show a frozen-frame
+            // tile for the departed nick the moment a same-named user joined.
+            state.callParticipants.removeAll { $0.lowercased() == nick.lowercased() }
+            state.participantsWithVideo = state.participantsWithVideo.filter {
+                $0.lowercased() != nick.lowercased()
+            }
+            state.updateCallActivity()
+            print("[av] Participant left: \(nick)")
+
+        case .audioTrackStarted(let nick):
+            print("[av] Audio started: \(nick)")
+
+        case .audioTrackStopped(let nick):
+            print("[av] Audio stopped: \(nick)")
+
+        case .videoTrackStarted(let nick):
+            print("[av] Video started: \(nick)")
+
+        case .videoTrackStopped(let nick):
+            state.participantsWithVideo = state.participantsWithVideo.filter {
+                $0.lowercased() != nick.lowercased()
+            }
+            print("[av] Video stopped: \(nick)")
+
+        case .videoFrame(let nick, let bgra, let width, let height):
+            // Own-nick echo of our own publish — never enqueue ourselves into
+            // a remote tile. The local preview comes off AVCaptureVideoPreviewLayer.
+            if nick.lowercased() == myNick { return }
+            // Race: a frame can arrive before the SFU's ParticipantJoined event
+            // fires (out-of-order on the network). Drop the frame silently
+            // rather than crash or create a phantom participant; the next
+            // frame after the Joined arrives will render normally.
+            guard state.callParticipants.contains(where: { $0.lowercased() == nick.lowercased() }) else {
+                return
+            }
+            if let layer = state.videoLayer(for: nick) {
+                VideoSampleBuffer.enqueue(
+                    bgra: bgra,
+                    width: Int(width),
+                    height: Int(height),
+                    on: layer
+                )
+            }
+            _ = state.participantsWithVideo.insert(nick)
+
+        case .error(let message):
+            print("[av] Error: \(message)")
         }
     }
 }

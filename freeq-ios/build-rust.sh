@@ -24,20 +24,31 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
 FEATURES="--features av"
 
-# Whether to build the simulator slice. `openh264-sys2` (transitively pulled
-# in by iroh-live's h264 feature) panics on the `aarch64-apple-ios-sim` target
-# env ("Unknown target env: sim"), so device-only is the default. Set
-# BUILD_SIM=1 to attempt the simulator slice anyway.
-BUILD_SIM="${BUILD_SIM:-0}"
+# Whether to build the simulator slice WITH the AV feature. `openh264-sys2`
+# (transitively pulled in by iroh-live's h264 feature) panics on the
+# `aarch64-apple-ios-sim` target env ("Unknown target env: sim"), so the AV
+# feature must be off for the sim slice. BUILD_SIM_AV=1 tries anyway.
+#
+# BUILD_SIM=1 (the new default) builds an AV-stub simulator slice — every
+# FreeqAv method returns NotConnected/no-op. This is enough to let the
+# XCTest target link and run unit tests on Simulator destinations; real
+# AV behavior is only exercised on-device.
+BUILD_SIM="${BUILD_SIM:-1}"
+BUILD_SIM_AV="${BUILD_SIM_AV:-0}"
 
 echo "==> Building for iOS device (aarch64-apple-ios)..."
 IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo rustc -p freeq-sdk-ffi $FEATURES --release --target aarch64-apple-ios --lib --crate-type staticlib
 
 if [ "$BUILD_SIM" = "1" ]; then
-    echo "==> Building for iOS simulator (aarch64-apple-ios-sim)..."
-    IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo rustc -p freeq-sdk-ffi $FEATURES --release --target aarch64-apple-ios-sim --lib --crate-type staticlib
+    if [ "$BUILD_SIM_AV" = "1" ]; then
+        echo "==> Building for iOS simulator WITH AV (aarch64-apple-ios-sim)..."
+        IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo rustc -p freeq-sdk-ffi $FEATURES --release --target aarch64-apple-ios-sim --lib --crate-type staticlib
+    else
+        echo "==> Building for iOS simulator WITHOUT AV (aarch64-apple-ios-sim) — stub FreeqAv lets the test target link"
+        IPHONEOS_DEPLOYMENT_TARGET=18.0 cargo rustc -p freeq-sdk-ffi --release --target aarch64-apple-ios-sim --lib --crate-type staticlib
+    fi
 else
-    echo "==> Skipping simulator slice (BUILD_SIM=0; openh264-sys2 panics on sim target env)"
+    echo "==> Skipping simulator slice (BUILD_SIM=0)"
 fi
 
 echo "==> Building host binary for bindgen..."
@@ -62,10 +73,10 @@ cp freeq-ios/Generated/freeqFFI.modulemap freeq-ios/FreeqSDK.xcframework/ios-arm
 cp target/aarch64-apple-ios/release/libfreeq_sdk_ffi.a freeq-ios/FreeqSDK.xcframework/ios-arm64/
 
 if [ "$BUILD_SIM" = "1" ]; then
-    mkdir -p freeq-ios/FreeqSDK.xcframework/ios-arm64_x86_64-simulator/Headers
-    cp freeq-ios/Generated/freeqFFI.h freeq-ios/FreeqSDK.xcframework/ios-arm64_x86_64-simulator/Headers/
-    cp freeq-ios/Generated/freeqFFI.modulemap freeq-ios/FreeqSDK.xcframework/ios-arm64_x86_64-simulator/Headers/module.modulemap
-    cp target/aarch64-apple-ios-sim/release/libfreeq_sdk_ffi.a freeq-ios/FreeqSDK.xcframework/ios-arm64_x86_64-simulator/
+    mkdir -p freeq-ios/FreeqSDK.xcframework/ios-arm64-simulator/Headers
+    cp freeq-ios/Generated/freeqFFI.h freeq-ios/FreeqSDK.xcframework/ios-arm64-simulator/Headers/
+    cp freeq-ios/Generated/freeqFFI.modulemap freeq-ios/FreeqSDK.xcframework/ios-arm64-simulator/Headers/module.modulemap
+    cp target/aarch64-apple-ios-sim/release/libfreeq_sdk_ffi.a freeq-ios/FreeqSDK.xcframework/ios-arm64-simulator/
 fi
 
 # Info.plist — listing only the slices we actually built.
@@ -95,7 +106,7 @@ cat > freeq-ios/FreeqSDK.xcframework/Info.plist << 'EOF'
 			<key>HeadersPath</key>
 			<string>Headers</string>
 			<key>LibraryIdentifier</key>
-			<string>ios-arm64_x86_64-simulator</string>
+			<string>ios-arm64-simulator</string>
 			<key>LibraryPath</key>
 			<string>libfreeq_sdk_ffi.a</string>
 			<key>SupportedArchitectures</key>
