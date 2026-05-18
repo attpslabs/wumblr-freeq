@@ -96,16 +96,24 @@ final class CallCameraCapture: NSObject {
             session.addOutput(videoOutput)
         }
 
-        // Front camera is mirrored by convention; remote peers prefer the
-        // unflipped feed so what they see matches what the camera saw.
+        // Data-output connection: deliberately NOT rotated. The H.264 encoder
+        // is configured from VideoPreset::P720 = 1280×720 landscape; if we
+        // rotated 90° here we'd push 720×1280 frames into an encoder set up
+        // for 1280×720, which the encoder rejects (and the catalog never
+        // advertises video, so subscribers see nothing). Receivers can rotate
+        // their display layer if desired.
         if let connection = videoOutput.connection(with: .video) {
             if connection.isVideoMirroringSupported {
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = false
             }
-            if connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90
-            }
+        }
+
+        // Preview layer's connection is independent of the data-output's —
+        // rotate it 90° so the user's local self-view looks portrait even
+        // though the encoder receives native landscape sensor frames.
+        if let pConn = previewLayer.connection, pConn.isVideoRotationAngleSupported(90) {
+            pConn.videoRotationAngle = 90
         }
 
         configured = true

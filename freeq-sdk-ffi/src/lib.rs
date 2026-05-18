@@ -1175,12 +1175,18 @@ mod av_impl {
                                 let path_str = path.to_string();
                                 if path_str == our_name { continue; }
 
-                                let nick = path_str
+                                // Path is `{session}/{nick}[~{instance}]` —
+                                // strip the per-device instance suffix so
+                                // events surface the display nick. Matches the
+                                // web client: subscribe uses the full path
+                                // (which the MoQ layer already has), UI keys
+                                // off the bare nick.
+                                let last = path_str
                                     .split('/')
                                     .last()
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                tracing::info!(nick = %nick, "AV: participant broadcast");
+                                    .unwrap_or("unknown");
+                                let nick = last.split('~').next().unwrap_or(last).to_string();
+                                tracing::info!(nick = %nick, path = %path_str, "AV: participant broadcast");
                                 handler_loop
                                     .on_av_event(AvEvent::ParticipantJoined { nick: nick.clone() });
 
@@ -1193,12 +1199,12 @@ mod av_impl {
                                 });
                             }
                             Some((path, None)) => {
-                                let nick = path
-                                    .to_string()
+                                let path_str = path.to_string();
+                                let last = path_str
                                     .split('/')
                                     .last()
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                                    .unwrap_or("unknown");
+                                let nick = last.split('~').next().unwrap_or(last).to_string();
                                 handler_loop.on_av_event(AvEvent::ParticipantLeft { nick });
                             }
                             None => break,
@@ -1245,7 +1251,7 @@ mod av_impl {
             }
         };
 
-        let tracks = match remote.media(&audio_backend, Default::default()).await {
+        let mut tracks = match remote.media(&audio_backend, Default::default()).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(nick = %nick, "AV: media error: {e}");
@@ -1257,21 +1263,60 @@ mod av_impl {
             tracing::info!(nick = %nick, "AV: playing remote audio");
             handler.on_av_event(AvEvent::AudioTrackStarted { nick: nick.clone() });
         }
-        if tracks.video.is_some() {
-            tracing::info!(nick = %nick, "AV: remote video track present");
-            handler.on_av_event(AvEvent::VideoTrackStarted { nick: nick.clone() });
-            // TODO(av-video-subscribe): drive a decoder loop that pops frames
-            // from the remote video track, converts to BGRA, and emits
-            // AvEvent::VideoFrame. The current `tracks.video` plumbing in
-            // moq-media renders to a wgpu surface by default; we need a
-            // CPU-frame variant that yields raw BGRA bytes for Swift's
-            // AVSampleBufferDisplayLayer. Tracked as a follow-up: until this
-            // lands, remote audio works but remote video is a black tile.
-        }
 
-        // Hold the tracks alive for the duration of the remote broadcast.
+        // `media()` samples the catalog once. A peer who joined the call
+        // before enabling their camera has no video rendition in the
+        // catalog at sub time, so `tracks.video` is None permanently.
+        // Watch the catalog and (re)subscribe when video appears.
+        let mut video = tracks.video.take();
+
+        // Hold audio + broadcast alive for the duration of the function.
+        let remote_for_watch = remote.clone();
         let _tracks = tracks;
-        std::future::pending::<()>().await;
+
+        loop {
+            match video.take() {
+                Some(mut v) => {
+                    tracing::info!(nick = %nick, decoder = %v.decoder_name(), "AV: remote video track present");
+                    handler.on_av_event(AvEvent::VideoTrackStarted { nick: nick.clone() });
+                    while let Some(frame) = v.next_frame().await {
+                        let (w, h) = (frame.width(), frame.height());
+                        // Decoded frames arrive as I420/NV12/GPU depending on
+                        // backend. rgba_image() unifies them into packed RGBA;
+                        // swap R↔B for BGRA (kCVPixelFormatType_32BGRA), which
+                        // is what Swift's AVSampleBufferDisplayLayer expects.
+                        let rgba = frame.rgba_image();
+                        let mut bgra = rgba.as_raw().clone();
+                        for chunk in bgra.chunks_exact_mut(4) {
+                            chunk.swap(0, 2);
+                        }
+                        handler.on_av_event(AvEvent::VideoFrame {
+                            nick: nick.clone(),
+                            bgra,
+                            width: w,
+                            height: h,
+                        });
+                    }
+                    tracing::info!(nick = %nick, "AV: remote video track ended; will re-subscribe if it returns");
+                    handler.on_av_event(AvEvent::VideoTrackStopped { nick: nick.clone() });
+                    // Track ended — fall through and wait for video to come back.
+                }
+                None => {
+                    // No video yet (or it ended). Wait for it.
+                    match remote_for_watch.video_ready().await {
+                        Ok(v) => {
+                            video = Some(v);
+                        }
+                        Err(e) => {
+                            tracing::warn!(nick = %nick, "AV: video_ready error: {e}; staying audio-only");
+                            // Keep the function alive so audio + broadcast
+                            // stay subscribed until the caller cancels.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn enable_camera(state: &mut State) -> Result<(), FreeqError> {
@@ -1326,10 +1371,29 @@ mod av_impl {
         {
             let mut fmt = state.video_format.lock().unwrap();
             if fmt.dimensions != [width, height] {
+                tracing::info!(
+                    old_w = fmt.dimensions[0],
+                    old_h = fmt.dimensions[1],
+                    new_w = width,
+                    new_h = height,
+                    "AV: source frame dimensions changed"
+                );
                 *fmt = VideoFormat {
                     pixel_format: PixelFormat::Bgra,
                     dimensions: [width, height],
                 };
+            }
+        }
+        // Periodic frame-push heartbeat — useful when diagnosing why the
+        // catalog never advertises video: if pushes flow but the encoder
+        // never produces packets, it's an encoder-side problem (e.g.,
+        // preset dimension mismatch).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FRAMES: AtomicU64 = AtomicU64::new(0);
+            let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(60) {
+                tracing::info!(frame_no = n, width, height, "AV: pushed frame");
             }
         }
         let frame = VideoFrame::new_packed(
