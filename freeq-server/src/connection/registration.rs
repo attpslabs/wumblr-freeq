@@ -331,31 +331,56 @@ pub(super) fn try_complete_registration(
     // Enforce nick ownership at registration time.
     // If the user claimed a registered nick during CAP negotiation
     // but didn't authenticate as the owner, force-rename them.
-    if let Some(ref nick) = conn.nick {
+    if let Some(nick) = conn.nick.clone() {
         let nick_lower = nick.to_lowercase();
         let owner_did = state.nick_owners.lock().get(&nick_lower).cloned();
         if let Some(owner) = owner_did {
-            let is_owner = conn.authenticated_did.as_ref().is_some_and(|d| d == &owner);
+            let auth_did = conn.authenticated_did.clone();
+            let is_owner = auth_did.as_deref() == Some(owner.as_str());
             if !is_owner {
-                // Nick is registered to a DID — rename to a temp nick.
-                // The web client detects Guest rename and disconnects (no ghost).
-                // The iOS client continues with the temp nick and auto-joins channels.
-                let guest_id: u32 = rand::random::<u32>() % 100000;
-                let guest_nick = format!("Guest{guest_id}");
-                let notice = Message::from_server(
-                    server_name,
-                    "NOTICE",
-                    vec![
-                        "*",
-                        &format!(
-                            "Nick {nick} is registered — renamed to {guest_nick}. Authenticate to reclaim."
-                        ),
-                    ],
-                );
-                send(state, session_id, format!("{notice}\r\n"));
-                state.nick_to_session.lock().remove_by_nick(nick);
-                state.nick_to_session.lock().insert(&guest_nick, session_id);
-                conn.nick = Some(guest_nick);
+                if let Some(did) = auth_did {
+                    // Authenticated as a different DID than the nick's
+                    // owner: assign a deterministic, durably-persisted
+                    // derived nick (stable across reconnects/restarts)
+                    // rather than a throwaway Guest. They are NOT being
+                    // asked to "authenticate" — they already did; the
+                    // name simply belongs to another identity.
+                    let assigned = state.bind_identity_with_fallback(&did, &nick_lower);
+                    let notice = Message::from_server(
+                        server_name,
+                        "NOTICE",
+                        vec![
+                            "*",
+                            &format!(
+                                "{nick} is registered to another identity. You are {assigned} (tied to your account)."
+                            ),
+                        ],
+                    );
+                    send(state, session_id, format!("{notice}\r\n"));
+                    state.nick_to_session.lock().remove_by_nick(&nick);
+                    state.nick_to_session.lock().insert(&assigned, session_id);
+                    conn.nick = Some(assigned);
+                } else {
+                    // Unauthenticated squatter — temp Guest nick.
+                    // The web client detects Guest rename and disconnects (no ghost).
+                    // The iOS client continues with the temp nick and auto-joins channels.
+                    let guest_id: u32 = rand::random::<u32>() % 100000;
+                    let guest_nick = format!("Guest{guest_id}");
+                    let notice = Message::from_server(
+                        server_name,
+                        "NOTICE",
+                        vec![
+                            "*",
+                            &format!(
+                                "Nick {nick} is registered — renamed to {guest_nick}. Authenticate to reclaim."
+                            ),
+                        ],
+                    );
+                    send(state, session_id, format!("{notice}\r\n"));
+                    state.nick_to_session.lock().remove_by_nick(&nick);
+                    state.nick_to_session.lock().insert(&guest_nick, session_id);
+                    conn.nick = Some(guest_nick);
+                }
             }
         }
     }

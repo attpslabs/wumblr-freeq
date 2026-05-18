@@ -836,6 +836,58 @@ impl SharedState {
         BindOutcome::Bound
     }
 
+    /// Bind `did` to `requested`; if `requested` is owned by a
+    /// *different* DID, bind a deterministic derived nick
+    /// `<base>-<didfrag>` instead and return it. Always returns the nick
+    /// actually bound (lowercased) — total, never fails.
+    ///
+    /// `didfrag` is the DID identifier (after the last `:`), ascii-
+    /// alphanumeric, lowercased. Nicks cap at 64, so `base` is truncated
+    /// to leave room for `-<didfrag>`. Deterministic for a given
+    /// (requested, did): the same identity always lands on the same
+    /// derived nick across reconnects/restarts. If the derived nick is
+    /// itself owned by yet another DID, the fragment is lengthened; a
+    /// random `guest` nick is the absolute last resort.
+    ///
+    /// For authenticated identities only. Unauthenticated nick squatters
+    /// keep the `Guest<rand>` path in registration.
+    pub fn bind_identity_with_fallback(&self, did: &str, requested: &str) -> String {
+        const MAX_NICK: usize = 64;
+        let requested_lower = requested.to_lowercase();
+        if let BindOutcome::Bound = self.bind_identity(did, &requested_lower) {
+            return requested_lower;
+        }
+        let ident: String = did
+            .rsplit(':')
+            .next()
+            .unwrap_or(did)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let mut last = String::new();
+        for raw_len in [8usize, 12, 16, 24, ident.len()] {
+            let frag_len = raw_len.min(ident.len());
+            if frag_len == 0 {
+                break;
+            }
+            let frag = &ident[..frag_len];
+            let base_budget = MAX_NICK.saturating_sub(1 + frag_len);
+            let base: String = requested_lower.chars().take(base_budget).collect();
+            let derived = format!("{base}-{frag}");
+            if derived == last {
+                continue; // ident shorter than this step — no new candidate
+            }
+            last = derived.clone();
+            if let BindOutcome::Bound = self.bind_identity(did, &derived) {
+                return derived;
+            }
+        }
+        let guest = format!("guest{}", rand::random::<u32>() % 100000);
+        let _ = self.bind_identity(did, &guest);
+        guest
+    }
+
     /// Resolve a DID to a display nick for UI surfaces (CHATHISTORY
     /// TARGETS, etc.). Chain: in-memory `did_nicks` → live session
     /// (`session_dids` reverse + `nick_to_session`) → persistent
@@ -4178,6 +4230,16 @@ mod s2s_adversarial_tests {
 
     /// Build a minimal SharedState for testing (no DB, no iroh).
     fn test_state() -> Arc<SharedState> {
+        test_state_inner(None)
+    }
+
+    /// Like `test_state` but with an in-memory SQLite DB attached, so
+    /// persistence paths (`identities`, `messages`, …) are exercised.
+    fn test_state_with_db() -> Arc<SharedState> {
+        test_state_inner(Some(crate::db::Db::open_memory().unwrap()))
+    }
+
+    fn test_state_inner(db: Option<crate::db::Db>) -> Arc<SharedState> {
         let config = crate::config::ServerConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             server_name: "test-s2s".to_string(),
@@ -4228,7 +4290,7 @@ mod s2s_adversarial_tests {
             av_media: Mutex::new(None),
             s2s_manager: Mutex::new(None),
             cluster_doc: crate::crdt::ClusterDoc::new("test-server-id"),
-            db: None,
+            db: db.map(Mutex::new),
             config,
             plugin_manager: crate::plugin::PluginManager::new(),
             policy_engine: None,
@@ -4876,6 +4938,41 @@ mod s2s_adversarial_tests {
         assert_eq!(state.did_nicks.lock().get("did:key:A").map(String::as_str), Some("bar"));
         // The freed nick is immediately claimable by a different DID.
         assert_eq!(state.bind_identity("did:key:B", "foo"), BindOutcome::Bound);
+    }
+
+    /// Going-forward contract for the DM partner name resolution bug:
+    /// an authenticated DID colliding on an owned nick gets a
+    /// deterministic, identity-derived nick that is durably persisted
+    /// (so it resolves offline / after a restart, never a raw did:key).
+    #[test]
+    fn collision_yields_deterministic_persisted_derived_nick() {
+        let state = test_state_with_db();
+        let owner = "did:key:zAAAAAAAAAAAAAAAA";
+        let did_b = "did:key:zBBBBBBBBBBBBBBBB";
+
+        assert_eq!(state.bind_identity(owner, "happybot"), BindOutcome::Bound);
+
+        let assigned = state.bind_identity_with_fallback(did_b, "happybot");
+
+        assert_ne!(assigned, "happybot");
+        assert!(assigned.starts_with("happybot-"), "got {assigned}");
+        assert!(!assigned.starts_with("guest"), "got {assigned}");
+        assert!(assigned.len() <= 64, "over nick cap: {assigned}");
+
+        // Deterministic: same DID + same request → same nick.
+        assert_eq!(assigned, state.bind_identity_with_fallback(did_b, "happybot"));
+
+        // The original owner keeps the bare nick.
+        assert_eq!(
+            state.nick_owners.lock().get("happybot").map(String::as_str),
+            Some(owner)
+        );
+
+        // Durable: wipe in-memory maps (simulate restart); the derived
+        // nick still resolves via the identities table.
+        state.did_nicks.lock().clear();
+        state.nick_owners.lock().clear();
+        assert_eq!(state.display_nick_for_did(did_b), assigned);
     }
 
     #[test]
