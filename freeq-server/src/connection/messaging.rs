@@ -1976,6 +1976,15 @@ fn handle_av_tagmsg(
             // it; the manager falls back to one-slot-per-DID for them.
             let instance_id = tags.get("+freeq.at/av-instance").map(String::as_str);
 
+            tracing::info!(
+                session_id = %session_id,
+                did = %did,
+                nick = %nick,
+                conn_id = %conn.id,
+                instance_id = ?instance_id,
+                "av-join: handler entry"
+            );
+
             // Before joining: reap any orphan slots in this session whose
             // owning IRC connection is gone. Live-set is built from the
             // (did, instance) pairs that current connections registered on
@@ -2073,6 +2082,14 @@ fn handle_av_tagmsg(
                     tracing::info!(session_id = %session_id, did = %did, "AV session joined");
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        did = %did,
+                        nick = %nick,
+                        instance_id = ?instance_id,
+                        error = %e,
+                        "av-join rejected by AvSessionManager"
+                    );
                     let reply = Message::from_server(
                         &state.server_name,
                         "NOTICE",
