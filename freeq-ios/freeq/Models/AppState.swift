@@ -2223,9 +2223,13 @@ final class AvCallbackHandler: @unchecked Sendable, AvEventHandler {
             print("[av] Disconnected: \(reason)")
 
         case .participantJoined(let nick):
-            // Own nick is a self-echo from the SFU — never list ourselves as a
-            // remote tile. The call UI renders "You" from a separate code path.
-            if nick.lowercased() == myNick { return }
+            // Don't filter on nick alone here — the SDK already drops our
+            // own broadcast at the path level (`path == our_name`), so
+            // anything that reaches us is a *different device's* broadcast,
+            // including same-DID multi-device (chadfowler on iOS + chadfowler
+            // on web). The bare-nick "self-echo" filter we used to have
+            // here was the cause of "iOS doesn't show my web client" — it
+            // collapsed the multi-device case into a no-op.
             if !state.callParticipants.contains(where: { $0.lowercased() == nick.lowercased() }) {
                 state.callParticipants.append(nick)
             }
@@ -2259,9 +2263,10 @@ final class AvCallbackHandler: @unchecked Sendable, AvEventHandler {
             print("[av] Video stopped: \(nick)")
 
         case .videoFrame(let nick, let bgra, let width, let height):
-            // Own-nick echo of our own publish — never enqueue ourselves into
-            // a remote tile. The local preview comes off AVCaptureVideoPreviewLayer.
-            if nick.lowercased() == myNick { return }
+            // SDK already filters our own broadcast at the path level;
+            // anything reaching us is for a different device. Matching on
+            // bare nick blocked the multi-device case (same handle on
+            // iOS + web).
             // Race: a frame can arrive before the SFU's ParticipantJoined event
             // fires (out-of-order on the network). Drop the frame silently
             // rather than crash or create a phantom participant; the next

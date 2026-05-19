@@ -333,20 +333,33 @@ final class AvSessionTests: XCTestCase {
         XCTAssertFalse(state.callParticipants.contains("dave"))
     }
 
-    // MARK: - 11. Own nick filtered out of callParticipants
+    // MARK: - 11. Self-echo filtering — TAGMSG only, not FreeqAv events
 
-    func testOwnNickFilteredFromCallParticipants() {
+    /// The TAGMSG `+freeq.at/av-state=joined` broadcast goes to every
+    /// channel member including the joiner; we filter our own nick out
+    /// of that path so we don't list ourselves as a remote.
+    ///
+    /// The FreeqAv path is different: the SDK already filters our own
+    /// broadcast at the *path* level (`path == our_name`), so anything
+    /// reaching `participantJoined` is a different device — including
+    /// a same-DID second device (iOS + web for the same handle). We
+    /// must NOT filter on bare nick at this layer or we'd lose the
+    /// multi-device case (the "iOS doesn't show my web client" bug).
+    func testSelfEchoFilteredOnlyOnTagMsgPath() {
         let (state, _, _) = makeHarness(myNick: "alice")
         state.activeAvSessions["#freeq"] = "sess-1"
         state.startOrJoinVoice(channel: "#freeq")
 
-        // FreeqAv echoes our own ParticipantJoined back to us when the SFU
-        // welcomes the local broadcast. The UI must NOT list us as a remote.
+        // FreeqAv path: same-DID second device. The SDK gave us this
+        // event after stripping `~instance`, so the bare nick happens
+        // to match — but it's still a different device, so we keep it.
         state.deliverAvEventForTest(.participantJoined(nick: "alice"))
-        XCTAssertFalse(state.callParticipants.contains(where: { $0.lowercased() == "alice" }),
-                       "own nick must never appear in callParticipants (FreeqAv path)")
+        XCTAssertTrue(state.callParticipants.contains(where: { $0.lowercased() == "alice" }),
+                      "FreeqAv participantJoined must surface as a remote tile even if nick matches us — same-DID multi-device")
 
-        // Same via TAGMSG `joined` self-echo.
+        // TAGMSG path: server-sent broadcast goes to everyone in the
+        // channel, including the joiner. Filter our own nick here.
+        state.callParticipants.removeAll()
         SwiftEventHandler(appState: state).handleEvent(.tagMsg(msg: TagMessage(
             from: "server", target: "#freeq",
             tags: [
@@ -355,7 +368,7 @@ final class AvSessionTests: XCTestCase {
                 TagEntry(key: "+freeq.at/av-actor", value: "ALICE"),
             ])))
         XCTAssertFalse(state.callParticipants.contains(where: { $0.lowercased() == "alice" }),
-                       "own nick must never appear via TAGMSG joined either")
+                       "own nick must not appear via TAGMSG joined (server self-echo)")
     }
 
     // MARK: - 12. callParticipants reflects what server tells us (limitation pinned)
