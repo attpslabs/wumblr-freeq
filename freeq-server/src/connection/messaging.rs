@@ -215,9 +215,27 @@ pub(super) fn handle_tagmsg(
     }
 
     // ── AV session control (+freeq.at/av-*) ──
-    // av-signal is a relay tag (WebRTC signaling) — must be forwarded, not consumed
-    if let Some(av_tag) = tags.keys().find(|k| k.starts_with("+freeq.at/av-") && !k.contains("signal") && !k.contains("chunk")) {
-        handle_av_tagmsg(conn, target, tags, av_tag, state);
+    //
+    // The dispatch key must be the *action* tag (av-start / av-join /
+    // av-leave / av-end), never a parameter (av-id, av-instance,
+    // av-title, …). Previously we grabbed `tags.keys().find(...)` on
+    // anything starting with `+freeq.at/av-` and HashMap iteration
+    // order picked whichever tag happened to hash first — so an
+    // av-join TAGMSG that also carried av-id and av-instance would
+    // sometimes dispatch under av-id, fall into the `_ => debug!` arm,
+    // and silently do nothing. That was the "av-join succeeds for one
+    // device but not the other" bug.
+    //
+    // av-signal / av-chunk are relay tags (WebRTC signalling / data
+    // chunks) — must be forwarded, not consumed.
+    const AV_ACTIONS: &[&str] = &[
+        "+freeq.at/av-start",
+        "+freeq.at/av-join",
+        "+freeq.at/av-leave",
+        "+freeq.at/av-end",
+    ];
+    if let Some(action) = AV_ACTIONS.iter().find(|tag| tags.contains_key(**tag)) {
+        handle_av_tagmsg(conn, target, tags, action, state);
         return; // AV control tags are consumed server-side; don't relay
     }
 
