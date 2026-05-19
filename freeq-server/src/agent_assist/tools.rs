@@ -1534,13 +1534,11 @@ pub fn diagnose_av_session(
     };
     let safe_channel = sanitize_label(&channel);
     let level = crate::agent_assist::caller::effective_level(caller, state, &channel);
-    if !level.satisfies(DisclosureLevel::ChannelMember) {
-        return permission_denied(
-            "DIAGNOSE_AV_CHANNEL_MEMBER_ONLY",
-            "Only members of the channel may inspect its AV session state.",
-            DisclosureLevel::ChannelMember,
-        );
-    }
+    // Counts + divergence flag are visible to anyone — they leak no
+    // identities. Per-slot listings (with hashed DIDs/instances) are
+    // ChannelMember-gated so the response isn't a probe surface for
+    // who's currently in a private call.
+    let detailed = level.satisfies(DisclosureLevel::ChannelMember);
 
     // 8-char URL-safe hash; enough to disambiguate within a session
     // without leaking identity. We mix in the channel so two sessions
@@ -1637,23 +1635,25 @@ pub fn diagnose_av_session(
         if bridge_up { "up" } else { "down" }
     ));
 
-    for (i, (did, inst, is_self)) in mgr_slots.iter().enumerate() {
-        safe_facts.push(format!(
-            "mgr[{}] did=`#{}` instance={}{}",
-            i,
-            did,
-            inst,
-            if *is_self { " (you)" } else { "" }
-        ));
-    }
-    for (i, (did, inst, is_self)) in conn_slots.iter().enumerate() {
-        safe_facts.push(format!(
-            "conn[{}] did=`#{}` instance={}{}",
-            i,
-            did,
-            inst,
-            if *is_self { " (you)" } else { "" }
-        ));
+    if detailed {
+        for (i, (did, inst, is_self)) in mgr_slots.iter().enumerate() {
+            safe_facts.push(format!(
+                "mgr[{}] did=`#{}` instance={}{}",
+                i,
+                did,
+                inst,
+                if *is_self { " (you)" } else { "" }
+            ));
+        }
+        for (i, (did, inst, is_self)) in conn_slots.iter().enumerate() {
+            safe_facts.push(format!(
+                "conn[{}] did=`#{}` instance={}{}",
+                i,
+                did,
+                inst,
+                if *is_self { " (you)" } else { "" }
+            ));
+        }
     }
 
     // ── Divergence detection ─────────────────────────────────────
@@ -1737,6 +1737,20 @@ pub fn diagnose_av_session(
         _ => "Session is wedged (no participants, no bridge).".into(),
     };
 
+    let mut redactions = vec!["Raw MoQ broadcast paths omitted.".into()];
+    if detailed {
+        redactions.push(
+            "DIDs and instance ids of other participants are hashed (`#xxxxxxxx`).".into(),
+        );
+    } else {
+        redactions.push(
+            "Per-slot listings withheld at Public disclosure level — counts and the \
+             divergence verdict are still returned. Authenticate as a channel member \
+             via `Authorization: Bearer <irc-session-id>` for the full slot map."
+                .into(),
+        );
+    }
+
     FactBundle {
         ok,
         code: code.into(),
@@ -1744,12 +1758,12 @@ pub fn diagnose_av_session(
         confidence: Confidence::High,
         safe_facts,
         suggested_fixes: fixes,
-        redactions: vec![
-            "DIDs and instance ids of other participants are hashed (`#xxxxxxxx`).".into(),
-            "Raw MoQ broadcast paths omitted.".into(),
-        ],
+        redactions,
         followups: vec![],
-        min_disclosure: DisclosureLevel::ChannelMember,
+        // Public is sufficient — the disclosure filter strips identities
+        // and the per-slot dump is gated above. Anyone can ask "is this
+        // session diverged?" without learning who's in it.
+        min_disclosure: DisclosureLevel::Public,
     }
 }
 
