@@ -1176,9 +1176,13 @@ class AppState: ObservableObject {
         KeychainHelper.delete(key: "brokerToken")
         KeychainHelper.delete(key: "webToken")
         UserDefaults.standard.removeObject(forKey: "freeq.webTokenExpiry")
-        UserDefaults.standard.removeObject(forKey: "freeq.nick")
-        UserDefaults.standard.removeObject(forKey: "freeq.handle")
         UserDefaults.standard.removeObject(forKey: "freeq.channels")
+        // Intentionally NOT clearing `freeq.handle` and `freeq.nick`. They're
+        // the user-typed identity from the previous session; ConnectView
+        // pre-fills the Bluesky handle field from `freeq.handle` so the
+        // user doesn't have to retype it after a sign-out / forced
+        // re-auth. Credentials are in the keychain and have already been
+        // removed above.
         cachedWebToken = nil
         cachedWebTokenExpiry = .distantPast
         SpotlightIndexer.clear()
