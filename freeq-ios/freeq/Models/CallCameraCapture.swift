@@ -39,7 +39,25 @@ final class CallCameraCapture: NSObject {
     /// across orientation changes — see the long comment in
     /// `configureIfNeeded`.
     private var initialDataOutputAngle: CGFloat = 0
+    /// Tracks the last orientation we accepted as "meaningful". Initialised
+    /// to portrait but updated to the current device orientation in
+    /// `configureIfNeeded` so a call that starts in landscape doesn't snap
+    /// to portrait for the first frame.
     private var lastValidOrientation: UIDeviceOrientation = .portrait
+    /// Pinned-in-memory copy of the rotation angle that *would* be applied
+    /// to the preview, regardless of whether an
+    /// `AVCaptureVideoPreviewLayer.connection` currently exists. The
+    /// connection is nil before `session.startRunning` builds it, but the
+    /// orientation observer can still fire — we cache the angle here and
+    /// apply it via affine transform as a fallback. Tests read this to pin
+    /// the connection-less path.
+    private(set) var pendingPreviewAngle: CGFloat = 90
+    /// Provider for the "current device orientation" — overridable in tests
+    /// so we don't depend on `UIDevice.current.orientation`, which returns
+    /// `.unknown` in the simulator/unit-test environment.
+    fileprivate var orientationProvider: () -> UIDeviceOrientation = {
+        UIDevice.current.orientation
+    }
 
     override init() {
         self.session = AVCaptureSession()
@@ -73,56 +91,110 @@ final class CallCameraCapture: NSObject {
     }
 
     @objc private func deviceOrientationDidChange() {
-        // Marshal to the main thread — AVCaptureConnection mutations and
-        // CALayer transforms must happen there. Notifications fire on
-        // whichever thread the post happened on.
-        DispatchQueue.main.async {
-            self.applyOrientation(UIDevice.current.orientation)
+        applyOrientationOnMain(orientationProvider())
+    }
+
+    /// Hop to main if we aren't already there. `AVCaptureConnection` and
+    /// `CALayer` mutations both require the main thread; notifications can
+    /// fire on any thread; `configureIfNeeded` runs on the capture queue.
+    private func applyOrientationOnMain(_ orientation: UIDeviceOrientation) {
+        if Thread.isMainThread {
+            applyOrientation(orientation)
+        } else {
+            DispatchQueue.main.async { self.applyOrientation(orientation) }
         }
     }
 
     /// Rotate only the local preview connection. The data-output connection
-    /// (encoder feed) is deliberately left alone — the H.264 encoder is set
-    /// for 1280x720 landscape and will reject rotated frames; receivers can
-    /// rotate their display layer if they care. Today they don't, which is
-    /// why portrait-held callers look sideways on the other side; fixing
-    /// that requires the receiver to rotate, not us.
-    fileprivate func applyOrientation(_ orientation: UIDeviceOrientation) {
-        let angle: CGFloat?
+    /// (encoder feed) is fed by `captureOutput` which software-rotates the
+    /// buffer to keep receivers seeing the user upright — see the rotation
+    /// matrix and `rotatedFrame(_:width:height:for:)`.
+    ///
+    /// ## Angle matrix
+    ///
+    /// The app's UI is portrait-locked (Info.plist declares no
+    /// `UISupportedInterfaceOrientations`, so SwiftUI never re-lays-out the
+    /// preview tile when the device rotates). That means the preview rect's
+    /// own "up" direction is always the device's "up" direction — but the
+    /// device's "up" direction in the user's visual field changes as they
+    /// tilt the phone.
+    ///
+    /// We want the user to see their own head at the top of *their visual
+    /// field* (i.e. anchored to gravity), regardless of how the phone is
+    /// tilted. Apple's canonical mapping (portrait=90, landscapeLeft=0,
+    /// landscapeRight=180, portraitUpsideDown=270) is for a UI that
+    /// rotates with the device. Ours doesn't.
+    ///
+    /// Derivation: in raw sensor coords, the user's head sits at the
+    /// buffer's left edge when the phone is held in portrait. As the
+    /// phone rotates CW by θ, the user (stationary in the world) rotates
+    /// CCW by θ in the buffer. Composing that with the rotation needed
+    /// to land the head at the rect position that maps to gravity-up
+    /// gives:
+    ///
+    ///   - .portrait              → 90° CW
+    ///   - .portraitUpsideDown    → 90° CW
+    ///   - .landscapeLeft         → 270° CW
+    ///   - .landscapeRight        → 270° CW
+    ///
+    /// The user-reported bug ("upside-down in landscape") was caused by
+    /// shipping Apple's standard rotating-UI mapping in a portrait-locked
+    /// app: in landscapeLeft we were applying 0° (the right answer if the
+    /// rect rotates with the device), which left the user 90° off from
+    /// gravity-up.
+    /// Same as `previewAngleOrNil` but with a defaulted return for
+    /// `faceUp`/`faceDown`/`unknown` so callers that want a guaranteed
+    /// angle (the configure-time seed) get one.
+    private func previewAngle(for orientation: UIDeviceOrientation) -> CGFloat {
+        previewAngleOrNil(for: orientation) ?? 90
+    }
+
+    /// Returns the angle, in CW degrees, the preview connection should
+    /// be set to for the given device orientation in a portrait-locked
+    /// UI. Returns nil for `faceUp`/`faceDown`/`unknown` so callers can
+    /// decide whether to leave the prior orientation in place (the
+    /// observer path) or fall back to portrait (the initial seed path).
+    private func previewAngleOrNil(for orientation: UIDeviceOrientation) -> CGFloat? {
         switch orientation {
-        case .portrait:
-            angle = 90
-        case .portraitUpsideDown:
-            angle = 270
-        case .landscapeLeft:
-            // Home button on the right — native sensor orientation.
-            angle = 0
-        case .landscapeRight:
-            angle = 180
+        case .portrait, .portraitUpsideDown:
+            return 90
+        case .landscapeLeft, .landscapeRight:
+            return 270
         case .faceUp, .faceDown, .unknown:
-            // Not a meaningful UI rotation; leave the prior angle in place.
-            angle = nil
+            return nil
         @unknown default:
-            angle = nil
+            return nil
         }
+    }
+
+    fileprivate func applyOrientation(_ orientation: UIDeviceOrientation) {
+        let angle: CGFloat? = previewAngleOrNil(for: orientation)
         guard let angle else {
             print("[camera] orientation: \(orientation.rawValue) — skipped (faceUp/faceDown/unknown)")
             return
         }
         lastValidOrientation = orientation
+        pendingPreviewAngle = angle
         let conn = previewLayer.connection
         let supported = conn?.isVideoRotationAngleSupported(angle) ?? false
         print("[camera] orientation: raw=\(orientation.rawValue) angle=\(angle) connection=\(conn != nil) supported=\(supported)")
         if let conn, supported {
             conn.videoRotationAngle = angle
+            // Clear any leftover affine transform from a pre-connection
+            // fallback — without this, when the connection appears mid-call
+            // the affine rotation would compound with the connection's
+            // rotation, double-rotating the preview.
+            previewLayer.setAffineTransform(.identity)
         } else {
             // Fallback: if AVCaptureVideoPreviewLayer's connection isn't
             // ready yet (it isn't until startRunning has connected the
             // session), apply the rotation as a CALayer affine transform.
-            // Less ideal than the connection-driven rotation (the latter
-            // also fixes preview pipeline orientation hints) but the user
-            // sees a rotating preview either way.
-            let radians = angle * .pi / 180.0
+            //
+            // `videoRotationAngle` is documented as a CLOCKWISE rotation,
+            // but iOS's `CGAffineTransform(rotationAngle:)` interprets a
+            // positive angle as COUNTER-clockwise. Negate so the fallback
+            // matches the connection-driven path visually.
+            let radians = -angle * .pi / 180.0
             previewLayer.setAffineTransform(CGAffineTransform(rotationAngle: radians))
         }
     }
@@ -199,14 +271,27 @@ final class CallCameraCapture: NSObject {
         // Preview layer's connection is independent of the data-output's.
         // Initialize from the CURRENT device orientation (the user may be
         // holding the phone in landscape when the call starts) rather
-        // than hard-coding 90°/portrait. After this, the notification
-        // observer keeps it in sync on every flip. The applyOrientation
-        // call is dispatched to main inside the function so it's safe
-        // from this background queue.
-        DispatchQueue.main.async {
-            let o = UIDevice.current.orientation
-            self.applyOrientation(o == .unknown ? .portrait : o)
-        }
+        // than hard-coding 90°/portrait.
+        //
+        // We seed `lastValidOrientation` and `pendingPreviewAngle`
+        // SYNCHRONOUSLY here on the capture queue so the very first
+        // `captureOutput` invocation (which reads `lastValidOrientation`
+        // for the broadcast-side software rotation) sees the correct
+        // value rather than the configure-time `.portrait` default. We
+        // also kick off the main-thread `applyOrientation` to set the
+        // preview connection angle. After this initial application, the
+        // notification observer keeps everything in sync on every flip.
+        let initial = orientationProvider()
+        let resolvedInitial: UIDeviceOrientation = (initial == .unknown
+                                                    || initial == .faceUp
+                                                    || initial == .faceDown)
+            ? .portrait
+            : initial
+        lastValidOrientation = resolvedInitial
+        // Best-effort: set pendingPreviewAngle directly too so any
+        // reader that races the main-thread hop sees the right value.
+        pendingPreviewAngle = previewAngle(for: resolvedInitial)
+        applyOrientationOnMain(resolvedInitial)
         // Capture the configured data-output angle so the orientation tests
         // can pin it as the immutable baseline. Defaults to 0 (landscape).
         if let dConn = videoOutput.connection(with: .video) {
@@ -246,20 +331,15 @@ extension CallCameraCapture {
     /// What angle would `applyOrientation` have set for the most recent
     /// supported orientation? Returns 90 as the configure-time default if
     /// nothing has been applied yet.
+    ///
+    /// In the simulator/unit-test environment the preview connection
+    /// almost never exists, so this falls back to `pendingPreviewAngle`,
+    /// which is the angle the connection *would* receive once it appears.
     var previewRotationAngleForTest: CGFloat {
-        // Prefer the live connection's angle if the test environment ever
-        // attached one; otherwise reflect what the last applied orientation
-        // would have set.
         if let conn = previewLayer.connection {
             return conn.videoRotationAngle
         }
-        switch lastValidOrientation {
-        case .portrait: return 90
-        case .portraitUpsideDown: return 270
-        case .landscapeLeft: return 0
-        case .landscapeRight: return 180
-        default: return 90
-        }
+        return pendingPreviewAngle
     }
 
     /// Configured-once data-output rotation. Must NOT change across
@@ -267,6 +347,30 @@ extension CallCameraCapture {
     var dataOutputRotationAngleForTest: CGFloat {
         videoOutput.connection(with: .video)?.videoRotationAngle ?? initialDataOutputAngle
     }
+
+    /// Drive the orientation provider for tests. Hosts in the simulator
+    /// always report `.unknown` for `UIDevice.current.orientation`, so we
+    /// can't rely on the OS to feed the orientation; tests inject a value
+    /// here and re-trigger `configureIfNeeded` / observers as needed.
+    func setOrientationProviderForTest(_ provider: @escaping () -> UIDeviceOrientation) {
+        self.orientationProvider = provider
+    }
+
+    /// Drive the `configureIfNeeded` initial-orientation read without
+    /// actually starting an AVCaptureSession (which needs camera permission
+    /// and real hardware). Pins the initial preview angle.
+    func simulateInitialConfigure() {
+        let initial = orientationProvider()
+        let resolved: UIDeviceOrientation = (initial == .unknown || initial == .faceUp || initial == .faceDown)
+            ? .portrait
+            : initial
+        applyOrientation(resolved)
+    }
+
+    /// Read-only access to the last orientation we accepted as "meaningful"
+    /// (i.e. not faceUp/faceDown/unknown). Tests read this to confirm that
+    /// the resume-from-faceUp path remembers the last UI orientation.
+    var lastValidOrientationForTest: UIDeviceOrientation { lastValidOrientation }
 }
 
 extension CallCameraCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -287,24 +391,183 @@ extension CallCameraCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
         let ts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let tsMicros = UInt64(ts.seconds * 1_000_000)
 
-        // The Rust side expects tightly-packed BGRA. AVCaptureSession often
-        // produces buffers where rowBytes > width*4 for alignment; copy
-        // row-by-row to strip the padding.
+        // Pack the (possibly row-padded) capture buffer into a tightly-
+        // packed BGRA byte array, then software-rotate it to match the
+        // current device orientation. This is what makes a portrait-held
+        // iOS user appear upright on the receiver's screen: the encoder
+        // is locked at 1280×720 landscape and the only knob that travels
+        // out the wire is the pixel content itself, so we rotate the
+        // pixels here.
         let expectedRow = width * 4
-        if rowBytes == expectedRow {
-            cb(base.assumingMemoryBound(to: UInt8.self), height * rowBytes, width, height, tsMicros)
-        } else {
-            var packed = [UInt8](repeating: 0, count: width * height * 4)
-            packed.withUnsafeMutableBufferPointer { dst in
-                for y in 0..<height {
-                    let src = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
-                    let dstRow = dst.baseAddress!.advanced(by: y * expectedRow)
-                    dstRow.update(from: src, count: expectedRow)
-                }
-            }
-            packed.withUnsafeBufferPointer { buf in
-                cb(buf.baseAddress!, width * height * 4, width, height, tsMicros)
+        var packed = [UInt8](repeating: 0, count: width * height * 4)
+        packed.withUnsafeMutableBufferPointer { dst in
+            for y in 0..<height {
+                let src = base.advanced(by: y * rowBytes).assumingMemoryBound(to: UInt8.self)
+                let dstRow = dst.baseAddress!.advanced(by: y * expectedRow)
+                dstRow.update(from: src, count: expectedRow)
             }
         }
+
+        let rotated = CallCameraCapture.rotatedFrame(
+            sourceBGRA: packed,
+            sourceWidth: width,
+            sourceHeight: height,
+            for: lastValidOrientation
+        )
+        rotated.data.withUnsafeBufferPointer { buf in
+            cb(buf.baseAddress!, rotated.data.count, rotated.width, rotated.height, tsMicros)
+        }
+    }
+
+    // MARK: - Software rotation for the broadcast path
+
+    /// Pure rotate-and-letterbox of a tightly-packed BGRA buffer. The
+    /// encoder is locked at the source's landscape dimensions
+    /// (1280×720 for the P720 preset), so we always return a buffer of
+    /// the source's dimensions — portrait orientations are letterboxed
+    /// with black bars on the long axis.
+    ///
+    /// Rotation table (CW, derived to land the user's head at the
+    /// output frame's TOP regardless of how the iOS user is holding
+    /// the phone):
+    ///
+    ///   - .landscapeRight       → 0°
+    ///   - .portrait             → 90°  (letterbox)
+    ///   - .landscapeLeft        → 180°
+    ///   - .portraitUpsideDown   → 270° (letterbox)
+    ///   - .faceUp/.faceDown/.unknown → use `.portrait` rotation
+    ///     (matches the preview's prior-orientation behaviour; the
+    ///     orientation observer never updates `lastValidOrientation`
+    ///     to a face-up reading anyway).
+    static func rotatedFrame(
+        sourceBGRA: [UInt8],
+        sourceWidth: Int,
+        sourceHeight: Int,
+        for orientation: UIDeviceOrientation
+    ) -> (data: [UInt8], width: Int, height: Int) {
+        let resolved: UIDeviceOrientation
+        switch orientation {
+        case .portrait, .portraitUpsideDown, .landscapeLeft, .landscapeRight:
+            resolved = orientation
+        case .faceUp, .faceDown, .unknown:
+            resolved = .portrait
+        @unknown default:
+            resolved = .portrait
+        }
+
+        switch resolved {
+        case .landscapeRight:
+            return (sourceBGRA, sourceWidth, sourceHeight)
+        case .landscapeLeft:
+            return (rotate180(sourceBGRA, width: sourceWidth, height: sourceHeight),
+                    sourceWidth, sourceHeight)
+        case .portrait:
+            return (rotate90CWLetterboxed(sourceBGRA,
+                                         width: sourceWidth,
+                                         height: sourceHeight),
+                    sourceWidth, sourceHeight)
+        case .portraitUpsideDown:
+            return (rotate270CWLetterboxed(sourceBGRA,
+                                          width: sourceWidth,
+                                          height: sourceHeight),
+                    sourceWidth, sourceHeight)
+        default:
+            return (sourceBGRA, sourceWidth, sourceHeight)
+        }
+    }
+
+    /// In-place 180° rotation: `out[y][x] = in[H-1-y][W-1-x]`.
+    private static func rotate180(_ src: [UInt8], width: Int, height: Int) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: src.count)
+        out.withUnsafeMutableBufferPointer { dst in
+            src.withUnsafeBufferPointer { sb in
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let srcIdx = ((height - 1 - y) * width + (width - 1 - x)) * 4
+                        let dstIdx = (y * width + x) * 4
+                        dst[dstIdx]     = sb[srcIdx]
+                        dst[dstIdx + 1] = sb[srcIdx + 1]
+                        dst[dstIdx + 2] = sb[srcIdx + 2]
+                        dst[dstIdx + 3] = sb[srcIdx + 3]
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Rotate 90° CW and letterbox into a `width × height` (landscape)
+    /// black canvas. The portrait content is height-fit: scaled to fill
+    /// the full output height, padded with black columns on each side.
+    ///
+    /// Mapping reasoning: a 90° CW rotation of a W×H buffer produces an
+    /// H×W image. We then scale that H×W image to fit in W×H (the output
+    /// canvas) — height fit gives a (H × H × H/W)-wide column centred in
+    /// the canvas.
+    private static func rotate90CWLetterboxed(_ src: [UInt8], width W: Int, height H: Int) -> [UInt8] {
+        // Rotated dimensions (logical): H × W (portrait).
+        // Letterbox so rotated-height (W) fits canvas-height (H):
+        //   scale = H / W.
+        //   contentColW = round(H * H / W).
+        let contentColW = max(1, (H * H + W / 2) / W)
+        let xOffset = (W - contentColW) / 2
+        var out = [UInt8](repeating: 0, count: W * H * 4)
+        out.withUnsafeMutableBufferPointer { dst in
+            src.withUnsafeBufferPointer { sb in
+                for y in 0..<H {
+                    for x in 0..<contentColW {
+                        // (x, y) in canvas → local coords inside content
+                        // window: (lx, ly) where lx ∈ [0, contentColW),
+                        // ly = y. Rotated image is H×W; nearest-neighbour
+                        // sample into rotated coords:
+                        //   ry = ly * W / H.
+                        //   rx = lx * H / contentColW.
+                        // Mapping rotated (rx, ry) back to source (sx, sy)
+                        // for a 90° CW rotation of a W×H source:
+                        //   sx = ry, sy = H - 1 - rx.
+                        let ry = (y * W) / H
+                        let rx = (x * H) / contentColW
+                        let sx = ry
+                        let sy = H - 1 - rx
+                        let srcIdx = (sy * W + sx) * 4
+                        let dstIdx = (y * W + (x + xOffset)) * 4
+                        dst[dstIdx]     = sb[srcIdx]
+                        dst[dstIdx + 1] = sb[srcIdx + 1]
+                        dst[dstIdx + 2] = sb[srcIdx + 2]
+                        dst[dstIdx + 3] = sb[srcIdx + 3]
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Rotate 270° CW (== 90° CCW) and letterbox. Symmetric to
+    /// `rotate90CWLetterboxed`. Mapping: for a 270° CW rotation of a
+    /// W×H source, rotated (rx, ry) maps back to source (sx, sy):
+    ///   sx = W - 1 - ry, sy = rx.
+    private static func rotate270CWLetterboxed(_ src: [UInt8], width W: Int, height H: Int) -> [UInt8] {
+        let contentColW = max(1, (H * H + W / 2) / W)
+        let xOffset = (W - contentColW) / 2
+        var out = [UInt8](repeating: 0, count: W * H * 4)
+        out.withUnsafeMutableBufferPointer { dst in
+            src.withUnsafeBufferPointer { sb in
+                for y in 0..<H {
+                    for x in 0..<contentColW {
+                        let ry = (y * W) / H
+                        let rx = (x * H) / contentColW
+                        let sx = W - 1 - ry
+                        let sy = rx
+                        let srcIdx = (sy * W + sx) * 4
+                        let dstIdx = (y * W + (x + xOffset)) * 4
+                        dst[dstIdx]     = sb[srcIdx]
+                        dst[dstIdx + 1] = sb[srcIdx + 1]
+                        dst[dstIdx + 2] = sb[srcIdx + 2]
+                        dst[dstIdx + 3] = sb[srcIdx + 3]
+                    }
+                }
+            }
+        }
+        return out
     }
 }
