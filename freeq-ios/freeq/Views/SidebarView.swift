@@ -36,19 +36,25 @@ struct SidebarView: View {
             // Content
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    // Channels
-                    sectionHeader("CHANNELS", count: appState.channels.count)
+                    // Channels — alphabetical, case-insensitive. Matches
+                    // ChatsTab so the same room is always in the same place
+                    // regardless of which view the user is in.
+                    let sortedChannels = appState.channels.sorted {
+                        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                    sectionHeader("CHANNELS", count: sortedChannels.count)
 
-                    ForEach(appState.channels) { channel in
+                    ForEach(sortedChannels) { channel in
                         channelRow(channel)
                     }
 
-                    // DMs
+                    // DMs — most recently active first. Mirrors ChatsTab.
                     if !appState.dmBuffers.isEmpty {
-                        sectionHeader("DIRECT MESSAGES", count: appState.dmBuffers.count)
+                        let sortedDMs = appState.dmBuffers.sorted { $0.lastActivity > $1.lastActivity }
+                        sectionHeader("DIRECT MESSAGES", count: sortedDMs.count)
                             .padding(.top, 12)
 
-                        ForEach(appState.dmBuffers) { dm in
+                        ForEach(sortedDMs) { dm in
                             dmRow(dm)
                         }
                     }

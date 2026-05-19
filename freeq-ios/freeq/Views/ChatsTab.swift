@@ -125,9 +125,21 @@ struct ChatsTab: View {
         case .channels: source = appState.channels
         case .dms:      source = appState.dmBuffers
         }
-        return source
-            .filter { !$0.name.trimmingCharacters(in: .whitespaces).isEmpty }
-            .sorted { a, b in a.lastActivity > b.lastActivity }
+        let filtered = source.filter { !$0.name.trimmingCharacters(in: .whitespaces).isEmpty }
+        switch mode {
+        case .channels:
+            // Channels are durable, named rooms — alphabetical is the
+            // ordering the user can predict. The previous recency sort
+            // shuffled #freeq, #avtest, #yokota every time a message
+            // landed; alphabetical lets muscle memory work.
+            return filtered.sorted { a, b in
+                a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
+        case .dms:
+            // DMs are 1:1 threads — recency matters: the person you're
+            // actively talking to should float to the top.
+            return filtered.sorted { a, b in a.lastActivity > b.lastActivity }
+        }
     }
 
     private var filteredConversations: [ChannelState] {
