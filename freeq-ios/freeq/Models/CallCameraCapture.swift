@@ -73,7 +73,12 @@ final class CallCameraCapture: NSObject {
     }
 
     @objc private func deviceOrientationDidChange() {
-        applyOrientation(UIDevice.current.orientation)
+        // Marshal to the main thread — AVCaptureConnection mutations and
+        // CALayer transforms must happen there. Notifications fire on
+        // whichever thread the post happened on.
+        DispatchQueue.main.async {
+            self.applyOrientation(UIDevice.current.orientation)
+        }
     }
 
     /// Rotate only the local preview connection. The data-output connection
@@ -100,10 +105,25 @@ final class CallCameraCapture: NSObject {
         @unknown default:
             angle = nil
         }
-        guard let angle else { return }
+        guard let angle else {
+            print("[camera] orientation: \(orientation.rawValue) — skipped (faceUp/faceDown/unknown)")
+            return
+        }
         lastValidOrientation = orientation
-        if let conn = previewLayer.connection, conn.isVideoRotationAngleSupported(angle) {
+        let conn = previewLayer.connection
+        let supported = conn?.isVideoRotationAngleSupported(angle) ?? false
+        print("[camera] orientation: raw=\(orientation.rawValue) angle=\(angle) connection=\(conn != nil) supported=\(supported)")
+        if let conn, supported {
             conn.videoRotationAngle = angle
+        } else {
+            // Fallback: if AVCaptureVideoPreviewLayer's connection isn't
+            // ready yet (it isn't until startRunning has connected the
+            // session), apply the rotation as a CALayer affine transform.
+            // Less ideal than the connection-driven rotation (the latter
+            // also fixes preview pipeline orientation hints) but the user
+            // sees a rotating preview either way.
+            let radians = angle * .pi / 180.0
+            previewLayer.setAffineTransform(CGAffineTransform(rotationAngle: radians))
         }
     }
 
@@ -176,11 +196,16 @@ final class CallCameraCapture: NSObject {
             }
         }
 
-        // Preview layer's connection is independent of the data-output's —
-        // rotate it 90° so the user's local self-view looks portrait even
-        // though the encoder receives native landscape sensor frames.
-        if let pConn = previewLayer.connection, pConn.isVideoRotationAngleSupported(90) {
-            pConn.videoRotationAngle = 90
+        // Preview layer's connection is independent of the data-output's.
+        // Initialize from the CURRENT device orientation (the user may be
+        // holding the phone in landscape when the call starts) rather
+        // than hard-coding 90°/portrait. After this, the notification
+        // observer keeps it in sync on every flip. The applyOrientation
+        // call is dispatched to main inside the function so it's safe
+        // from this background queue.
+        DispatchQueue.main.async {
+            let o = UIDevice.current.orientation
+            self.applyOrientation(o == .unknown ? .portrait : o)
         }
         // Capture the configured data-output angle so the orientation tests
         // can pin it as the immutable baseline. Defaults to 0 (landscape).
