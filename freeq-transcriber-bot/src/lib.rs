@@ -7,5 +7,7 @@
 pub mod audio_tap;
 pub mod identity;
 pub mod irc;
+pub mod qa;
 pub mod stt;
 pub mod summary;
+pub mod tts;

@@ -138,6 +138,161 @@ impl AudioSource for SilentSource {
     }
 }
 
+// ── Publish side: PushAudioSource + Speaker ─────────────────────────
+
+/// Sample rate the bot's outbound broadcast runs at. 48 kHz — the
+/// universal Opus rate that every other freeq client (iOS mic, web
+/// mic) publishes at and that receivers' Opus decoders expect from the
+/// catalog. Publishing at a non-48 kHz rate decoded to silence on the
+/// receivers. TTS output (Groq Orpheus is 24 kHz) is upsampled to this
+/// with a windowed-sinc resampler — a naïve linear one left audible
+/// imaging artifacts ("bad-radio static").
+pub const SPEAK_RATE: u32 = 48_000;
+
+/// The publish-side audio source for the bot's own broadcast. The Opus
+/// encoder pulls `pop_samples` continuously; we serve queued TTS audio
+/// when there's any, silence otherwise. A continuous stream (silence
+/// included) keeps subscribers attached so there's no join latency
+/// when the bot does speak.
+///
+/// `Clone` shares the same queue — so the subscriber's reconnect loop
+/// can hand a fresh clone to each new `LocalBroadcast` while the
+/// `Speaker` keeps feeding the one queue.
+#[derive(Clone)]
+pub struct PushAudioSource {
+    queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+}
+
+impl AudioSource for PushAudioSource {
+    fn format(&self) -> AudioFormat {
+        AudioFormat {
+            sample_rate: SPEAK_RATE,
+            channel_count: 1,
+        }
+    }
+    fn pop_samples(&mut self, buf: &mut [f32]) -> Result<Option<usize>> {
+        let mut q = self.queue.lock().expect("speak queue poisoned");
+        for slot in buf.iter_mut() {
+            *slot = q.pop_front().unwrap_or(0.0);
+        }
+        Ok(Some(buf.len()))
+    }
+}
+
+/// Handle the bot uses to make its broadcast speak. Clone-cheap; the
+/// underlying queue is shared with the [`PushAudioSource`] feeding the
+/// encoder.
+#[derive(Clone)]
+pub struct Speaker {
+    queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+}
+
+impl Speaker {
+    /// Create a paired `(Speaker, PushAudioSource)`. The source goes to
+    /// the `LocalBroadcast`; the speaker is kept by the orchestrator.
+    pub fn new() -> (Speaker, PushAudioSource) {
+        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        (
+            Speaker { queue: queue.clone() },
+            PushAudioSource { queue },
+        )
+    }
+
+    /// Queue `pcm` (mono, at `from_rate`) for playback. Resampled to
+    /// [`SPEAK_RATE`] and appended — concurrent enqueues just play one
+    /// after another.
+    pub fn enqueue(&self, pcm: &[f32], from_rate: u32) {
+        let resampled = resample_mono(pcm, from_rate, SPEAK_RATE);
+        let mut q = self.queue.lock().expect("speak queue poisoned");
+        q.extend(resampled);
+    }
+
+    /// True while there's still queued audio the encoder hasn't drained.
+    pub fn is_speaking(&self) -> bool {
+        !self.queue.lock().expect("speak queue poisoned").is_empty()
+    }
+
+    /// Approximate seconds of audio still queued — used to wait out a
+    /// reply before tearing the broadcast down.
+    pub fn queued_secs(&self) -> f32 {
+        self.queue.lock().expect("speak queue poisoned").len() as f32 / SPEAK_RATE as f32
+    }
+}
+
+/// Windowed-sinc mono resampler. Shared by the whisper downsample path
+/// and the TTS-playback upsample path.
+///
+/// Naïve linear interpolation leaves strong spectral images when
+/// upsampling (the source's content mirrored above its Nyquist) — on
+/// speech that's audible as fizzy/static-y sibilants. A windowed-sinc
+/// kernel is the correct band-limited interpolator: for each output
+/// sample it sums `2*HALF+1` input taps weighted by a Hann-windowed
+/// sinc. The sinc cutoff is `min(1, ratio)` so the same routine also
+/// anti-aliases when *down*sampling (e.g. 48→16 kHz for whisper).
+pub fn resample_mono(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if input.is_empty() || from_rate == 0 || to_rate == 0 {
+        return Vec::new();
+    }
+    if from_rate == to_rate {
+        return input.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len_f = input.len() as f64 * ratio;
+    // Bound pathological ratios (see to_whisper_pcm's note).
+    let out_len = if out_len_f.is_finite() && out_len_f >= 0.0 {
+        (out_len_f as usize).min(input.len().saturating_mul(16))
+    } else {
+        0
+    };
+    // Kernel half-width in input samples. 16 → 33-tap filter: a good
+    // quality/cost balance for speech.
+    const HALF: i64 = 16;
+    // sinc cutoff (normalized to the input rate): for downsampling we
+    // pull it in to the output Nyquist to anti-alias; for upsampling
+    // it stays at the input Nyquist (1.0).
+    let cutoff = ratio.min(1.0);
+    let half_f = HALF as f64;
+
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src = i as f64 / ratio; // position in input samples
+        let center = src.floor() as i64;
+        let mut acc = 0.0f64;
+        let mut norm = 0.0f64;
+        for k in -HALF..=HALF {
+            let j = center + k;
+            if j < 0 || j as usize >= input.len() {
+                continue;
+            }
+            let x = src - j as f64; // tap distance, input samples
+            if x.abs() > half_f {
+                continue;
+            }
+            // Hann window over [-HALF, HALF].
+            let w = 0.5 + 0.5 * (std::f64::consts::PI * x / half_f).cos();
+            let weight = sinc(x * cutoff) * w;
+            acc += input[j as usize] as f64 * weight;
+            norm += weight;
+        }
+        // Normalize by the realized tap-weight sum — corrects gain at
+        // the signal edges where the kernel is truncated.
+        let s = if norm.abs() > 1e-9 { acc / norm } else { 0.0 };
+        out.push(if s.is_finite() { s as f32 } else { 0.0 });
+    }
+    out
+}
+
+/// Normalized sinc: `sin(pi x) / (pi x)`, with the removable
+/// singularity at 0 filled in.
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
 /// Naïve resampler / channel-downmixer: interleaved multi-channel f32
 /// at `format.sample_rate` → mono f32 at 16 kHz, suitable for whisper.
 ///

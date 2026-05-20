@@ -59,10 +59,28 @@ struct Cli {
     #[arg(long)]
     nick: Option<String>,
 
-    /// Path to a ggml whisper.cpp model. Recommend `ggml-small.en.bin`
-    /// for a balance of latency/accuracy on a modern laptop CPU.
+    /// Path to a ggml whisper.cpp model — used only by the local STT
+    /// backend (the `stt` cargo feature). Ignored when `GROQ_API_KEY`
+    /// is set, which is the preferred path.
     #[arg(long, default_value = "./models/ggml-small.en.bin")]
     model_path: PathBuf,
+
+    /// Groq transcription model. Used when `GROQ_API_KEY` is set in
+    /// the environment. `whisper-large-v3-turbo` is fast + accurate.
+    #[arg(long, default_value = "whisper-large-v3-turbo")]
+    groq_model: String,
+
+    /// Groq chat model for answering questions addressed to the bot.
+    #[arg(long, default_value = "llama-3.3-70b-versatile")]
+    groq_chat_model: String,
+
+    /// ElevenLabs voice + model for speaking answers aloud. Reads
+    /// `ELEVENLABS_API_KEY` from the environment. The default voice is
+    /// "Utopia" (`aj0fZfXTBc7E3By4X8L2`).
+    #[arg(long, default_value = "aj0fZfXTBc7E3By4X8L2")]
+    elevenlabs_voice: String,
+    #[arg(long, default_value = "eleven_turbo_v2_5")]
+    elevenlabs_model: String,
 
     /// Skip the end-of-call summary even if `ANTHROPIC_API_KEY` is set.
     #[arg(long)]
@@ -77,6 +95,12 @@ struct Cli {
     /// Shorter = lower latency, more re-decode work. Default 10s.
     #[arg(long, default_value_t = 10.0)]
     window_secs: f32,
+
+    /// Initiate a call: send `av-start` for this channel right after
+    /// joining, instead of only waiting for someone else to start one.
+    /// The channel must also be in `--channel`.
+    #[arg(long)]
+    start_session_in: Option<String>,
 }
 
 #[tokio::main]
@@ -97,13 +121,11 @@ async fn main() -> Result<()> {
     let ident = identity::load_or_create(&cli.name).context("loading bot identity")?;
     tracing::info!(did = %ident.did, "bot identity ready");
 
-    // Lazy-init whisper. We don't want a missing model file to fail us
-    // mid-call; surface it at startup.
-    let stt = Arc::new(
-        stt::Whisper::load(&cli.model_path)
-            .with_context(|| format!("loading whisper model at {}", cli.model_path.display()))?,
-    );
-    tracing::info!(model = %cli.model_path.display(), "whisper model loaded");
+    // Pick the STT backend. Priority: Groq (hosted, fast, no local
+    // toolchain) when GROQ_API_KEY is set; else the local whisper.cpp
+    // backend if the `stt` feature was compiled in; else a no-op.
+    let stt = Arc::new(build_stt(&cli)?);
+    tracing::info!(backend = %stt.label(), "STT backend ready");
 
     // Anthropic key is optional — `--no-summary` or a missing key both
     // result in transcript-only mode.
@@ -116,6 +138,18 @@ async fn main() -> Result<()> {
         tracing::info!("ANTHROPIC_API_KEY not set or --no-summary; end-of-call summary disabled");
     }
 
+    // Groq key powers STT (above) + question-answering. ElevenLabs key
+    // powers TTS. Read both from the environment.
+    let groq_api_key = std::env::var("GROQ_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    let elevenlabs_api_key = std::env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    if elevenlabs_api_key.is_none() {
+        tracing::info!("ELEVENLABS_API_KEY not set — spoken replies disabled (text only)");
+    }
+
     irc::run(irc::RunConfig {
         server: cli.server,
         channels: cli.channel,
@@ -125,6 +159,35 @@ async fn main() -> Result<()> {
         window_secs: cli.window_secs,
         summary_model: cli.summary_model,
         anthropic_key,
+        start_session_in: cli.start_session_in,
+        groq_api_key,
+        groq_chat_model: cli.groq_chat_model,
+        elevenlabs_api_key,
+        elevenlabs_voice_id: cli.elevenlabs_voice,
+        elevenlabs_model: cli.elevenlabs_model,
     })
     .await
+}
+
+/// Choose the STT backend. Groq wins when `GROQ_API_KEY` is present.
+fn build_stt(cli: &Cli) -> Result<stt::SttEngine> {
+    if let Ok(key) = std::env::var("GROQ_API_KEY") {
+        if !key.trim().is_empty() {
+            return Ok(stt::SttEngine::groq(key, cli.groq_model.clone()));
+        }
+    }
+    #[cfg(feature = "stt")]
+    {
+        return stt::SttEngine::local(&cli.model_path).with_context(|| {
+            format!("loading local whisper model at {}", cli.model_path.display())
+        });
+    }
+    #[cfg(not(feature = "stt"))]
+    {
+        tracing::warn!(
+            "no GROQ_API_KEY and the `stt` feature is off — transcription is a no-op. \
+             Set GROQ_API_KEY or rebuild with --features stt."
+        );
+        Ok(stt::SttEngine::noop())
+    }
 }

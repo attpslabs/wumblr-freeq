@@ -11,32 +11,52 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
+use iroh_live::media::codec::AudioCodec;
+use iroh_live::media::format::AudioPreset;
+use iroh_live::media::publish::LocalBroadcast;
 use iroh_live::media::subscribe::RemoteBroadcast;
 use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::audio_tap::{TapBackend, to_whisper_pcm};
+use crate::audio_tap::{PushAudioSource, Speaker, TapBackend, to_whisper_pcm};
 use crate::identity::Identity;
-use crate::stt::Whisper;
-use crate::summary;
+use crate::stt::SttEngine;
+use crate::{qa, summary, tts};
 
 pub struct RunConfig {
     pub server: String,
     pub channels: Vec<String>,
     pub nick: String,
     pub ident: Identity,
-    pub stt: Arc<Whisper>,
+    pub stt: Arc<SttEngine>,
     pub window_secs: f32,
     pub summary_model: String,
     pub anthropic_key: Option<String>,
+    /// When set, the bot sends an `av-start` for this channel right
+    /// after joining — it initiates a call rather than only watching
+    /// for one. The channel must also appear in `channels`. The
+    /// server's `av-state=started` echo then drives the normal
+    /// join/subscribe path.
+    pub start_session_in: Option<String>,
+    /// Groq API key — powers question-answering (chat). When `None`,
+    /// the bot can't answer addressed questions.
+    pub groq_api_key: Option<String>,
+    /// Groq chat model for answering addressed questions.
+    pub groq_chat_model: String,
+    /// ElevenLabs API key + voice + model for speaking answers aloud.
+    /// When the key is `None`, answers are posted as text only.
+    pub elevenlabs_api_key: Option<String>,
+    pub elevenlabs_voice_id: String,
+    pub elevenlabs_model: String,
 }
 
 /// Subset of [`RunConfig`] shared with inner tasks. Excludes the
@@ -46,10 +66,17 @@ struct SharedConfig {
     server: String,
     channels: Vec<String>,
     nick: String,
-    stt: Arc<Whisper>,
+    stt: Arc<SttEngine>,
     window_secs: f32,
     summary_model: String,
     anthropic_key: Option<String>,
+    groq_api_key: Option<String>,
+    groq_chat_model: String,
+    elevenlabs_api_key: Option<String>,
+    elevenlabs_voice_id: String,
+    elevenlabs_model: String,
+    /// Shared HTTP client for Groq QA + ElevenLabs TTS calls.
+    http: reqwest::Client,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
@@ -59,12 +86,35 @@ struct ActiveCall {
     channel: String,
     session_id: String,
     instance_id: String,
-    /// Lines of `<nick>: <utterance>` we've posted so far, used to
-    /// build the end-of-call summary.
+    /// Lines of `<nick>: <utterance>` heard so far. Buffered (not
+    /// firehosed to the channel) and used to build the end-of-call
+    /// summary + answer `dump` requests.
     transcript: Vec<String>,
-    /// Drop on call end → cancels the MoQ subscriber + per-nick tap
-    /// tasks via tokio's normal task-drop semantics.
-    _moq_task: JoinHandle<()>,
+    /// Index of the first `transcript` line not yet posted by a `dump`
+    /// request — a `dump` posts `transcript[dumped_upto..]` and advances
+    /// this so a repeat dump only shows what's new.
+    dumped_upto: usize,
+    /// Feeds the bot's outbound broadcast — `enqueue` makes it speak.
+    speaker: Speaker,
+    /// Notify the MoQ session to drop and reconnect. Fired from the IRC
+    /// loop when a participant joins onto a *stale* transport.
+    reconnect_signal: Arc<Notify>,
+    /// Wall-clock time the MoQ session last (re)connected. The IRC loop
+    /// reads it to decide whether a join needs a transport refresh — a
+    /// young connection is healthy and must be left alone, since a
+    /// needless reconnect drops the joiner's subscription to the bot's
+    /// audio (they'd hear nothing).
+    moq_connected_at: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// The MoQ subscriber/publisher task. Aborted by `Drop` on call
+    /// end — a plain `JoinHandle` drop only *detaches*, which would
+    /// leave the reconnect loop running forever after the call ends.
+    moq_task: JoinHandle<()>,
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        self.moq_task.abort();
+    }
 }
 
 pub async fn run(cfg: RunConfig) -> Result<()> {
@@ -80,6 +130,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         window_secs,
         summary_model,
         anthropic_key,
+        start_session_in,
+        groq_api_key,
+        groq_chat_model,
+        elevenlabs_api_key,
+        elevenlabs_voice_id,
+        elevenlabs_model,
     } = cfg;
 
     // Pick websocket vs raw-TCP transport based on URL scheme — mirrors
@@ -153,8 +209,72 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         window_secs,
         summary_model,
         anthropic_key,
+        groq_api_key,
+        groq_chat_model,
+        elevenlabs_api_key,
+        elevenlabs_voice_id,
+        elevenlabs_model,
+        http: reqwest::Client::new(),
     });
     let handle_arc = Arc::new(handle);
+
+    // Discover-or-start. If `--start-session-in` is set we want a call
+    // running — but a blind `av-start` is rejected by the server when
+    // the channel already has an active session (e.g. a previous test,
+    // or a human already calling). So: ask the REST API first.
+    //   - active session exists → join it directly (av-join + subscribe)
+    //   - no session → send av-start; the `av-state=started` echo drives
+    //     the subscribe path via the normal Start handler.
+    // `self_start` carries the av-start instance so the Start handler
+    // reuses it and skips a redundant av-join (no double-appearance).
+    let mut self_start: Option<(String, String)> = None;
+    if let Some(ref start_ch) = start_session_in {
+        if !cfg.channels.iter().any(|c| c.eq_ignore_ascii_case(start_ch)) {
+            tracing::warn!(channel = %start_ch, "start-session channel is not in --channel; skipping");
+        } else if let Some(session_id) = discover_active_session(&cfg, start_ch).await {
+            tracing::info!(channel = %start_ch, %session_id, "joining existing session");
+            match start_transcription(
+                cfg.clone(),
+                handle_arc.clone(),
+                start_ch.clone(),
+                session_id.clone(),
+                None,
+                active.clone(),
+            )
+            .await
+            {
+                Ok(call) => {
+                    *active.lock().await = Some(call);
+                    let _ = handle_arc
+                        .privmsg(
+                            start_ch,
+                            "[transcript] listening (joined a call in progress). \
+                             Say or type \"transcriber: dump\" for the transcript so far.",
+                        )
+                        .await;
+                }
+                Err(e) => tracing::warn!(error = ?e, "failed to join existing session"),
+            }
+        } else {
+            let instance = generate_instance_id();
+            let mut tags = HashMap::new();
+            tags.insert("+freeq.at/av-start".to_string(), String::new());
+            tags.insert("+freeq.at/av-instance".to_string(), instance.clone());
+            tags.insert(
+                "+freeq.at/av-title".to_string(),
+                "transcribed session".to_string(),
+            );
+            handle_arc
+                .send_tagmsg(start_ch, tags)
+                .await
+                .with_context(|| format!("sending av-start to {start_ch}"))?;
+            tracing::info!(channel = %start_ch, %instance, "sent av-start — initiating a call");
+            self_start = Some((start_ch.to_lowercase(), instance));
+        }
+    }
+
+    // Debounce for participant-join MoQ refreshes (see below).
+    let mut last_join_refresh: Option<std::time::Instant> = None;
 
     loop {
         let Some(event) = events.recv().await else {
@@ -167,6 +287,33 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     .get("+freeq.at/av-actor")
                     .cloned()
                     .unwrap_or_default();
+                // A participant joining is our cue to refresh the MoQ
+                // transport. While the bot sat idle the WebSocket may
+                // have silently died (proxy idle-timeout) and moq won't
+                // surface that — reconnecting on the join guarantees the
+                // joiner lands on a live connection and gets discovered.
+                // Debounced so a burst of joins triggers one reconnect.
+                if tags.get("+freeq.at/av-state").map(String::as_str) == Some("joined")
+                    && !actor.eq_ignore_ascii_case(&cfg.nick)
+                    && last_join_refresh
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(25))
+                {
+                    if let Some(call) = active.lock().await.as_ref() {
+                        // Only refresh a *stale* transport. A young
+                        // connection is healthy — `announced()` discovers
+                        // the joiner on its own — and a needless
+                        // reconnect would drop the joiner's subscription
+                        // to the bot's audio, so they'd hear nothing.
+                        let age = call.moq_connected_at.lock().unwrap().elapsed();
+                        if age > Duration::from_secs(50) {
+                            call.reconnect_signal.notify_one();
+                            last_join_refresh = Some(std::time::Instant::now());
+                            tracing::info!(%actor, ?age, "participant joined — refreshing stale MoQ transport");
+                        } else {
+                            tracing::info!(%actor, ?age, "participant joined — transport fresh, no refresh");
+                        }
+                    }
+                }
                 match classify_av_event(&target, &tags, &cfg.channels, &cfg.nick) {
                     AvAction::Start { channel, session_id } => {
                         let mut active_guard = active.lock().await;
@@ -174,11 +321,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                             tracing::info!(channel = %channel, "already in a call; ignoring new session");
                             continue;
                         }
+                        // If this is the session WE started, the av-start
+                        // already registered us as the creator participant.
+                        // Reuse that instance and skip the redundant
+                        // av-join — otherwise the bot occupies two slots
+                        // and shows up twice in every client.
+                        let existing_instance = match &self_start {
+                            Some((ch, inst)) if ch.eq_ignore_ascii_case(&channel) => {
+                                Some(inst.clone())
+                            }
+                            _ => None,
+                        };
                         match start_transcription(
                             cfg.clone(),
                             handle_arc.clone(),
                             channel.clone(),
                             session_id.clone(),
+                            existing_instance,
                             active.clone(),
                         )
                         .await
@@ -193,7 +352,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                                 let _ = handle_arc
                                     .privmsg(
                                         &channel,
-                                        "[transcript] listening — I'll post utterances as I hear them.",
+                                        "[transcript] listening. I'll stay quiet — \
+                                         say or type \"transcriber: dump\" anytime for \
+                                         the transcript so far.",
                                     )
                                     .await;
                             }
@@ -261,11 +422,144 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     AvAction::Skip => {}
                 }
             }
+            Event::Message { from, target, text, .. } => {
+                // Answer when a participant addresses the bot by name in
+                // channel chat. Ignore non-channel targets and our own
+                // messages (the bot posts to the channel too).
+                if !target.starts_with('#') && !target.starts_with('&') {
+                    continue;
+                }
+                if from.eq_ignore_ascii_case(&cfg.nick) {
+                    continue;
+                }
+                let Some(question) = qa::extract_addressed(&text, &cfg.nick) else {
+                    continue;
+                };
+                // "transcriber: dump" → post the buffered transcript
+                // rather than running it through Q&A.
+                if is_transcript_request(question) {
+                    let handle = handle_arc.clone();
+                    let active = active.clone();
+                    let channel = target.clone();
+                    tokio::spawn(async move {
+                        dump_transcript(&handle, &channel, &active).await;
+                    });
+                    continue;
+                }
+                if cfg.groq_api_key.is_none() {
+                    let _ = handle_arc
+                        .privmsg(&target, &format!("{from}: Q&A needs a Groq key — not configured."))
+                        .await;
+                    continue;
+                }
+                // Snapshot transcript + speaker handle from the active
+                // call, then answer + speak off the event loop.
+                let (transcript, speaker) = {
+                    let guard = active.lock().await;
+                    match guard.as_ref() {
+                        Some(call) => (call.transcript.join("\n"), Some(call.speaker.clone())),
+                        None => (String::new(), None),
+                    }
+                };
+                let cfg = cfg.clone();
+                let handle = handle_arc.clone();
+                let channel = target.clone();
+                let question = question.to_string();
+                let asker = from.clone();
+                tokio::spawn(async move {
+                    answer_and_speak(cfg, handle, channel, asker, question, transcript, speaker)
+                        .await;
+                });
+            }
             Event::Disconnected { reason } => {
                 tracing::warn!(%reason, "disconnected");
                 return Ok(());
             }
             _ => {}
+        }
+    }
+}
+
+/// Handle one addressed question: ask Groq, post the answer to chat,
+/// and (if we're in a call) speak it aloud through the bot's broadcast.
+async fn answer_and_speak(
+    cfg: Arc<SharedConfig>,
+    handle: Arc<ClientHandle>,
+    channel: String,
+    asker: String,
+    question: String,
+    transcript: String,
+    speaker: Option<Speaker>,
+) {
+    let Some(key) = cfg.groq_api_key.as_deref() else { return };
+    tracing::info!(%asker, %question, "answering addressed question");
+
+    let answer = match qa::answer(
+        &cfg.http,
+        key,
+        &cfg.groq_chat_model,
+        &transcript,
+        &question,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = ?e, "QA failed");
+            let _ = handle
+                .privmsg(&channel, &format!("{asker}: sorry — I couldn't answer that ({e})."))
+                .await;
+            return;
+        }
+    };
+
+    // Post the text answer regardless of whether speech works.
+    let _ = handle
+        .privmsg(&channel, &format!("[transcriber→{asker}] {answer}"))
+        .await;
+
+    // Speak it, if we have a broadcast to speak through + an EL key.
+    let Some(speaker) = speaker else {
+        tracing::info!("no active call — answered in text only");
+        return;
+    };
+    let Some(el_key) = cfg.elevenlabs_api_key.as_deref() else {
+        tracing::info!("no ElevenLabs key — answered in text only");
+        return;
+    };
+    match tts::synthesize(
+        &cfg.http,
+        el_key,
+        &cfg.elevenlabs_voice_id,
+        &cfg.elevenlabs_model,
+        &answer,
+    )
+    .await
+    {
+        Ok(audio) => {
+            // Dump the exact synthesized PCM so a "static" report can be
+            // bisected: if /tmp/freeq-tts-last.wav plays clean, the
+            // static is introduced downstream (Opus encode / WebSocket
+            // transport / receiver playout), not by TTS.
+            match std::fs::write(
+                "/tmp/freeq-tts-last.wav",
+                tts::encode_wav(&audio.pcm, audio.sample_rate),
+            ) {
+                Ok(()) => tracing::info!(
+                    samples = audio.pcm.len(),
+                    rate = audio.sample_rate,
+                    "saved TTS audio to /tmp/freeq-tts-last.wav"
+                ),
+                Err(e) => tracing::warn!(error = ?e, "could not save TTS debug WAV"),
+            }
+            speaker.enqueue(&audio.pcm, audio.sample_rate);
+            tracing::info!(
+                queued_secs = speaker.queued_secs(),
+                "spoke answer into the call"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "TTS failed — answer posted as text only");
         }
     }
 }
@@ -290,30 +584,29 @@ pub(crate) enum AvAction {
 /// Pure classifier for av-state TAGMSGs. Centralises:
 ///   - target must be a channel target (`#` / `&`),
 ///   - required tags must be present,
-///   - target must match one of our joined channels (case-insensitive),
-///   - we ignore events whose `+freeq.at/av-actor` equals our own
-///     nick — the bot's own av-join lands as a TAGMSG too, and without
-///     this guard we'd recursively join ourselves.
+///   - `started` is acted on only for one of our joined channels.
+///
+/// We deliberately do NOT skip events whose `+freeq.at/av-actor` is the
+/// bot's own nick. The bot must react to a session *it* started (the
+/// `--start-session-in` flow) — that `av-state=started` is attributed
+/// to the bot. There's no self-recursion risk: the bot's own av-join
+/// produces an `av-state=joined` broadcast, which maps to `Noop`
+/// below (only `started`/`ended` are actioned), and the run loop's
+/// `already in a call` guard absorbs any duplicate `started`.
+///
+/// `my_nick` is retained in the signature for callers/tests; it is no
+/// longer used for filtering.
 pub(crate) fn classify_av_event(
     target: &str,
     tags: &std::collections::HashMap<String, String>,
     my_channels: &[String],
-    my_nick: &str,
+    _my_nick: &str,
 ) -> AvAction {
     if !target.starts_with('#') && !target.starts_with('&') {
         return AvAction::Skip;
     }
     let Some(state) = tags.get("+freeq.at/av-state") else { return AvAction::Skip };
     let Some(av_id) = tags.get("+freeq.at/av-id") else { return AvAction::Skip };
-
-    // Self-loop guard: if the actor is us (case-insensitive — IRC nicks
-    // are ASCII-case-insensitive), drop the event. Without this, the
-    // bot's own av-join would look like a new av-state to itself.
-    if let Some(actor) = tags.get("+freeq.at/av-actor") {
-        if actor.eq_ignore_ascii_case(my_nick) {
-            return AvAction::Skip;
-        }
-    }
 
     match state.as_str() {
         "started" => {
@@ -354,45 +647,74 @@ pub(crate) async fn wait_for_registration_with_timeout(
     }
 }
 
-/// Send av-join, open a MoQ subscriber via the SFU, and spawn the
-/// audio-tap → whisper → PRIVMSG pipeline. Returns an `ActiveCall`
-/// whose `_moq_task` field's drop tears everything down.
+/// Open a MoQ subscriber via the SFU and spawn the audio-tap → STT →
+/// PRIVMSG pipeline. Returns an `ActiveCall` whose `_moq_task` field's
+/// drop tears everything down.
+///
+/// `existing_instance`: when `Some`, the bot is already a participant
+/// in this session (it sent the `av-start`), so we reuse that instance
+/// and do NOT send an `av-join` — sending one would mint a second slot
+/// and the bot would appear in the call twice. When `None` (joining a
+/// session someone else started), we mint a fresh instance and join.
 async fn start_transcription(
     cfg: Arc<SharedConfig>,
     handle: Arc<ClientHandle>,
     channel: String,
     session_id: String,
+    existing_instance: Option<String>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
 ) -> Result<ActiveCall> {
-    let instance_id = generate_instance_id();
-    let mut tags = HashMap::new();
-    tags.insert("+freeq.at/av-join".to_string(), String::new());
-    tags.insert("+freeq.at/av-id".to_string(), session_id.clone());
-    tags.insert("+freeq.at/av-instance".to_string(), instance_id.clone());
-    handle
-        .send_tagmsg(&channel, tags)
-        .await
-        .context("sending av-join")?;
+    let instance_id = match existing_instance {
+        Some(inst) => {
+            tracing::info!(%inst, "reusing av-start instance — skipping redundant av-join");
+            inst
+        }
+        None => {
+            let instance_id = generate_instance_id();
+            let mut tags = HashMap::new();
+            tags.insert("+freeq.at/av-join".to_string(), String::new());
+            tags.insert("+freeq.at/av-id".to_string(), session_id.clone());
+            tags.insert("+freeq.at/av-instance".to_string(), instance_id.clone());
+            handle
+                .send_tagmsg(&channel, tags)
+                .await
+                .context("sending av-join")?;
+            instance_id
+        }
+    };
 
     // Build the MoQ URL. ConnectConfig.server is the IRC server URL;
     // the SFU lives at /av/moq on the same host.
     let sfu_url = sfu_url_from_server(&cfg.server)?;
     let our_broadcast = format!("{session_id}/{}~{instance_id}", cfg.nick);
-    let stt = cfg.stt.clone();
-    let window_secs = cfg.window_secs;
+    let cfg_for_task = cfg.clone();
     let channel_for_task = channel.clone();
     let handle_for_task = handle.clone();
     let active_for_task = active.clone();
+    let session_for_task = session_id.clone();
+
+    // Pair a Speaker (kept here) with a PushAudioSource (handed to the
+    // MoQ task, which publishes it as the bot's broadcast). Enqueueing
+    // on the Speaker makes the bot talk.
+    let (speaker, push_source) = Speaker::new();
+
+    let reconnect_signal = Arc::new(Notify::new());
+    let reconnect_for_task = reconnect_signal.clone();
+    let moq_connected_at = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let connected_at_for_task = moq_connected_at.clone();
 
     let task = tokio::spawn(async move {
         if let Err(e) = run_moq_subscriber(
+            cfg_for_task,
             sfu_url,
+            session_for_task,
             our_broadcast,
             channel_for_task,
-            stt,
-            window_secs,
+            push_source,
             handle_for_task,
             active_for_task,
+            reconnect_for_task,
+            connected_at_for_task,
         )
         .await
         {
@@ -405,42 +727,133 @@ async fn start_transcription(
         session_id,
         instance_id,
         transcript: Vec::new(),
-        _moq_task: task,
+        dumped_upto: 0,
+        speaker,
+        reconnect_signal,
+        moq_connected_at,
+        moq_task: task,
     })
 }
 
-/// Long-lived per-call MoQ subscriber. Listens for participant
-/// broadcasts and spawns a per-nick tap task for each.
+/// Long-lived MoQ subscriber/publisher with automatic reconnect.
+///
+/// The MoQ session over the SFU does occasionally drop (network blip,
+/// SFU restart, transport idle). Without reconnect the bot would go
+/// permanently deaf + mute mid-call. This wraps [`run_moq_session`] in
+/// a backoff loop; the only thing that stops it is the whole task
+/// being aborted on call-end (see `ActiveCall`'s `Drop`).
+#[allow(clippy::too_many_arguments)]
 async fn run_moq_subscriber(
+    cfg: Arc<SharedConfig>,
     sfu_url: url::Url,
+    session_id: String,
     our_broadcast: String,
     channel: String,
-    stt: Arc<Whisper>,
-    window_secs: f32,
+    push_source: PushAudioSource,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
+    reconnect_signal: Arc<Notify>,
+    moq_connected_at: Arc<std::sync::Mutex<std::time::Instant>>,
 ) -> Result<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        let started = std::time::Instant::now();
+        let result = run_moq_session(
+            &cfg,
+            &sfu_url,
+            &session_id,
+            &our_broadcast,
+            &channel,
+            // Fresh clone per attempt — same shared Speaker queue.
+            push_source.clone(),
+            &handle,
+            &active,
+            &reconnect_signal,
+            &moq_connected_at,
+        )
+        .await;
+        // A session that ran for a healthy while then dropped resets
+        // the backoff — only a tight failure loop escalates.
+        if started.elapsed() > Duration::from_secs(30) {
+            attempt = 0;
+        }
+        match result {
+            Ok(()) => {
+                tracing::info!("MoQ subscription stream ended cleanly");
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "MoQ session error");
+            }
+        }
+        attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_secs(2u64.pow(attempt.min(4))); // 2,4,8,16,16…
+        tracing::info!(?backoff, attempt, "reconnecting MoQ session");
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// One MoQ session: connect, publish the bot's broadcast, tap every
+/// participant, until the transport drops. Tap tasks are owned by a
+/// local `JoinSet` so when this function returns (for any reason)
+/// they're all aborted — a reconnect starts every tap fresh rather
+/// than leaving zombies spinning on a dead transport.
+#[allow(clippy::too_many_arguments)]
+async fn run_moq_session(
+    cfg: &Arc<SharedConfig>,
+    sfu_url: &url::Url,
+    session_id: &str,
+    our_broadcast: &str,
+    channel: &str,
+    push_source: PushAudioSource,
+    handle: &Arc<ClientHandle>,
+    active: &Arc<AsyncMutex<Option<ActiveCall>>>,
+    reconnect_signal: &Arc<Notify>,
+    moq_connected_at: &Arc<std::sync::Mutex<std::time::Instant>>,
+) -> Result<()> {
+    let my_nick = cfg.nick.clone();
+    let session_prefix = format!("{session_id}/");
     let mut client_config = moq_native::ClientConfig::default();
     client_config.tls.disable_verify = Some(true);
     client_config.backend = Some(moq_native::QuicBackend::Noq);
     let client = client_config.init()?;
 
-    // We don't publish (silent observer) — but moq-native still wants a
-    // publish-side origin. Hand it an empty one.
+    // Publish the bot's own broadcast — an Opus stream fed by the
+    // PushAudioSource (silence until the bot speaks).
+    let broadcast = LocalBroadcast::new();
+    broadcast
+        .audio()
+        .set(push_source, AudioCodec::Opus, [AudioPreset::Hq])
+        .context("setting bot broadcast audio source")?;
     let pub_origin = moq_lite::Origin::produce();
+    pub_origin.publish_broadcast(our_broadcast, broadcast.consume());
+
     let sub_origin = moq_lite::Origin::produce();
     let mut sub_consumer = sub_origin.consume();
 
     let session_handle = client
         .with_publish(pub_origin.consume())
         .with_consume(sub_origin)
-        .connect(sfu_url)
+        .connect(sfu_url.clone())
         .await
         .context("MoQ connect")?;
 
-    tracing::info!("MoQ subscriber connected; watching for participant broadcasts");
+    // Keep the encoder alive for the session's lifetime.
+    let _broadcast = broadcast;
+    *moq_connected_at.lock().unwrap() = std::time::Instant::now();
+    tracing::info!(%our_broadcast, "MoQ connected — publishing bot audio + watching participants");
 
-    let active_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Tap tasks live here — dropping the JoinSet on return aborts them.
+    let mut taps: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut tapped: HashSet<String> = HashSet::new();
+
+    // Reconnect trigger. moq's `Session::closed()` does NOT resolve when
+    // the WebSocket dies silently (e.g. a proxy idle-timeout strands an
+    // idle socket) — so the `select!` below would park forever. The IRC
+    // loop fires `reconnect_signal` when a participant joins; that bails
+    // this session so `run_moq_subscriber` rebuilds on a fresh socket.
+    // Pinned once: when it resolves we exit the loop, no need to re-arm.
+    let reconnect = reconnect_signal.notified();
+    tokio::pin!(reconnect);
 
     loop {
         tokio::select! {
@@ -451,31 +864,37 @@ async fn run_moq_subscriber(
                         if path_str == our_broadcast {
                             continue;
                         }
-                        // Strip the `{session}/` prefix and the
-                        // `~instance` suffix to get the display nick.
+                        // Only tap broadcasts in *our* session — the SFU
+                        // announces everything, including stale broadcasts
+                        // from prior sessions (no live catalog → "no
+                        // audio renditions").
+                        if !path_str.starts_with(&session_prefix) {
+                            tracing::debug!(%path_str, "skipping broadcast outside our session");
+                            continue;
+                        }
                         let last = path_str.split('/').last().unwrap_or("unknown");
                         let nick = last.split('~').next().unwrap_or(last).to_string();
-                        let key = path_str.clone();
-                        {
-                            let mut set = active_tasks.lock().unwrap();
-                            if !set.insert(key.clone()) {
-                                continue;
-                            }
+                        // Skip the bot's own broadcast — that's our TTS
+                        // audio; transcribing it would be a feedback loop.
+                        if nick.eq_ignore_ascii_case(&my_nick) {
+                            continue;
+                        }
+                        if !tapped.insert(path_str.clone()) {
+                            continue;
                         }
                         tracing::info!(%nick, %path_str, "subscribing to participant");
 
-                        let stt = stt.clone();
-                        let channel = channel.clone();
+                        let cfg = cfg.clone();
+                        let channel = channel.to_string();
                         let handle = handle.clone();
                         let active = active.clone();
-                        tokio::spawn(async move {
+                        taps.spawn(async move {
                             if let Err(e) = tap_participant(
+                                cfg,
                                 path_str,
                                 broadcast_consumer,
                                 nick,
                                 channel,
-                                stt,
-                                window_secs,
                                 handle,
                                 active,
                             )
@@ -489,85 +908,230 @@ async fn run_moq_subscriber(
                         tracing::info!(path = %path.to_string(), "participant broadcast removed");
                     }
                     None => {
-                        tracing::info!("subscription stream closed");
-                        break;
+                        return Ok(()); // subscription stream closed
                     }
                 }
             }
             res = session_handle.closed() => {
-                if let Err(e) = res {
-                    tracing::warn!(error = ?e, "MoQ session closed");
-                }
-                break;
+                anyhow::bail!("MoQ transport closed: {res:?}");
+            }
+            _ = &mut reconnect => {
+                anyhow::bail!("reconnect requested — refreshing MoQ transport");
             }
         }
     }
-
-    Ok(())
 }
 
-/// One per remote broadcast: subscribes to its audio, drains decoded
-/// PCM, runs whisper, posts transcript lines.
+// ── Voice-activity segmentation tuning ──────────────────────────────
+// All in 16 kHz mono samples / amplitude units.
+
+/// Peak amplitude above which a chunk counts as speech. Mic silence /
+/// room noise sits well under this; conversational speech peaks far
+/// above it. Deliberately low so we don't clip quiet talkers.
+const VOICE_PEAK_THRESHOLD: f32 = 0.018;
+/// A pause this long ends an utterance and triggers a flush. Long
+/// enough to ride over the gaps between words, short enough that the
+/// post still feels rapid. 0.6s @ 16 kHz.
+const SILENCE_GAP_SAMPLES: usize = (16_000.0 * 0.6) as usize;
+/// Hard cap on an utterance — flush even mid-speech so a monologue
+/// doesn't accumulate unbounded latency. 22s @ 16 kHz.
+const MAX_UTTERANCE_SAMPLES: usize = 16_000 * 22;
+/// Don't bother transcribing an utterance with less than this much
+/// actual voiced audio — it's a cough / click / room noise. 0.35s.
+const MIN_VOICED_SAMPLES: usize = (16_000.0 * 0.35) as usize;
+
+/// Known Whisper silence/noise hallucinations. Even with VAD, a short
+/// burst of non-speech noise occasionally slips a window through;
+/// these are the canonical phantom outputs across Whisper variants.
+/// An exact (case/punctuation-insensitive) match is dropped.
+fn is_hallucination(text: &str) -> bool {
+    let t = text
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_lowercase();
+    matches!(
+        t.as_str(),
+        "" | "you"
+            | "thank you"
+            | "thanks for watching"
+            | "thank you for watching"
+            | "bye"
+            | "okay"
+            | "so"
+            | "the"
+    )
+}
+
+/// True when an addressed utterance is asking the bot to post the
+/// transcript buffered so far, rather than answer a question. The bot
+/// no longer firehoses every utterance to the channel — people pull the
+/// transcript on demand with "transcriber: dump". Matched loosely
+/// because it's typed *and* spoken (whisper punctuation varies).
+pub(crate) fn is_transcript_request(question: &str) -> bool {
+    let q = question
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_lowercase();
+    q == "dump" || q.starts_with("dump ") || q.contains("transcript")
+}
+
+/// One per remote broadcast: subscribes to its audio and segments it
+/// into utterances by voice activity — accumulate while the speaker is
+/// talking, flush to STT on a natural pause. This kills both the
+/// "Thank you." silence hallucinations (silent stretches never reach
+/// STT) and the mid-sentence splits (we cut at pauses, not on a fixed
+/// clock).
+#[allow(clippy::too_many_arguments)]
 async fn tap_participant(
+    cfg: Arc<SharedConfig>,
     path_str: String,
     broadcast_consumer: moq_lite::BroadcastConsumer,
     nick: String,
     channel: String,
-    stt: Arc<Whisper>,
-    window_secs: f32,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
 ) -> Result<()> {
+    let stt = cfg.stt.clone();
     let remote = RemoteBroadcast::new(&path_str, broadcast_consumer)
         .await
         .context("RemoteBroadcast::new")?;
     let (backend, mut rx) = TapBackend::channel();
-    // Hold the audio track alive — dropping it stops the decoder.
-    let _audio_track = match remote.audio(&backend).await {
+    // `audio_ready()` blocks on the catalog watcher until the broadcast
+    // advertises an audio rendition, then subscribes. The plain
+    // `audio()` is a one-shot catalog read — a participant who joined
+    // before their mic catalog populated (or whose Opus track lands a
+    // beat after the broadcast is announced) fails permanently with
+    // "no audio renditions". Same race we hit on the video path.
+    let _audio_track = match remote.audio_ready(&backend).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(%nick, error = ?e, "audio subscribe failed");
             return Ok(());
         }
     };
+    tracing::info!(%nick, "audio track live — transcribing");
 
+    // Utterance accumulator + VAD state.
     let mut buf: Vec<f32> = Vec::new();
-    let target_samples = (16_000.0 * window_secs) as usize;
+    let mut voiced_samples: usize = 0;
+    let mut trailing_silence: usize = 0;
+    let mut frames_seen: u64 = 0;
 
     while let Some(frame) = rx.recv().await {
+        frames_seen += 1;
         let pcm = to_whisper_pcm(&frame.samples, frame.format);
-        buf.extend_from_slice(&pcm);
-        if buf.len() < target_samples {
+        if pcm.is_empty() {
             continue;
         }
-        // Run whisper on the buffered window. Drain the buffer; we
-        // accept a small amount of word-boundary drift in exchange for
-        // not re-decoding the same audio twice.
+        let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let voiced = peak >= VOICE_PEAK_THRESHOLD;
+
+        if voiced {
+            buf.extend_from_slice(&pcm);
+            voiced_samples += pcm.len();
+            trailing_silence = 0;
+        } else if !buf.is_empty() {
+            // Mid-utterance silence: keep it in the buffer (the pause is
+            // part of natural speech and helps STT) and count it toward
+            // the end-of-utterance gap.
+            buf.extend_from_slice(&pcm);
+            trailing_silence += pcm.len();
+        }
+        // else: pre-speech silence — drop it, never accumulate.
+
+        if frames_seen == 1 || frames_seen.is_multiple_of(250) {
+            tracing::info!(
+                %nick, frames_seen, buffered = buf.len(), voiced_samples, peak,
+                in_rate = frame.format.sample_rate,
+                in_channels = frame.format.channel_count,
+                "audio tap heartbeat"
+            );
+        }
+
+        let pause_flush = trailing_silence >= SILENCE_GAP_SAMPLES && !buf.is_empty();
+        let cap_flush = buf.len() >= MAX_UTTERANCE_SAMPLES;
+        if !pause_flush && !cap_flush {
+            continue;
+        }
+
         let chunk = std::mem::take(&mut buf);
+        let chunk_voiced = voiced_samples;
+        voiced_samples = 0;
+        trailing_silence = 0;
+
+        // Skip utterances that are basically noise — too little actual
+        // speech to be worth a round-trip (and a prime hallucination
+        // source).
+        if chunk_voiced < MIN_VOICED_SAMPLES {
+            tracing::debug!(%nick, chunk_voiced, "skipping low-voice utterance");
+            continue;
+        }
+
         let stt = stt.clone();
         let nick = nick.clone();
         let channel = channel.clone();
         let handle = handle.clone();
         let active = active.clone();
+        let cfg = cfg.clone();
+        // `SttEngine::transcribe` is async — Groq is an HTTP round-trip,
+        // local whisper does its own spawn_blocking internally. One task
+        // per utterance so a slow STT call doesn't stall the tap loop.
         tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || stt.transcribe(&chunk)).await {
-                Ok(Ok(text)) => {
-                    if text.is_empty() {
+            match stt.transcribe(&chunk).await {
+                Ok(text) => {
+                    if text.is_empty() || is_hallucination(&text) {
+                        tracing::info!(%nick, %text, "dropped empty/hallucinated utterance");
                         return;
                     }
-                    let line = format!("[transcript] {nick}: {text}");
-                    let _ = handle.privmsg(&channel, &line).await;
+                    tracing::info!(%nick, %text, "transcribed utterance");
+
+                    // Voice-addressed Q&A: if the utterance starts with
+                    // the bot's name ("transcriber, summarize…"), treat
+                    // it as a spoken question — answer + speak back —
+                    // instead of just logging it as a transcript line.
+                    // In a voice call people address the bot by talking,
+                    // not typing.
+                    if let Some(question) = qa::extract_addressed(&text, &cfg.nick) {
+                        if is_transcript_request(question) {
+                            dump_transcript(&handle, &channel, &active).await;
+                            return;
+                        }
+                        let _ = handle
+                            .privmsg(&channel, &format!("[transcript] {nick} asked: {text}"))
+                            .await;
+                        let (transcript, speaker) = {
+                            let guard = active.lock().await;
+                            match guard.as_ref() {
+                                Some(call) => {
+                                    (call.transcript.join("\n"), Some(call.speaker.clone()))
+                                }
+                                None => (String::new(), None),
+                            }
+                        };
+                        answer_and_speak(
+                            cfg,
+                            handle,
+                            channel,
+                            nick,
+                            question.to_string(),
+                            transcript,
+                            speaker,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    // Buffer the line — the bot no longer firehoses every
+                    // utterance to the channel. A `dump` request posts
+                    // what's accumulated.
                     let log_line = format!("{nick}: {text}");
                     let mut guard = active.lock().await;
                     if let Some(call) = guard.as_mut() {
                         call.transcript.push(log_line);
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(%nick, error = ?e, "whisper failed");
-                }
                 Err(e) => {
-                    tracing::warn!(%nick, error = ?e, "whisper task joined with error");
+                    tracing::warn!(%nick, error = ?e, "STT failed");
                 }
             }
         });
@@ -584,7 +1148,18 @@ pub(crate) fn generate_instance_id() -> String {
 }
 
 /// Derive the MoQ SFU URL from the IRC server URL. Same host, /av/moq
-/// path, ws/wss based on scheme.
+/// path, `https`/`http` scheme.
+///
+/// The scheme matters for transport selection. moq-native races a QUIC
+/// (WebTransport) connection against a WebSocket fallback and keeps the
+/// first to succeed. Its QUIC backend only accepts `https`/`moqt`/`moql`
+/// — a `wss` URL is rejected outright, so the bot would silently drop to
+/// the WebSocket fallback. WebSocket runs over TCP, whose head-of-line
+/// blocking turns any packet loss into bursty delivery, which the
+/// receiver hears as "bad-radio" static on the bot's audio. Emitting
+/// `https` puts QUIC (the proper low-latency media transport) back in
+/// the race; the WebSocket fallback accepts `https`/`http` too, so this
+/// costs nothing if QUIC is unavailable.
 ///
 /// Adversarial input handling:
 ///   - empty / whitespace-only string → clean error (was previously
@@ -612,14 +1187,15 @@ pub(crate) fn sfu_url_from_server(server: &str) -> Result<url::Url> {
         .with_context(|| format!("parsing server URL for SFU: {trimmed:?}"))?;
     // Reject schemes that don't make sense for the SFU. `url::Url`
     // happily accepts `file://`, `mailto:`, etc. — pin the allowed set.
+    // Normalize to `https`/`http` so moq-native can attempt QUIC (see
+    // the doc comment above).
     match u.scheme() {
-        "https" => {
-            u.set_scheme("wss").ok();
+        "https" | "wss" => {
+            u.set_scheme("https").ok();
         }
-        "http" => {
-            u.set_scheme("ws").ok();
+        "http" | "ws" => {
+            u.set_scheme("http").ok();
         }
-        "ws" | "wss" => {}
         other => anyhow::bail!("unsupported scheme for SFU URL: {other:?}"),
     }
     // A URL like `ws://` parses but has an empty host; that would make
@@ -629,6 +1205,79 @@ pub(crate) fn sfu_url_from_server(server: &str) -> Result<url::Url> {
     }
     u.set_path("/av/moq");
     Ok(u)
+}
+
+/// Derive the REST API base (`https://host[:port]`) from the IRC
+/// server URL. `wss://host/irc` → `https://host`; `host:port` →
+/// `http://host:port`.
+pub(crate) fn api_base_from_server(server: &str) -> Result<String> {
+    let trimmed = server.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("server URL is empty");
+    }
+    let normalized = if trimmed.starts_with("ws://")
+        || trimmed.starts_with("wss://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+    {
+        trimmed.to_string()
+    } else {
+        format!("ws://{trimmed}")
+    };
+    let u: url::Url = normalized
+        .parse()
+        .with_context(|| format!("parsing server URL for REST API: {trimmed:?}"))?;
+    let scheme = match u.scheme() {
+        "https" | "wss" => "https",
+        "http" | "ws" => "http",
+        other => anyhow::bail!("unsupported scheme for REST API: {other:?}"),
+    };
+    let host = u.host_str().context("server URL has no host")?;
+    Ok(match u.port() {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
+/// Query the REST API for an active AV session in `channel`. Returns
+/// its session id if one is running, `None` otherwise (incl. on any
+/// network/parse error — we then fall back to starting a fresh call).
+async fn discover_active_session(cfg: &SharedConfig, channel: &str) -> Option<String> {
+    let base = api_base_from_server(&cfg.server).ok()?;
+    let encoded: String = channel
+        .bytes()
+        .map(|b| {
+            if b == b'#' {
+                "%23".to_string()
+            } else {
+                (b as char).to_string()
+            }
+        })
+        .collect();
+    let url = format!("{base}/api/v1/channels/{encoded}/sessions");
+    let resp = cfg
+        .http
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let active = json.get("active")?;
+    if active.is_null() {
+        return None;
+    }
+    let state = active.get("state").and_then(|s| s.as_str()).unwrap_or("");
+    if state != "Active" {
+        return None;
+    }
+    active
+        .get("id")
+        .and_then(|i| i.as_str())
+        .map(|s| s.to_string())
 }
 
 /// PRIVMSG has a length cap (~400-500 chars depending on prefix length).
@@ -642,6 +1291,56 @@ async fn post_long(handle: &ClientHandle, channel: &str, text: &str) {
         let _ = handle.privmsg(channel, line).await;
         // Brief pacing so we don't flood-trip the server.
         tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Post the transcript accumulated since the last dump to `channel`.
+/// Called on an explicit `dump` request — this replaces the old
+/// one-PRIVMSG-per-utterance firehose. Advances `dumped_upto` so a
+/// repeated dump only shows what's new since the previous one.
+async fn dump_transcript(
+    handle: &ClientHandle,
+    channel: &str,
+    active: &Arc<AsyncMutex<Option<ActiveCall>>>,
+) {
+    // Snapshot the new lines while holding the lock; post outside it.
+    let snapshot: Option<(Vec<String>, usize)> = {
+        let mut guard = active.lock().await;
+        guard.as_mut().map(|call| {
+            let total = call.transcript.len();
+            let from = call.dumped_upto.min(total);
+            let new = call.transcript[from..].to_vec();
+            call.dumped_upto = total;
+            (new, total)
+        })
+    };
+    match snapshot {
+        None => {
+            let _ = handle
+                .privmsg(channel, "[transcript] no active call right now.")
+                .await;
+        }
+        Some((new, total)) if new.is_empty() => {
+            let msg = if total == 0 {
+                "[transcript] nothing transcribed yet."
+            } else {
+                "[transcript] nothing new since the last dump."
+            };
+            let _ = handle.privmsg(channel, msg).await;
+        }
+        Some((new, _)) => {
+            let _ = handle
+                .privmsg(
+                    channel,
+                    &format!("[transcript] {} line(s) since the last dump:", new.len()),
+                )
+                .await;
+            for line in &new {
+                let _ = handle.privmsg(channel, &format!("  {line}")).await;
+                // Brief pacing so we don't flood-trip the server.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+        }
     }
 }
 
@@ -676,27 +1375,29 @@ mod tests {
     // ---------- sfu_url_from_server ----------
 
     #[test]
-    fn sfu_wss_irc_to_wss_avmoq() {
+    fn sfu_wss_irc_to_https_avmoq() {
+        // `wss` IRC URL → `https` SFU URL so moq-native attempts QUIC
+        // rather than skipping straight to the WebSocket fallback.
         let u = sfu_url_from_server("wss://irc.freeq.at/irc").unwrap();
-        assert_eq!(u.as_str(), "wss://irc.freeq.at/av/moq");
+        assert_eq!(u.as_str(), "https://irc.freeq.at/av/moq");
     }
 
     #[test]
-    fn sfu_https_to_wss() {
+    fn sfu_https_stays_https() {
         let u = sfu_url_from_server("https://irc.freeq.at").unwrap();
-        assert_eq!(u.as_str(), "wss://irc.freeq.at/av/moq");
+        assert_eq!(u.as_str(), "https://irc.freeq.at/av/moq");
     }
 
     #[test]
-    fn sfu_http_to_ws() {
+    fn sfu_http_stays_http() {
         let u = sfu_url_from_server("http://localhost").unwrap();
-        assert_eq!(u.as_str(), "ws://localhost/av/moq");
+        assert_eq!(u.as_str(), "http://localhost/av/moq");
     }
 
     #[test]
-    fn sfu_raw_host_port_to_ws() {
+    fn sfu_raw_host_port_to_http() {
         let u = sfu_url_from_server("localhost:6667").unwrap();
-        assert_eq!(u.as_str(), "ws://localhost:6667/av/moq");
+        assert_eq!(u.as_str(), "http://localhost:6667/av/moq");
     }
 
     #[test]
@@ -719,7 +1420,7 @@ mod tests {
     #[test]
     fn sfu_trims_surrounding_whitespace() {
         let u = sfu_url_from_server("  wss://irc.freeq.at/irc  ").unwrap();
-        assert_eq!(u.as_str(), "wss://irc.freeq.at/av/moq");
+        assert_eq!(u.as_str(), "https://irc.freeq.at/av/moq");
     }
 
     #[test]
@@ -925,9 +1626,11 @@ mod tests {
     }
 
     #[test]
-    fn classify_skips_self_actor_loop() {
-        // The bot's own av-join lands as a TAGMSG. Without this
-        // guard the bot would respond to itself and recurse.
+    fn classify_acts_on_self_started_session() {
+        // The bot must act on a session IT started (--start-session-in):
+        // the server attributes that `av-state=started` to the bot's
+        // own nick. Self-recursion is not a risk — the subsequent
+        // av-join surfaces as `av-state=joined`, which is Noop.
         let t = tags(&[
             ("+freeq.at/av-state", "started"),
             ("+freeq.at/av-id", "s1"),
@@ -935,8 +1638,26 @@ mod tests {
         ]);
         assert_eq!(
             classify_av_event("#room", &t, &["#room".into()], "tbot"),
-            AvAction::Skip,
-            "case-insensitive nick match should self-skip"
+            AvAction::Start {
+                channel: "#room".into(),
+                session_id: "s1".into(),
+            },
+            "bot-initiated session start must be acted on, not self-skipped"
+        );
+    }
+
+    #[test]
+    fn classify_self_actor_joined_is_noop() {
+        // The bot's own av-join → server broadcasts av-state=joined
+        // attributed to the bot. Must be Noop, never a re-trigger.
+        let t = tags(&[
+            ("+freeq.at/av-state", "joined"),
+            ("+freeq.at/av-id", "s1"),
+            ("+freeq.at/av-actor", "tbot"),
+        ]);
+        assert_eq!(
+            classify_av_event("#room", &t, &["#room".into()], "tbot"),
+            AvAction::Noop,
         );
     }
 
@@ -1015,6 +1736,41 @@ mod tests {
                 AvAction::Noop,
                 "state {state:?}"
             );
+        }
+    }
+
+    // ---------- is_transcript_request ----------
+
+    #[test]
+    fn transcript_request_matches_dump_phrasings() {
+        for q in [
+            "dump",
+            "dump.",
+            "Dump!",
+            "dump it",
+            "dump the transcript",
+            "dump everything",
+            "transcript",
+            "transcript please",
+            "show me the transcript",
+            "post the transcript",
+            "what's the transcript so far",
+        ] {
+            assert!(is_transcript_request(q), "should match: {q:?}");
+        }
+    }
+
+    #[test]
+    fn transcript_request_rejects_real_questions() {
+        for q in [
+            "",
+            "what time is it",
+            "summarize the action items",
+            "who said that",
+            "how are you",
+            "dumpling recipe", // 'dump' must be a whole word, not a prefix
+        ] {
+            assert!(!is_transcript_request(q), "should not match: {q:?}");
         }
     }
 

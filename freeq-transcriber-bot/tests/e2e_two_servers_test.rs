@@ -24,7 +24,7 @@ use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
 use freeq_transcriber_bot::identity::{self, Identity};
 use freeq_transcriber_bot::irc::{RunConfig, run};
-use freeq_transcriber_bot::stt::Whisper;
+use freeq_transcriber_bot::stt::SttEngine;
 use tokio::sync::mpsc::Receiver;
 
 // ───────────────────────────── server bootstrap ─────────────────────────────
@@ -275,11 +275,21 @@ fn spawn_bot(
         // stt feature is off → Whisper::load is a no-op that accepts any
         // path and `transcribe` always returns "". We never reach the
         // audio path in these tests anyway.
-        stt: Arc::new(Whisper::load(std::path::Path::new("/dev/null")).expect("no-op whisper")),
+        stt: Arc::new(SttEngine::noop()),
         window_secs: 10.0,
         summary_model: "claude-sonnet-4-5".to_string(),
         // No ANTHROPIC key in test env → no summary path.
         anthropic_key: None,
+        // These tests drive av-start from a separate publisher client;
+        // the bot itself only watches.
+        start_session_in: None,
+        // No Groq/ElevenLabs keys in test env → Q&A/TTS disabled; these
+        // tests only exercise the IRC/TAGMSG control plane.
+        groq_api_key: None,
+        groq_chat_model: "llama-3.3-70b-versatile".to_string(),
+        elevenlabs_api_key: None,
+        elevenlabs_voice_id: "aj0fZfXTBc7E3By4X8L2".to_string(),
+        elevenlabs_model: "eleven_turbo_v2_5".to_string(),
     };
     let handle = tokio::spawn(run(cfg));
     (handle, tmp)
