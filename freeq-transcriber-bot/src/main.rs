@@ -101,6 +101,13 @@ struct Cli {
     /// The channel must also be in `--channel`.
     #[arg(long)]
     start_session_in: Option<String>,
+
+    /// Override the MoQ SFU URL. Default: derived from `--server` as
+    /// `https://<host>/av/moq`. Point at the SFU's QUIC port to force
+    /// the low-latency transport, e.g.
+    /// `https://irc.freeq.at:4443/av/moq`.
+    #[arg(long)]
+    sfu_url: Option<String>,
 }
 
 #[tokio::main]
@@ -160,6 +167,7 @@ async fn main() -> Result<()> {
         summary_model: cli.summary_model,
         anthropic_key,
         start_session_in: cli.start_session_in,
+        sfu_url_override: cli.sfu_url,
         groq_api_key,
         groq_chat_model: cli.groq_chat_model,
         elevenlabs_api_key,

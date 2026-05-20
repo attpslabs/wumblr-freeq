@@ -47,6 +47,11 @@ pub struct RunConfig {
     /// server's `av-state=started` echo then drives the normal
     /// join/subscribe path.
     pub start_session_in: Option<String>,
+    /// Override the MoQ SFU URL. When `None` it's derived from `server`
+    /// via [`sfu_url_from_server`]. Set this to the SFU's QUIC port
+    /// (e.g. `https://host:4443/av/moq`) to use QUIC instead of the
+    /// WebSocket fallback.
+    pub sfu_url_override: Option<String>,
     /// Groq API key — powers question-answering (chat). When `None`,
     /// the bot can't answer addressed questions.
     pub groq_api_key: Option<String>,
@@ -70,6 +75,7 @@ struct SharedConfig {
     window_secs: f32,
     summary_model: String,
     anthropic_key: Option<String>,
+    sfu_url_override: Option<String>,
     groq_api_key: Option<String>,
     groq_chat_model: String,
     elevenlabs_api_key: Option<String>,
@@ -131,6 +137,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         summary_model,
         anthropic_key,
         start_session_in,
+        sfu_url_override,
         groq_api_key,
         groq_chat_model,
         elevenlabs_api_key,
@@ -209,6 +216,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         window_secs,
         summary_model,
         anthropic_key,
+        sfu_url_override,
         groq_api_key,
         groq_chat_model,
         elevenlabs_api_key,
@@ -683,9 +691,12 @@ async fn start_transcription(
         }
     };
 
-    // Build the MoQ URL. ConnectConfig.server is the IRC server URL;
-    // the SFU lives at /av/moq on the same host.
-    let sfu_url = sfu_url_from_server(&cfg.server)?;
+    // Build the MoQ URL. Use the explicit override if given (e.g. the
+    // SFU's QUIC port), else derive `/av/moq` on the IRC server's host.
+    let sfu_url = match &cfg.sfu_url_override {
+        Some(u) => u.parse().with_context(|| format!("parsing --sfu-url {u:?}"))?,
+        None => sfu_url_from_server(&cfg.server)?,
+    };
     let our_broadcast = format!("{session_id}/{}~{instance_id}", cfg.nick);
     let cfg_for_task = cfg.clone();
     let channel_for_task = channel.clone();

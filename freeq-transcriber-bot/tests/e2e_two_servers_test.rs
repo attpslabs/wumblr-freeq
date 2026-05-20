@@ -283,6 +283,7 @@ fn spawn_bot(
         // These tests drive av-start from a separate publisher client;
         // the bot itself only watches.
         start_session_in: None,
+        sfu_url_override: None,
         // No Groq/ElevenLabs keys in test env → Q&A/TTS disabled; these
         // tests only exercise the IRC/TAGMSG control plane.
         groq_api_key: None,
