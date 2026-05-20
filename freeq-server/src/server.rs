@@ -5016,6 +5016,223 @@ mod s2s_adversarial_tests {
         assert_eq!(state.display_nick_for_did(owner), "foo");
     }
 
+    // === commit-reveal verification ===
+    //
+    // Tests for `connection::messaging::verify_commit_reveal`. Each test
+    // stages a synthetic commit message in the `messages` table (via the
+    // same `insert_message` path commits ride in production), then calls
+    // the verifier with matching/mismatching reveal inputs and asserts
+    // the outcome.
+
+    fn stage_commit(
+        state: &Arc<SharedState>,
+        msgid: &str,
+        commit_did: &str,
+        channel: &str,
+        ref_id: Option<&str>,
+        salt: &[u8],
+        plaintext: &str,
+        alg: &str,
+    ) -> String {
+        use base64::Engine;
+        use sha2::Digest;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(salt);
+        hasher.update(plaintext.as_bytes());
+        let hash_b64 = b64.encode(hasher.finalize());
+
+        let mut tags: HashMap<String, String> = HashMap::new();
+        tags.insert("+freeq.at/event".to_string(), "commit".to_string());
+        let payload = format!(r#"{{"hash":"{}","alg":"{}"}}"#, hash_b64, alg);
+        tags.insert("+freeq.at/payload".to_string(), payload);
+        if let Some(r) = ref_id {
+            tags.insert("+freeq.at/ref".to_string(), r.to_string());
+        }
+
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    channel,
+                    "panelist",
+                    "🔒 sealed",
+                    1_700_000_000,
+                    &tags,
+                    Some(msgid),
+                    Some(commit_did),
+                )
+            })
+            .expect("insert_message via with_db");
+        hash_b64
+    }
+
+    fn reveal_payload(commit_msgid: &str, salt: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let salt_b64 = b64.encode(salt);
+        format!(
+            r#"{{"reveal_of":"{}","salt":"{}"}}"#,
+            commit_msgid, salt_b64
+        )
+    }
+
+    #[test]
+    fn commit_reveal_verify_happy_path() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let salt: &[u8] = b"saltsalt12345678";
+        let plaintext = "The answer is X because Y.";
+        stage_commit(
+            &state, "01J...COMMIT", did, "#debate",
+            Some("01J...DEBATE"), salt, plaintext, "sha256",
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate", Some("01J...DEBATE"), &payload, plaintext,
+        );
+        assert_eq!(r, Ok(()));
+    }
+
+    #[test]
+    fn commit_reveal_hash_mismatch_on_tampered_body() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let salt: &[u8] = b"saltsalt12345678";
+        stage_commit(
+            &state, "01J...COMMIT", did, "#debate",
+            Some("01J...DEBATE"), salt, "original", "sha256",
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate", Some("01J...DEBATE"),
+            &payload, "tampered", // different from committed plaintext
+        );
+        assert_eq!(r, Err("hash_mismatch"));
+    }
+
+    #[test]
+    fn commit_reveal_commit_not_found() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let payload = reveal_payload("01J...DOESNOTEXIST", b"salt");
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate", Some("01J...DEBATE"),
+            &payload, "anything",
+        );
+        assert_eq!(r, Err("commit_not_found"));
+    }
+
+    #[test]
+    fn commit_reveal_actor_mismatch() {
+        let state = test_state_with_db();
+        let salt: &[u8] = b"saltsalt";
+        let plaintext = "answer";
+        stage_commit(
+            &state, "01J...COMMIT", "did:key:zPANEL1", "#debate",
+            Some("01J...DEBATE"), salt, plaintext, "sha256",
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state,
+            Some("did:key:zPANEL2"), // different DID reveals
+            "#debate", Some("01J...DEBATE"), &payload, plaintext,
+        );
+        assert_eq!(r, Err("actor_mismatch"));
+    }
+
+    #[test]
+    fn commit_reveal_channel_mismatch() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let salt: &[u8] = b"saltsalt";
+        let plaintext = "answer";
+        stage_commit(
+            &state, "01J...COMMIT", did, "#debate",
+            Some("01J...DEBATE"), salt, plaintext, "sha256",
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did),
+            "#other", // different channel
+            Some("01J...DEBATE"), &payload, plaintext,
+        );
+        assert_eq!(r, Err("channel_mismatch"));
+    }
+
+    #[test]
+    fn commit_reveal_ref_id_mismatch() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let salt: &[u8] = b"saltsalt";
+        let plaintext = "answer";
+        stage_commit(
+            &state, "01J...COMMIT", did, "#debate",
+            Some("01J...DEBATE-A"), salt, plaintext, "sha256",
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate",
+            Some("01J...DEBATE-B"), // different ref_id
+            &payload, plaintext,
+        );
+        assert_eq!(r, Err("ref_id_mismatch"));
+    }
+
+    #[test]
+    fn commit_reveal_unsupported_alg() {
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let salt: &[u8] = b"saltsalt";
+        let plaintext = "answer";
+        stage_commit(
+            &state, "01J...COMMIT", did, "#debate",
+            Some("01J...DEBATE"), salt, plaintext, "md5", // unsupported
+        );
+        let payload = reveal_payload("01J...COMMIT", salt);
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate", Some("01J...DEBATE"), &payload, plaintext,
+        );
+        assert_eq!(r, Err("unsupported_alg"));
+    }
+
+    #[test]
+    fn commit_reveal_not_a_commit() {
+        // Stage a non-commit message at the referenced msgid.
+        let state = test_state_with_db();
+        let did = "did:key:zPANEL1";
+        let mut tags: HashMap<String, String> = HashMap::new();
+        tags.insert("+freeq.at/event".to_string(), "task_request".to_string());
+        state
+            .with_db(|db| {
+                db.insert_message(
+                    "#debate",
+                    "panelist",
+                    "task request",
+                    1_700_000_000,
+                    &tags,
+                    Some("01J...NOTCOMMIT"),
+                    Some(did),
+                )
+            })
+            .expect("insert_message via with_db");
+
+        let payload = reveal_payload("01J...NOTCOMMIT", b"salt");
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some(did), "#debate", None, &payload, "anything",
+        );
+        assert_eq!(r, Err("not_a_commit"));
+    }
+
+    #[test]
+    fn commit_reveal_bad_payload() {
+        let state = test_state_with_db();
+        let r = crate::connection::messaging::verify_commit_reveal(
+            &state, Some("did:key:zX"), "#debate", None,
+            "{not json", "anything",
+        );
+        assert_eq!(r, Err("bad_payload"));
+    }
+
     #[test]
     fn bind_identity_refuses_nick_owned_by_other_did() {
         let state = test_state();

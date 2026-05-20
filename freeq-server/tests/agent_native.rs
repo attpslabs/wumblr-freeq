@@ -1997,3 +1997,350 @@ async fn ghost_reclaim_cleans_stale_sessions() {
     server_handle.abort();
     eprintln!("  ✓ Ghost reclaim cleans stale sessions — no duplicate members");
 }
+
+// ── Test: Commit-Reveal verification ────────────────────────────────
+//
+// End-to-end coverage of the server's verify-and-stamp of
+// `+freeq.at/event=reveal` against a prior `+freeq.at/event=commit`:
+// the receiver of the relayed reveal must see the server's verdict
+// tag (`+freeq.at/commit-verified=true|false`, with
+// `+freeq.at/commit-mismatch=<reason>` on failure). Wire format and
+// hash scope are spec'd in docs/agents.md § Commit-Reveal.
+
+/// Helper: compute base64url(sha256(salt || plaintext)) + base64url(salt).
+fn cr_hash_and_salt(salt: &[u8], plaintext: &str) -> (String, String) {
+    use base64::Engine;
+    use sha2::Digest;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut h = sha2::Sha256::new();
+    h.update(salt);
+    h.update(plaintext.as_bytes());
+    (b64.encode(h.finalize()), b64.encode(salt))
+}
+
+fn commit_payload_tag(hash_b64: &str) -> String {
+    format!(r#"{{"hash":"{hash_b64}","alg":"sha256"}}"#)
+}
+
+fn reveal_payload_tag(commit_msgid: &str, salt_b64: &str) -> String {
+    format!(r#"{{"reveal_of":"{commit_msgid}","salt":"{salt_b64}"}}"#)
+}
+
+/// Drive both clients to join `#crtest` and drain join events.
+async fn cr_join_both(
+    a: &client::ClientHandle,
+    a_ev: &mut mpsc::Receiver<Event>,
+    o: &client::ClientHandle,
+    o_ev: &mut mpsc::Receiver<Event>,
+    channel: &str,
+) {
+    a.join(channel).await.unwrap();
+    expect_event(
+        a_ev,
+        2000,
+        |e| matches!(e, Event::Joined { channel: c, .. } if c == channel),
+        "alice joined",
+    )
+    .await;
+    o.join(channel).await.unwrap();
+    expect_event(
+        o_ev,
+        2000,
+        |e| matches!(e, Event::Joined { channel: c, .. } if c == channel),
+        "observer joined",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while a_ev.try_recv().is_ok() {}
+    while o_ev.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn commit_reveal_happy_path() {
+    // DB-backed: commit-reveal verification looks up the prior commit via
+    // find_message_by_msgid, which requires the messages table to be live.
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+    let (_alice_did, alice, mut alice_ev) = connect_did_key(addr, "alice").await;
+    let (observer, mut obs_ev) = connect_guest(addr, "crobs").await;
+
+    cr_join_both(&alice, &mut alice_ev, &observer, &mut obs_ev, "#crtest").await;
+
+    let salt: &[u8] = b"saltsalt12345678";
+    let plaintext = "The answer is X.";
+    let (hash_b64, salt_b64) = cr_hash_and_salt(salt, plaintext);
+
+    // Alice commits.
+    let mut commit_tags: HashMap<String, String> = HashMap::new();
+    commit_tags.insert("+freeq.at/event".to_string(), "commit".to_string());
+    commit_tags.insert("+freeq.at/ref".to_string(), "DEBATE-HAPPY".to_string());
+    commit_tags.insert(
+        "+freeq.at/payload".to_string(),
+        commit_payload_tag(&hash_b64),
+    );
+    alice
+        .send_tagged("#crtest", "🔒 sealed", commit_tags)
+        .await
+        .unwrap();
+
+    // Observer sees the commit; capture its msgid.
+    let commit_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "🔒 sealed"),
+        "observer got commit",
+    )
+    .await;
+    let commit_msgid = if let Event::Message { tags, .. } = &commit_event {
+        tags.get("msgid").cloned().expect("commit must carry msgid")
+    } else {
+        unreachable!()
+    };
+
+    // Alice reveals.
+    let mut reveal_tags: HashMap<String, String> = HashMap::new();
+    reveal_tags.insert("+freeq.at/event".to_string(), "reveal".to_string());
+    reveal_tags.insert("+freeq.at/ref".to_string(), "DEBATE-HAPPY".to_string());
+    reveal_tags.insert(
+        "+freeq.at/payload".to_string(),
+        reveal_payload_tag(&commit_msgid, &salt_b64),
+    );
+    alice
+        .send_tagged("#crtest", plaintext, reveal_tags)
+        .await
+        .unwrap();
+
+    // Observer sees the reveal with the server's verdict stamped on.
+    let reveal_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == plaintext),
+        "observer got reveal",
+    )
+    .await;
+    if let Event::Message { tags, .. } = &reveal_event {
+        assert_eq!(
+            tags.get("+freeq.at/commit-verified").map(String::as_str),
+            Some("true"),
+            "expected +freeq.at/commit-verified=true; tags={tags:?}",
+        );
+        assert!(
+            !tags.contains_key("+freeq.at/commit-mismatch"),
+            "expected no commit-mismatch on happy path; tags={tags:?}",
+        );
+    }
+
+    alice.quit(None).await.unwrap();
+    observer.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn commit_reveal_hash_mismatch_e2e() {
+    // DB-backed: commit-reveal verification looks up the prior commit via
+    // find_message_by_msgid, which requires the messages table to be live.
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+    let (_alice_did, alice, mut alice_ev) = connect_did_key(addr, "alice").await;
+    let (observer, mut obs_ev) = connect_guest(addr, "crobs").await;
+
+    cr_join_both(&alice, &mut alice_ev, &observer, &mut obs_ev, "#crtest").await;
+
+    let salt: &[u8] = b"saltsalt12345678";
+    let (hash_b64, salt_b64) = cr_hash_and_salt(salt, "the committed answer");
+
+    let mut commit_tags: HashMap<String, String> = HashMap::new();
+    commit_tags.insert("+freeq.at/event".to_string(), "commit".to_string());
+    commit_tags.insert("+freeq.at/ref".to_string(), "DEBATE-TAMPER".to_string());
+    commit_tags.insert(
+        "+freeq.at/payload".to_string(),
+        commit_payload_tag(&hash_b64),
+    );
+    alice
+        .send_tagged("#crtest", "🔒 sealed", commit_tags)
+        .await
+        .unwrap();
+
+    let commit_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "🔒 sealed"),
+        "observer got commit",
+    )
+    .await;
+    let commit_msgid = if let Event::Message { tags, .. } = &commit_event {
+        tags.get("msgid").cloned().unwrap()
+    } else {
+        unreachable!()
+    };
+
+    // Reveal a DIFFERENT body than what was committed.
+    let mut reveal_tags: HashMap<String, String> = HashMap::new();
+    reveal_tags.insert("+freeq.at/event".to_string(), "reveal".to_string());
+    reveal_tags.insert("+freeq.at/ref".to_string(), "DEBATE-TAMPER".to_string());
+    reveal_tags.insert(
+        "+freeq.at/payload".to_string(),
+        reveal_payload_tag(&commit_msgid, &salt_b64),
+    );
+    alice
+        .send_tagged("#crtest", "a tampered body", reveal_tags)
+        .await
+        .unwrap();
+
+    let reveal_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "a tampered body"),
+        "observer got tampered reveal",
+    )
+    .await;
+    if let Event::Message { tags, .. } = &reveal_event {
+        assert_eq!(
+            tags.get("+freeq.at/commit-verified").map(String::as_str),
+            Some("false"),
+            "expected commit-verified=false on tampered body; tags={tags:?}",
+        );
+        assert_eq!(
+            tags.get("+freeq.at/commit-mismatch").map(String::as_str),
+            Some("hash_mismatch"),
+            "expected commit-mismatch=hash_mismatch; tags={tags:?}",
+        );
+    }
+
+    alice.quit(None).await.unwrap();
+    observer.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn commit_reveal_actor_mismatch_e2e() {
+    // DB-backed: commit-reveal verification looks up the prior commit via
+    // find_message_by_msgid, which requires the messages table to be live.
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+    let (_alice_did, alice, mut alice_ev) = connect_did_key(addr, "alice").await;
+    let (_bob_did, bob, mut bob_ev) = connect_did_key(addr, "bob").await;
+    let (observer, mut obs_ev) = connect_guest(addr, "crobs").await;
+
+    // All three join.
+    alice.join("#crtest").await.unwrap();
+    expect_event(&mut alice_ev, 2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#crtest"), "alice joined").await;
+    bob.join("#crtest").await.unwrap();
+    expect_event(&mut bob_ev, 2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#crtest"), "bob joined").await;
+    observer.join("#crtest").await.unwrap();
+    expect_event(&mut obs_ev, 2000,
+        |e| matches!(e, Event::Joined { channel, .. } if channel == "#crtest"), "observer joined").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while alice_ev.try_recv().is_ok() {}
+    while bob_ev.try_recv().is_ok() {}
+    while obs_ev.try_recv().is_ok() {}
+
+    let salt: &[u8] = b"saltsalt12345678";
+    let plaintext = "The answer is X.";
+    let (hash_b64, salt_b64) = cr_hash_and_salt(salt, plaintext);
+
+    // Alice commits.
+    let mut commit_tags: HashMap<String, String> = HashMap::new();
+    commit_tags.insert("+freeq.at/event".to_string(), "commit".to_string());
+    commit_tags.insert(
+        "+freeq.at/payload".to_string(),
+        commit_payload_tag(&hash_b64),
+    );
+    alice
+        .send_tagged("#crtest", "🔒 sealed", commit_tags)
+        .await
+        .unwrap();
+
+    let commit_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "🔒 sealed"),
+        "observer got commit",
+    )
+    .await;
+    let commit_msgid = if let Event::Message { tags, .. } = &commit_event {
+        tags.get("msgid").cloned().unwrap()
+    } else {
+        unreachable!()
+    };
+
+    // Bob tries to reveal Alice's commit.
+    let mut reveal_tags: HashMap<String, String> = HashMap::new();
+    reveal_tags.insert("+freeq.at/event".to_string(), "reveal".to_string());
+    reveal_tags.insert(
+        "+freeq.at/payload".to_string(),
+        reveal_payload_tag(&commit_msgid, &salt_b64),
+    );
+    bob.send_tagged("#crtest", plaintext, reveal_tags)
+        .await
+        .unwrap();
+
+    let reveal_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == plaintext),
+        "observer got bob's reveal",
+    )
+    .await;
+    if let Event::Message { tags, .. } = &reveal_event {
+        assert_eq!(
+            tags.get("+freeq.at/commit-verified").map(String::as_str),
+            Some("false"),
+        );
+        assert_eq!(
+            tags.get("+freeq.at/commit-mismatch").map(String::as_str),
+            Some("actor_mismatch"),
+            "expected commit-mismatch=actor_mismatch; tags={tags:?}",
+        );
+    }
+
+    alice.quit(None).await.unwrap();
+    bob.quit(None).await.unwrap();
+    observer.quit(None).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn commit_reveal_commit_not_found_e2e() {
+    // DB-backed: commit-reveal verification looks up the prior commit via
+    // find_message_by_msgid, which requires the messages table to be live.
+    let (addr, server_handle) = start_test_server_with_db(empty_resolver(), true).await;
+    let (_alice_did, alice, mut alice_ev) = connect_did_key(addr, "alice").await;
+    let (observer, mut obs_ev) = connect_guest(addr, "crobs").await;
+
+    cr_join_both(&alice, &mut alice_ev, &observer, &mut obs_ev, "#crtest").await;
+
+    // Reveal pointing at a msgid that doesn't exist.
+    let mut reveal_tags: HashMap<String, String> = HashMap::new();
+    reveal_tags.insert("+freeq.at/event".to_string(), "reveal".to_string());
+    reveal_tags.insert(
+        "+freeq.at/payload".to_string(),
+        reveal_payload_tag("01J0000DOESNOTEXIST", "c2FsdA"),
+    );
+    alice
+        .send_tagged("#crtest", "anything", reveal_tags)
+        .await
+        .unwrap();
+
+    let reveal_event = expect_event(
+        &mut obs_ev,
+        2000,
+        |e| matches!(e, Event::Message { text, .. } if text == "anything"),
+        "observer got reveal",
+    )
+    .await;
+    if let Event::Message { tags, .. } = &reveal_event {
+        assert_eq!(
+            tags.get("+freeq.at/commit-verified").map(String::as_str),
+            Some("false"),
+        );
+        assert_eq!(
+            tags.get("+freeq.at/commit-mismatch").map(String::as_str),
+            Some("commit_not_found"),
+            "expected commit-mismatch=commit_not_found; tags={tags:?}",
+        );
+    }
+
+    alice.quit(None).await.unwrap();
+    observer.quit(None).await.unwrap();
+    server_handle.abort();
+}

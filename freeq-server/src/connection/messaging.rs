@@ -57,6 +57,124 @@ fn resolve_signature(
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
 
+/// Verify a commit-reveal binding declared on a PRIVMSG carrying
+/// `+freeq.at/event=reveal`.
+///
+/// The convention (see `docs/agents.md` § Commit-Reveal):
+///
+/// ```text
+/// Commit PRIVMSG: +freeq.at/event=commit
+///                 +freeq.at/payload={"hash":"<b64url>","alg":"sha256"}
+///                 (body: human-readable placeholder)
+///
+/// Reveal PRIVMSG: +freeq.at/event=reveal
+///                 +freeq.at/payload={"reveal_of":"<commit_msgid>","salt":"<b64url>"}
+///                 (body: the plaintext being revealed)
+/// ```
+///
+/// Verification recomputes `sha256(salt || body_bytes)` and compares to
+/// the commit's stored hash. Same actor, same channel, and same
+/// `+freeq.at/ref` are also required. Returns `Ok(())` on a clean
+/// match, or `Err(reason)` with one of:
+/// `bad_payload | commit_not_found | actor_mismatch | channel_mismatch |
+/// not_a_commit | ref_id_mismatch | bad_commit_payload | unsupported_alg |
+/// bad_salt | bad_commit_hash | hash_mismatch`.
+///
+/// Mirrors the verify-and-stamp pattern used by `+freeq.at/sig` above:
+/// callers turn `Ok`/`Err` into `+freeq.at/commit-verified=true|false`
+/// and (on error) `+freeq.at/commit-mismatch=<reason>` tags on the
+/// outgoing relay. Verify-and-annotate, never reject.
+pub(crate) fn verify_commit_reveal(
+    state: &Arc<SharedState>,
+    reveal_actor_did: Option<&str>,
+    reveal_channel: &str,
+    reveal_ref_id: Option<&str>,
+    reveal_payload_json: &str,
+    reveal_body: &str,
+) -> Result<(), &'static str> {
+    // Parse reveal payload: { reveal_of, salt }
+    let payload: serde_json::Value =
+        serde_json::from_str(reveal_payload_json).map_err(|_| "bad_payload")?;
+    let reveal_of = payload
+        .get("reveal_of")
+        .and_then(|v| v.as_str())
+        .ok_or("bad_payload")?;
+    let salt_b64 = payload
+        .get("salt")
+        .and_then(|v| v.as_str())
+        .ok_or("bad_payload")?;
+
+    // Look up the prior commit message by msgid.
+    // `with_db` already unwraps the inner SqlResult, so we get
+    // Option<Option<MessageRow>>: outer None = no DB attached or
+    // query errored; inner None = no row with that msgid.
+    let commit = state
+        .with_db(|db| db.find_message_by_msgid(reveal_of))
+        .flatten()
+        .ok_or("commit_not_found")?;
+
+    // Actor must match (the same DID that committed must reveal).
+    if commit.sender_did.as_deref() != reveal_actor_did {
+        return Err("actor_mismatch");
+    }
+    // Channel must match.
+    if commit.channel != reveal_channel {
+        return Err("channel_mismatch");
+    }
+    // Must actually be a commit event.
+    if commit.tags.get("+freeq.at/event").map(String::as_str) != Some("commit") {
+        return Err("not_a_commit");
+    }
+    // Ref-id must agree (either both absent, or both present and equal).
+    let commit_ref = commit
+        .tags
+        .get("+freeq.at/ref")
+        .or_else(|| commit.tags.get("+freeq.at/task-id"))
+        .map(String::as_str);
+    if commit_ref != reveal_ref_id {
+        return Err("ref_id_mismatch");
+    }
+    // Parse commit payload: { hash, alg }
+    let commit_payload_raw = commit
+        .tags
+        .get("+freeq.at/payload")
+        .ok_or("bad_commit_payload")?;
+    let commit_payload_decoded: String = urlencoding::decode(commit_payload_raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| commit_payload_raw.clone());
+    let commit_payload: serde_json::Value =
+        serde_json::from_str(&commit_payload_decoded).map_err(|_| "bad_commit_payload")?;
+    let expected_hash_b64 = commit_payload
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .ok_or("bad_commit_payload")?;
+    let alg = commit_payload
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("sha256");
+    if alg != "sha256" {
+        return Err("unsupported_alg");
+    }
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let salt = b64.decode(salt_b64).map_err(|_| "bad_salt")?;
+    let expected_hash = b64
+        .decode(expected_hash_b64)
+        .map_err(|_| "bad_commit_hash")?;
+
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&salt);
+    hasher.update(reveal_body.as_bytes());
+    let computed = hasher.finalize();
+
+    if computed.as_slice() != expected_hash.as_slice() {
+        return Err("hash_mismatch");
+    }
+    Ok(())
+}
+
 pub(super) fn handle_tagmsg(
     conn: &Connection,
     target: &str,
@@ -599,6 +717,45 @@ pub(super) fn handle_privmsg(
         let client_sig = tags.get("+freeq.at/sig").map(|s| s.as_str());
         if let Some(sig) = resolve_signature(conn, target, text, timestamp, client_sig, state) {
             full_tags.insert("+freeq.at/sig".to_string(), sig);
+        }
+
+        // If this PRIVMSG is a commit-reveal `reveal` event, verify the
+        // binding against the prior commit and stamp the outcome onto
+        // the outgoing relay tags. Mirrors the verify-and-stamp pattern
+        // used by `+freeq.at/sig` above. Verify-and-annotate, never
+        // reject — bad reveals still relay, carrying a `false` verdict.
+        if command == "PRIVMSG"
+            && full_tags.get("+freeq.at/event").map(String::as_str) == Some("reveal")
+        {
+            let reveal_ref = full_tags
+                .get("+freeq.at/ref")
+                .or_else(|| full_tags.get("+freeq.at/task-id"))
+                .cloned();
+            let reveal_payload_raw = full_tags
+                .get("+freeq.at/payload")
+                .cloned()
+                .unwrap_or_default();
+            let reveal_payload_decoded = urlencoding::decode(&reveal_payload_raw)
+                .map(|c| c.into_owned())
+                .unwrap_or(reveal_payload_raw);
+            let outcome = verify_commit_reveal(
+                state,
+                conn.authenticated_did.as_deref(),
+                target,
+                reveal_ref.as_deref(),
+                &reveal_payload_decoded,
+                text,
+            );
+            full_tags.insert(
+                "+freeq.at/commit-verified".to_string(),
+                if outcome.is_ok() { "true" } else { "false" }.to_string(),
+            );
+            if let Err(reason) = outcome {
+                full_tags.insert(
+                    "+freeq.at/commit-mismatch".to_string(),
+                    reason.to_string(),
+                );
+            }
         }
 
         let mut full_tags_with_time = full_tags.clone();
