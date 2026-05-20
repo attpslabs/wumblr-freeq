@@ -24,7 +24,6 @@ use iroh_live::media::publish::LocalBroadcast;
 use iroh_live::media::subscribe::RemoteBroadcast;
 use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::audio_tap::{PushAudioSource, Speaker, TapBackend, to_whisper_pcm};
@@ -102,15 +101,6 @@ struct ActiveCall {
     dumped_upto: usize,
     /// Feeds the bot's outbound broadcast — `enqueue` makes it speak.
     speaker: Speaker,
-    /// Notify the MoQ session to drop and reconnect. Fired from the IRC
-    /// loop when a participant joins onto a *stale* transport.
-    reconnect_signal: Arc<Notify>,
-    /// Wall-clock time the MoQ session last (re)connected. The IRC loop
-    /// reads it to decide whether a join needs a transport refresh — a
-    /// young connection is healthy and must be left alone, since a
-    /// needless reconnect drops the joiner's subscription to the bot's
-    /// audio (they'd hear nothing).
-    moq_connected_at: Arc<std::sync::Mutex<std::time::Instant>>,
     /// The MoQ subscriber/publisher task. Aborted by `Drop` on call
     /// end — a plain `JoinHandle` drop only *detaches*, which would
     /// leave the reconnect loop running forever after the call ends.
@@ -281,9 +271,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    // Debounce for participant-join MoQ refreshes (see below).
-    let mut last_join_refresh: Option<std::time::Instant> = None;
-
     loop {
         let Some(event) = events.recv().await else {
             tracing::warn!("event stream closed");
@@ -295,33 +282,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     .get("+freeq.at/av-actor")
                     .cloned()
                     .unwrap_or_default();
-                // A participant joining is our cue to refresh the MoQ
-                // transport. While the bot sat idle the WebSocket may
-                // have silently died (proxy idle-timeout) and moq won't
-                // surface that — reconnecting on the join guarantees the
-                // joiner lands on a live connection and gets discovered.
-                // Debounced so a burst of joins triggers one reconnect.
-                if tags.get("+freeq.at/av-state").map(String::as_str) == Some("joined")
-                    && !actor.eq_ignore_ascii_case(&cfg.nick)
-                    && last_join_refresh
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(25))
-                {
-                    if let Some(call) = active.lock().await.as_ref() {
-                        // Only refresh a *stale* transport. A young
-                        // connection is healthy — `announced()` discovers
-                        // the joiner on its own — and a needless
-                        // reconnect would drop the joiner's subscription
-                        // to the bot's audio, so they'd hear nothing.
-                        let age = call.moq_connected_at.lock().unwrap().elapsed();
-                        if age > Duration::from_secs(50) {
-                            call.reconnect_signal.notify_one();
-                            last_join_refresh = Some(std::time::Instant::now());
-                            tracing::info!(%actor, ?age, "participant joined — refreshing stale MoQ transport");
-                        } else {
-                            tracing::info!(%actor, ?age, "participant joined — transport fresh, no refresh");
-                        }
-                    }
-                }
                 match classify_av_event(&target, &tags, &cfg.channels, &cfg.nick) {
                     AvAction::Start { channel, session_id } => {
                         let mut active_guard = active.lock().await;
@@ -709,11 +669,6 @@ async fn start_transcription(
     // on the Speaker makes the bot talk.
     let (speaker, push_source) = Speaker::new();
 
-    let reconnect_signal = Arc::new(Notify::new());
-    let reconnect_for_task = reconnect_signal.clone();
-    let moq_connected_at = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-    let connected_at_for_task = moq_connected_at.clone();
-
     let task = tokio::spawn(async move {
         if let Err(e) = run_moq_subscriber(
             cfg_for_task,
@@ -724,8 +679,6 @@ async fn start_transcription(
             push_source,
             handle_for_task,
             active_for_task,
-            reconnect_for_task,
-            connected_at_for_task,
         )
         .await
         {
@@ -740,8 +693,6 @@ async fn start_transcription(
         transcript: Vec::new(),
         dumped_upto: 0,
         speaker,
-        reconnect_signal,
-        moq_connected_at,
         moq_task: task,
     })
 }
@@ -763,8 +714,6 @@ async fn run_moq_subscriber(
     push_source: PushAudioSource,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
-    reconnect_signal: Arc<Notify>,
-    moq_connected_at: Arc<std::sync::Mutex<std::time::Instant>>,
 ) -> Result<()> {
     let mut attempt: u32 = 0;
     loop {
@@ -779,8 +728,6 @@ async fn run_moq_subscriber(
             push_source.clone(),
             &handle,
             &active,
-            &reconnect_signal,
-            &moq_connected_at,
         )
         .await;
         // A session that ran for a healthy while then dropped resets
@@ -818,8 +765,6 @@ async fn run_moq_session(
     push_source: PushAudioSource,
     handle: &Arc<ClientHandle>,
     active: &Arc<AsyncMutex<Option<ActiveCall>>>,
-    reconnect_signal: &Arc<Notify>,
-    moq_connected_at: &Arc<std::sync::Mutex<std::time::Instant>>,
 ) -> Result<()> {
     let my_nick = cfg.nick.clone();
     let session_prefix = format!("{session_id}/");
@@ -850,21 +795,11 @@ async fn run_moq_session(
 
     // Keep the encoder alive for the session's lifetime.
     let _broadcast = broadcast;
-    *moq_connected_at.lock().unwrap() = std::time::Instant::now();
     tracing::info!(%our_broadcast, "MoQ connected — publishing bot audio + watching participants");
 
     // Tap tasks live here — dropping the JoinSet on return aborts them.
     let mut taps: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut tapped: HashSet<String> = HashSet::new();
-
-    // Reconnect trigger. moq's `Session::closed()` does NOT resolve when
-    // the WebSocket dies silently (e.g. a proxy idle-timeout strands an
-    // idle socket) — so the `select!` below would park forever. The IRC
-    // loop fires `reconnect_signal` when a participant joins; that bails
-    // this session so `run_moq_subscriber` rebuilds on a fresh socket.
-    // Pinned once: when it resolves we exit the loop, no need to re-arm.
-    let reconnect = reconnect_signal.notified();
-    tokio::pin!(reconnect);
 
     loop {
         tokio::select! {
@@ -925,9 +860,6 @@ async fn run_moq_session(
             }
             res = session_handle.closed() => {
                 anyhow::bail!("MoQ transport closed: {res:?}");
-            }
-            _ = &mut reconnect => {
-                anyhow::bail!("reconnect requested — refreshing MoQ transport");
             }
         }
     }
