@@ -161,6 +161,10 @@ pub const SPEAK_RATE: u32 = 48_000;
 #[derive(Clone)]
 pub struct PushAudioSource {
     queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+    /// Smoothed loudness of what the encoder just pulled, `[0,1]` as
+    /// `f32` bits — read by the video tile so the presence pulses with
+    /// utopia's voice.
+    level: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AudioSource for PushAudioSource {
@@ -171,10 +175,23 @@ impl AudioSource for PushAudioSource {
         }
     }
     fn pop_samples(&mut self, buf: &mut [f32]) -> Result<Option<usize>> {
-        let mut q = self.queue.lock().expect("speak queue poisoned");
-        for slot in buf.iter_mut() {
-            *slot = q.pop_front().unwrap_or(0.0);
+        {
+            let mut q = self.queue.lock().expect("speak queue poisoned");
+            for slot in buf.iter_mut() {
+                *slot = q.pop_front().unwrap_or(0.0);
+            }
         }
+        // Track loudness for the video presence: snap up fast, ease down
+        // slow — reads like an audio meter.
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let prev = f32::from_bits(self.level.load(Ordering::Relaxed));
+        let smoothed = if peak > prev {
+            peak
+        } else {
+            prev * 0.88 + peak * 0.12
+        };
+        self.level
+            .store(smoothed.to_bits(), Ordering::Relaxed);
         Ok(Some(buf.len()))
     }
 }
@@ -190,11 +207,13 @@ pub struct Speaker {
 impl Speaker {
     /// Create a paired `(Speaker, PushAudioSource)`. The source goes to
     /// the `LocalBroadcast`; the speaker is kept by the orchestrator.
-    pub fn new() -> (Speaker, PushAudioSource) {
+    /// `level` is shared with the video tile so the presence animation
+    /// can track utopia's own speech.
+    pub fn new(level: Arc<std::sync::atomic::AtomicU32>) -> (Speaker, PushAudioSource) {
         let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         (
             Speaker { queue: queue.clone() },
-            PushAudioSource { queue },
+            PushAudioSource { queue, level },
         )
     }
 

@@ -22,7 +22,7 @@ bs58 = "0.5"
 
 # AV / MoQ stack — same versions as freeq-av-client so the workspace
 # resolves them once.
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", default-features = false, features = ["opus"] }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", default-features = false, features = ["opus", "h264"] }
 moq-native = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main", default-features = false, features = ["noq", "websocket", "aws-lc-rs"] }
 moq-lite = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main" }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
@@ -35,6 +35,11 @@ futures-util = "0.3"
 # end-to-end IRC + MoQ + transcript-relay path is still testable with
 # a synthetic STT impl).
 whisper-rs = { version = "0.14", default-features = false, optional = true }
+
+# Visuals — render the agent's video tile (audio-reactive presence +
+# LLM-authored visual aids) as SVG, rasterized to RGBA frames.
+resvg = "0.45"
+bytes = "1"
 
 # Async + utility
 tokio = { workspace = true }

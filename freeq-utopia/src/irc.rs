@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
-use iroh_live::media::codec::AudioCodec;
-use iroh_live::media::format::AudioPreset;
+use iroh_live::media::codec::{AudioCodec, VideoCodec};
+use iroh_live::media::format::{AudioPreset, VideoPreset};
 use iroh_live::media::publish::LocalBroadcast;
 use iroh_live::media::subscribe::RemoteBroadcast;
 use rand::RngCore;
@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use crate::audio_tap::{PushAudioSource, Speaker, TapBackend, to_whisper_pcm};
 use crate::identity::Identity;
 use crate::stt::SttEngine;
+use crate::video::VideoTile;
 use crate::{qa, summary, tts};
 
 pub struct RunConfig {
@@ -101,6 +102,9 @@ struct ActiveCall {
     dumped_upto: usize,
     /// Feeds the bot's outbound broadcast — `enqueue` makes it speak.
     speaker: Speaker,
+    /// The agent's video tile (audio-reactive presence + visual-aid
+    /// cards). `show_card` puts up an LLM-drawn visual.
+    video: VideoTile,
     /// The MoQ subscriber/publisher task. Aborted by `Drop` on call
     /// end — a plain `JoinHandle` drop only *detaches*, which would
     /// leave the reconnect loop running forever after the call ends.
@@ -110,6 +114,7 @@ struct ActiveCall {
 impl Drop for ActiveCall {
     fn drop(&mut self) {
         self.moq_task.abort();
+        self.video.stop();
     }
 }
 
@@ -664,11 +669,18 @@ async fn start_transcription(
     let active_for_task = active.clone();
     let session_for_task = session_id.clone();
 
+    // The agent's video tile. The renderer thread runs for the call's
+    // lifetime, producing audio-reactive frames; the audio path shares
+    // the loudness cell so the presence pulses with utopia's voice.
+    let video = VideoTile::new();
+    video.spawn_renderer();
+
     // Pair a Speaker (kept here) with a PushAudioSource (handed to the
     // MoQ task, which publishes it as the bot's broadcast). Enqueueing
     // on the Speaker makes the bot talk.
-    let (speaker, push_source) = Speaker::new();
+    let (speaker, push_source) = Speaker::new(video.level_handle());
 
+    let video_for_task = video.clone();
     let task = tokio::spawn(async move {
         if let Err(e) = run_moq_subscriber(
             cfg_for_task,
@@ -679,6 +691,7 @@ async fn start_transcription(
             push_source,
             handle_for_task,
             active_for_task,
+            video_for_task,
         )
         .await
         {
@@ -693,6 +706,7 @@ async fn start_transcription(
         transcript: Vec::new(),
         dumped_upto: 0,
         speaker,
+        video,
         moq_task: task,
     })
 }
@@ -714,6 +728,7 @@ async fn run_moq_subscriber(
     push_source: PushAudioSource,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
+    video: VideoTile,
 ) -> Result<()> {
     let mut attempt: u32 = 0;
     loop {
@@ -728,6 +743,7 @@ async fn run_moq_subscriber(
             push_source.clone(),
             &handle,
             &active,
+            &video,
         )
         .await;
         // A session that ran for a healthy while then dropped resets
@@ -765,6 +781,7 @@ async fn run_moq_session(
     push_source: PushAudioSource,
     handle: &Arc<ClientHandle>,
     active: &Arc<AsyncMutex<Option<ActiveCall>>>,
+    video: &VideoTile,
 ) -> Result<()> {
     let my_nick = cfg.nick.clone();
     let session_prefix = format!("{session_id}/");
@@ -773,13 +790,18 @@ async fn run_moq_session(
     client_config.backend = Some(moq_native::QuicBackend::Noq);
     let client = client_config.init()?;
 
-    // Publish the bot's own broadcast — an Opus stream fed by the
-    // PushAudioSource (silence until the bot speaks).
+    // Publish the bot's own broadcast — an Opus audio stream fed by the
+    // PushAudioSource (silence until the bot speaks) plus an H.264 video
+    // tile (the audio-reactive presence / visual-aid cards).
     let broadcast = LocalBroadcast::new();
     broadcast
         .audio()
         .set(push_source, AudioCodec::Opus, [AudioPreset::Hq])
         .context("setting bot broadcast audio source")?;
+    broadcast
+        .video()
+        .set_source(video.source(), VideoCodec::H264, [VideoPreset::P360])
+        .context("setting bot broadcast video source")?;
     let pub_origin = moq_lite::Origin::produce();
     pub_origin.publish_broadcast(our_broadcast, broadcast.consume());
 
