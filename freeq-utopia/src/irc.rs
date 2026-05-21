@@ -475,6 +475,13 @@ async fn answer_and_speak(
     let Some(key) = cfg.groq_api_key.as_deref() else { return };
     tracing::info!(%asker, %question, "answering addressed question");
 
+    // Show the "thinking" mood on the tile while the LLM calls run.
+    // The guard clears it on every exit path.
+    if let Some(v) = &video {
+        v.set_thinking(true);
+    }
+    let _thinking = ThinkingGuard(video.clone());
+
     let answer = match qa::answer(
         &cfg.http,
         key,
@@ -544,17 +551,38 @@ async fn answer_and_speak(
         }
     }
 
-    // Draw a visual-aid card on the video tile if one would help — the
-    // model authors the SVG, or returns nothing for a plain answer.
-    if let Some(video) = video {
-        match qa::generate_card(&cfg.http, key, &cfg.groq_chat_model, &question, &answer)
-            .await
+    // Evolve utopia's visual board for this answer — the model carries
+    // forward still-relevant points and appends new ones; the renderer
+    // animates the new ones in.
+    if let Some(video) = &video {
+        let board = video.board_steps();
+        match qa::generate_scene(
+            &cfg.http,
+            key,
+            &cfg.groq_chat_model,
+            &question,
+            &answer,
+            &board,
+        )
+        .await
         {
-            Some(svg) => {
-                tracing::info!(svg_len = svg.len(), "showing visual-aid card");
-                video.show_card(svg);
+            Some((title, steps)) => {
+                tracing::info!(%title, steps = steps.len(), "updating visual board");
+                video.show_scene(title, steps);
             }
-            None => tracing::info!("no visual-aid card for this answer"),
+            None => tracing::info!("no board update for this answer"),
+        }
+    }
+}
+
+/// Clears the video tile's "thinking" mood when an `answer_and_speak`
+/// call ends — on every path, including early returns.
+struct ThinkingGuard(Option<VideoTile>);
+
+impl Drop for ThinkingGuard {
+    fn drop(&mut self) {
+        if let Some(v) = &self.0 {
+            v.set_thinking(false);
         }
     }
 }
@@ -878,6 +906,7 @@ async fn run_moq_session(
                         let channel = channel.to_string();
                         let handle = handle.clone();
                         let active = active.clone();
+                        let peer_level = video.peer_level_handle();
                         taps.spawn(async move {
                             if let Err(e) = tap_participant(
                                 cfg,
@@ -887,6 +916,7 @@ async fn run_moq_session(
                                 channel,
                                 handle,
                                 active,
+                                peer_level,
                             )
                             .await
                             {
@@ -977,6 +1007,9 @@ async fn tap_participant(
     channel: String,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
+    // Shared loudness cell — fed the participant's level so the video
+    // presence can show a "listening" mood when a human is talking.
+    peer_level: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<()> {
     let stt = cfg.stt.clone();
     let remote = RemoteBroadcast::new(&path_str, broadcast_consumer)
@@ -1012,6 +1045,17 @@ async fn tap_participant(
         }
         let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
         let voiced = peak >= VOICE_PEAK_THRESHOLD;
+        // Feed the video presence's "listening" mood — snap up, ease down.
+        {
+            use std::sync::atomic::Ordering;
+            let prev = f32::from_bits(peer_level.load(Ordering::Relaxed));
+            let smoothed = if peak > prev {
+                peak
+            } else {
+                prev * 0.9 + peak * 0.1
+            };
+            peer_level.store(smoothed.to_bits(), Ordering::Relaxed);
+        }
 
         if voiced {
             buf.extend_from_slice(&pcm);

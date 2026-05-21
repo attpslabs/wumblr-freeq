@@ -82,39 +82,55 @@ pub async fn answer(
     Ok(text)
 }
 
-const CARD_SYSTEM: &str = "You are utopia, an AI agent on a video call. \
-Produce a visual-aid card to display on your video tile. Output a single \
-SVG document and NOTHING else.\n\
-Hard requirements:\n\
-- Root: <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"360\" viewBox=\"0 0 640 360\">\n\
-- First child: an opaque full-size <rect width=\"640\" height=\"360\"> in a \
-dark fill (e.g. #0b1020).\n\
-- Light text (#e6edff / #9fb4e8), font-family=\"Helvetica, Arial, sans-serif\".\n\
-- Content: a short bold title near the top, then EITHER up to 4 concise \
-bullet lines OR a simple labelled box-and-arrow diagram. Type >= 20px. \
-Keep wide margins; do not let text overflow 640x360.\n\
-- No external images, no <script>, no <foreignObject>, no CSS classes.\n\
-- Output ONLY the raw SVG, starting with <svg and ending with </svg>. \
-If a visual genuinely would not help, output exactly: NONE";
+const SCENE_SYSTEM: &str = "You are utopia, an AI agent on a video call. \
+You keep a live visual 'board' on your video tile. After each answer you \
+update the board. Output ONLY a JSON object:\n\
+{\"title\": \"short board title\", \"steps\": [\"short point\", ...]}\n\
+Rules:\n\
+- title: <= 5 words.\n\
+- steps: 0 to 6 items, each <= 8 words, punchy, no trailing punctuation, \
+plain text (no markdown, no emoji).\n\
+- You are given the CURRENT board. Keep the points still worth showing \
+— repeat them VERBATIM and in the same order at the FRONT of the list — \
+then append new points drawn from the latest answer. The board \
+accumulates across the call.\n\
+- If the latest answer adds nothing worth showing, return the current \
+board unchanged.";
 
-/// Ask the model for an SVG visual-aid card illustrating an answer.
-/// Returns `None` when a visual wouldn't help, or on any error — utopia
-/// then simply keeps showing its presence. Never fails the caller.
-pub async fn generate_card(
+/// Ask the model to evolve utopia's visual board for the latest answer.
+/// `board` is the board's current points (carried forward + appended).
+/// Returns `(title, steps)`, or `None` when there's nothing to show or
+/// on any error — utopia then keeps its current tile. Never fails the
+/// caller.
+pub async fn generate_scene(
     client: &reqwest::Client,
     api_key: &str,
     model: &str,
     question: &str,
     answer: &str,
-) -> Option<String> {
+    board: &[String],
+) -> Option<(String, Vec<String>)> {
+    let board_str = if board.is_empty() {
+        "(empty)".to_string()
+    } else {
+        board
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let user = format!(
+        "Current board:\n{board_str}\n\nLatest question: {question}\n\
+         Latest answer: {answer}\n\nUpdated board JSON:"
+    );
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 1400,
-        "temperature": 0.4,
+        "max_tokens": 500,
+        "temperature": 0.3,
+        "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": CARD_SYSTEM },
-            { "role": "user", "content":
-                format!("Question: {question}\nAnswer: {answer}\n\nVisual-aid SVG:") },
+            { "role": "system", "content": SCENE_SYSTEM },
+            { "role": "user", "content": user },
         ],
     });
     let resp = client
@@ -129,18 +145,39 @@ pub async fn generate_card(
     }
     let parsed: ChatResponse = resp.json().await.ok()?;
     let text = parsed.choices.first()?.message.content.trim().to_string();
-    extract_svg(&text)
+    let json = extract_json(&text)?;
+    let title = json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let steps: Vec<String> = json
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if title.is_empty() && steps.is_empty() {
+        return None;
+    }
+    Some((title, steps))
 }
 
-/// Pull a `<svg>…</svg>` document out of a model reply — it may be
-/// fenced in markdown or wrapped in stray prose.
-pub(crate) fn extract_svg(text: &str) -> Option<String> {
-    let start = text.find("<svg")?;
-    let end = text.rfind("</svg>")?.checked_add("</svg>".len())?;
+/// Pull a JSON object out of a model reply — it may be fenced in
+/// markdown or wrapped in stray prose. Takes the outermost `{ … }`.
+pub(crate) fn extract_json(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?.checked_add(1)?;
     if end <= start {
         return None;
     }
-    Some(text[start..end].to_string())
+    serde_json::from_str(&text[start..end]).ok()
 }
 
 /// If `text` addresses `nick` at the start (`nick:`, `nick,`,
@@ -222,22 +259,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_svg_pulls_doc_out_of_messy_replies() {
-        // Bare SVG.
-        assert_eq!(
-            extract_svg("<svg><rect/></svg>").as_deref(),
-            Some("<svg><rect/></svg>")
-        );
+    fn extract_json_pulls_object_out_of_messy_replies() {
+        // Bare object.
+        let v = extract_json(r#"{"title":"T","steps":["a"]}"#).unwrap();
+        assert_eq!(v["title"], "T");
         // Markdown-fenced with surrounding prose.
-        assert_eq!(
-            extract_svg("Sure!\n```svg\n<svg a=\"1\"><rect/></svg>\n```\nDone.")
-                .as_deref(),
-            Some("<svg a=\"1\"><rect/></svg>")
-        );
-        // A model that declined → no SVG.
-        assert_eq!(extract_svg("NONE"), None);
-        assert_eq!(extract_svg("no visual needed here"), None);
-        // Truncated (no closing tag) → None, not a panic.
-        assert_eq!(extract_svg("<svg><rect/>"), None);
+        let v = extract_json("Sure:\n```json\n{\"title\":\"T\"}\n```\nok").unwrap();
+        assert_eq!(v["title"], "T");
+        // No object, or invalid JSON → None, never a panic.
+        assert!(extract_json("no json here").is_none());
+        assert!(extract_json("{not valid").is_none());
     }
 }
