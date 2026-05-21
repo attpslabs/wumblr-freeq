@@ -427,11 +427,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 // Snapshot transcript + speaker handle from the active
                 // call, then answer + speak off the event loop.
-                let (transcript, speaker) = {
+                let (transcript, speaker, video) = {
                     let guard = active.lock().await;
                     match guard.as_ref() {
-                        Some(call) => (call.transcript.join("\n"), Some(call.speaker.clone())),
-                        None => (String::new(), None),
+                        Some(call) => (
+                            call.transcript.join("\n"),
+                            Some(call.speaker.clone()),
+                            Some(call.video.clone()),
+                        ),
+                        None => (String::new(), None, None),
                     }
                 };
                 let cfg = cfg.clone();
@@ -440,8 +444,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 let question = question.to_string();
                 let asker = from.clone();
                 tokio::spawn(async move {
-                    answer_and_speak(cfg, handle, channel, asker, question, transcript, speaker)
-                        .await;
+                    answer_and_speak(
+                        cfg, handle, channel, asker, question, transcript, speaker, video,
+                    )
+                    .await;
                 });
             }
             Event::Disconnected { reason } => {
@@ -455,6 +461,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
 
 /// Handle one addressed question: ask Groq, post the answer to chat,
 /// and (if we're in a call) speak it aloud through the bot's broadcast.
+#[allow(clippy::too_many_arguments)]
 async fn answer_and_speak(
     cfg: Arc<SharedConfig>,
     handle: Arc<ClientHandle>,
@@ -463,6 +470,7 @@ async fn answer_and_speak(
     question: String,
     transcript: String,
     speaker: Option<Speaker>,
+    video: Option<VideoTile>,
 ) {
     let Some(key) = cfg.groq_api_key.as_deref() else { return };
     tracing::info!(%asker, %question, "answering addressed question");
@@ -533,6 +541,20 @@ async fn answer_and_speak(
         }
         Err(e) => {
             tracing::warn!(error = ?e, "TTS failed — answer posted as text only");
+        }
+    }
+
+    // Draw a visual-aid card on the video tile if one would help — the
+    // model authors the SVG, or returns nothing for a plain answer.
+    if let Some(video) = video {
+        match qa::generate_card(&cfg.http, key, &cfg.groq_chat_model, &question, &answer)
+            .await
+        {
+            Some(svg) => {
+                tracing::info!(svg_len = svg.len(), "showing visual-aid card");
+                video.show_card(svg);
+            }
+            None => tracing::info!("no visual-aid card for this answer"),
         }
     }
 }
@@ -1064,13 +1086,15 @@ async fn tap_participant(
                         let _ = handle
                             .privmsg(&channel, &format!("[transcript] {nick} asked: {text}"))
                             .await;
-                        let (transcript, speaker) = {
+                        let (transcript, speaker, video) = {
                             let guard = active.lock().await;
                             match guard.as_ref() {
-                                Some(call) => {
-                                    (call.transcript.join("\n"), Some(call.speaker.clone()))
-                                }
-                                None => (String::new(), None),
+                                Some(call) => (
+                                    call.transcript.join("\n"),
+                                    Some(call.speaker.clone()),
+                                    Some(call.video.clone()),
+                                ),
+                                None => (String::new(), None, None),
                             }
                         };
                         answer_and_speak(
@@ -1081,6 +1105,7 @@ async fn tap_participant(
                             question.to_string(),
                             transcript,
                             speaker,
+                            video,
                         )
                         .await;
                         return;

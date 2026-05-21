@@ -22,13 +22,13 @@ struct ChoiceMessage {
     content: String,
 }
 
-const SYSTEM: &str = "You are a transcription bot sitting in a live voice \
-call. A participant has addressed you by name in the text chat. Answer \
-their question using the call transcript provided as context. Rules: \
-answer in 1-3 short sentences — your reply will be spoken aloud, so keep \
-it brief and conversational. Don't use markdown, bullet points, or \
-emoji. If the transcript doesn't contain the answer, say so plainly. \
-Don't invent facts. Don't repeat the question back.";
+const SYSTEM: &str = "You are utopia, an AI agent sitting in a live voice \
+call. A participant has addressed you by name. Answer their question \
+using the call transcript provided as context. Rules: answer in 1-3 \
+short sentences — your reply will be spoken aloud, so keep it brief and \
+conversational. Don't use markdown, bullet points, or emoji. If the \
+transcript doesn't contain the answer, say so plainly. Don't invent \
+facts. Don't repeat the question back.";
 
 /// Answer `question` against `transcript` via Groq chat completions.
 /// `transcript` is the joined `<nick>: <utterance>` lines so far (may
@@ -80,6 +80,67 @@ pub async fn answer(
         anyhow::bail!("groq chat returned no content");
     }
     Ok(text)
+}
+
+const CARD_SYSTEM: &str = "You are utopia, an AI agent on a video call. \
+Produce a visual-aid card to display on your video tile. Output a single \
+SVG document and NOTHING else.\n\
+Hard requirements:\n\
+- Root: <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"360\" viewBox=\"0 0 640 360\">\n\
+- First child: an opaque full-size <rect width=\"640\" height=\"360\"> in a \
+dark fill (e.g. #0b1020).\n\
+- Light text (#e6edff / #9fb4e8), font-family=\"Helvetica, Arial, sans-serif\".\n\
+- Content: a short bold title near the top, then EITHER up to 4 concise \
+bullet lines OR a simple labelled box-and-arrow diagram. Type >= 20px. \
+Keep wide margins; do not let text overflow 640x360.\n\
+- No external images, no <script>, no <foreignObject>, no CSS classes.\n\
+- Output ONLY the raw SVG, starting with <svg and ending with </svg>. \
+If a visual genuinely would not help, output exactly: NONE";
+
+/// Ask the model for an SVG visual-aid card illustrating an answer.
+/// Returns `None` when a visual wouldn't help, or on any error — utopia
+/// then simply keeps showing its presence. Never fails the caller.
+pub async fn generate_card(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    question: &str,
+    answer: &str,
+) -> Option<String> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1400,
+        "temperature": 0.4,
+        "messages": [
+            { "role": "system", "content": CARD_SYSTEM },
+            { "role": "user", "content":
+                format!("Question: {question}\nAnswer: {answer}\n\nVisual-aid SVG:") },
+        ],
+    });
+    let resp = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: ChatResponse = resp.json().await.ok()?;
+    let text = parsed.choices.first()?.message.content.trim().to_string();
+    extract_svg(&text)
+}
+
+/// Pull a `<svg>…</svg>` document out of a model reply — it may be
+/// fenced in markdown or wrapped in stray prose.
+pub(crate) fn extract_svg(text: &str) -> Option<String> {
+    let start = text.find("<svg")?;
+    let end = text.rfind("</svg>")?.checked_add("</svg>".len())?;
+    if end <= start {
+        return None;
+    }
+    Some(text[start..end].to_string())
 }
 
 /// If `text` addresses `nick` at the start (`nick:`, `nick,`,
@@ -158,5 +219,25 @@ mod tests {
         // Just the nick, nothing after → not a question.
         assert_eq!(extract_addressed("utopia", "utopia"), None);
         assert_eq!(extract_addressed("utopia: ", "utopia"), None);
+    }
+
+    #[test]
+    fn extract_svg_pulls_doc_out_of_messy_replies() {
+        // Bare SVG.
+        assert_eq!(
+            extract_svg("<svg><rect/></svg>").as_deref(),
+            Some("<svg><rect/></svg>")
+        );
+        // Markdown-fenced with surrounding prose.
+        assert_eq!(
+            extract_svg("Sure!\n```svg\n<svg a=\"1\"><rect/></svg>\n```\nDone.")
+                .as_deref(),
+            Some("<svg a=\"1\"><rect/></svg>")
+        );
+        // A model that declined → no SVG.
+        assert_eq!(extract_svg("NONE"), None);
+        assert_eq!(extract_svg("no visual needed here"), None);
+        // Truncated (no closing tag) → None, not a panic.
+        assert_eq!(extract_svg("<svg><rect/>"), None);
     }
 }
