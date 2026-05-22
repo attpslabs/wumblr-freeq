@@ -2220,6 +2220,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "freeq-agent-kit"
+version = "0.1.0"
+
+[[package]]
 name = "freeq-auth-broker"
 version = "0.1.1"
 dependencies = [
