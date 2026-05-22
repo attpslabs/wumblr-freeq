@@ -131,6 +131,9 @@ beforeEach(() => {
   Object.defineProperty(globalThis.navigator, 'mediaDevices', {
     value: {
       getUserMedia: vi.fn(() => Promise.resolve(makeMediaStream())),
+      enumerateDevices: vi.fn(() => Promise.resolve([])),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
     },
     configurable: true,
   });
@@ -525,7 +528,12 @@ describe('CallPanel — camera', () => {
       return Promise.resolve(stream);
     });
     Object.defineProperty(globalThis.navigator, 'mediaDevices', {
-      value: { getUserMedia },
+      value: {
+        getUserMedia,
+        enumerateDevices: vi.fn(() => Promise.resolve([])),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
       configurable: true,
     });
 

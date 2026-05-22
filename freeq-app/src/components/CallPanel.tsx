@@ -15,6 +15,19 @@ import { getCachedProfile } from '../lib/profiles';
  * - invisible set → camera off (audio only)
  * - invisible removed → camera on (video + audio)
  */
+
+// Minimal shape of the moq-publish element we reach into for device
+// switching. moq-publish exposes `audio`/`video` as @moq/signals Signals
+// whose value is the live capture source; each source carries a `device`
+// with a `preferred` signal — set it to a deviceId to switch hardware
+// mid-call without rebuilding the broadcast.
+type MoqSignalLike<T> = { peek(): T };
+type MoqDeviceSource = { device?: { preferred: { set(id: string): void } } };
+type MoqPublishEl = HTMLElement & {
+  audio?: MoqSignalLike<MoqDeviceSource | undefined>;
+  video?: MoqSignalLike<MoqDeviceSource | undefined>;
+};
+
 export function CallPanel() {
   const activeAvSession = useStore((s) => s.activeAvSession);
   const avAudioActive = useStore((s) => s.avAudioActive);
@@ -34,9 +47,17 @@ export function CallPanel() {
 
   const [participantSlots, setParticipantSlots] = useState<Slot[]>([]);
   // Full-screen: the call panel takes over the whole web-app viewport so
-  // participant video (and utopia's visual-aid cards) is actually big
+  // participant video (and eliza's visual-aid cards) is actually big
   // enough to see.
   const [fullscreen, setFullscreen] = useState(false);
+
+  // Device pickers — available mic/camera hardware and the user's choice.
+  // Empty selection means "let moq-publish use its default heuristic".
+  const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMic, setSelectedMic] = useState('');
+  const [selectedCamera, setSelectedCamera] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
 
   const myNick = getNick();
   // Connect to the SFU's QUIC/WebTransport listener (udp :8080) rather
@@ -45,6 +66,28 @@ export function CallPanel() {
   // load. The `https://` scheme tells moq-publish/moq-watch to use
   // WebTransport. See docs/AV-QUIC-MIGRATION.md.
   const moqOrigin = `https://${location.hostname}:8080/av/moq`;
+
+  // ── Device enumeration ──────────────────────────────────────
+  // Device labels are blank until the matching permission is granted, so
+  // this is (re)run after mic permission at call start, after the camera
+  // turns on, and on every hardware hotplug.
+  const refreshDevices = useCallback(async () => {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      setMics(all.filter((d) => d.kind === 'audioinput' && d.deviceId !== ''));
+      setCameras(all.filter((d) => d.kind === 'videoinput' && d.deviceId !== ''));
+    } catch (e) {
+      console.warn('[call] enumerateDevices failed:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!avAudioActive) return;
+    refreshDevices();
+    const onChange = () => refreshDevices();
+    navigator.mediaDevices.addEventListener('devicechange', onChange);
+    return () => navigator.mediaDevices.removeEventListener('devicechange', onChange);
+  }, [avAudioActive, refreshDevices]);
 
   // ── Start/stop call when avAudioActive changes ──────────────
   useEffect(() => {
@@ -80,6 +123,9 @@ export function CallPanel() {
       }
       if (cancelled) return;
 
+      // Mic permission granted — device labels are populated now.
+      refreshDevices();
+
       const container = publishContainerRef.current;
       if (!container) return;
 
@@ -102,7 +148,10 @@ export function CallPanel() {
       console.log('[call] Publishing:', broadcastName);
 
       pollParticipants();
-      pollTimerRef.current = setInterval(pollParticipants, 3000);
+      // 1.2s poll — combined with the re-poll on roster changes below,
+      // tiles appear within a beat of someone joining instead of
+      // lagging by up to 3 seconds.
+      pollTimerRef.current = setInterval(pollParticipants, 1200);
     }
 
     start();
@@ -141,6 +190,9 @@ export function CallPanel() {
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
           }
+          // Camera permission just granted — device labels are now
+          // populated, so re-enumerate to fill in the camera picker.
+          refreshDevices();
         })
         .catch((e) => {
           console.warn('[call] Camera error:', e);
@@ -157,7 +209,7 @@ export function CallPanel() {
         localVideoRef.current.srcObject = null;
       }
     }
-  }, [avCameraOn]);
+  }, [avCameraOn, refreshDevices]);
 
   // ── Poll participants ───────────────────────────────────────
   const pollParticipants = useCallback(async () => {
@@ -214,6 +266,13 @@ export function CallPanel() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, myNick, moqOrigin]);
 
+  // Re-poll immediately when the roster changes. av-state join/left
+  // TAGMSGs update the session in the store, so this fires the instant
+  // someone joins or leaves — no waiting for the poll interval.
+  useEffect(() => {
+    if (avAudioActive && sessionId) pollParticipants();
+  }, [session?.participants.size, avAudioActive, sessionId, pollParticipants]);
+
   // ── Cleanup ─────────────────────────────────────────────────
   function cleanup() {
     if (pollTimerRef.current) {
@@ -222,7 +281,21 @@ export function CallPanel() {
     }
     const pub = publishElRef.current;
     if (pub) {
-      pub.setAttribute('source', '');
+      // Hard-stop the broadcast before unmounting. Removing the element
+      // alone leaves moq-publish's capture sources running — you keep
+      // broadcasting your mic after you've left the call.
+      const p = pub as HTMLElement & { paused?: boolean; muted?: boolean };
+      p.muted = true;
+      p.paused = true;
+      pub.setAttribute('muted', '');
+      // Release the capture source. moq-publish only accepts a `source`
+      // of camera/screen/file/null — clearing it to null is what closes
+      // the getUserMedia mic+camera tracks. NEVER setAttribute('source',
+      // '') here: the empty string throws inside the component's
+      // attributeChangedCallback *before* it clears its source state, so
+      // the capture is never closed and the microphone keeps listening
+      // after hang-up. `removeAttribute` clears it as null — accepted.
+      pub.removeAttribute('source');
       pub.setAttribute('url', '');
       pub.remove();
       publishElRef.current = null;
@@ -232,10 +305,27 @@ export function CallPanel() {
       localStreamRef.current = null;
     }
     setParticipantSlots([]);
+    setShowSettings(false);
+    setSelectedMic('');
+    setSelectedCamera('');
   }
 
   const handleMuteToggle = () => useStore.getState().setAvMuted(!avMuted);
   const handleCameraToggle = () => useStore.getState().setAvCameraOn(!avCameraOn);
+
+  // Switch capture hardware mid-call by setting the moq-publish source's
+  // `device.preferred` signal. Empty id = keep moq's default heuristic.
+  const selectMic = (id: string) => {
+    setSelectedMic(id);
+    if (!id) return;
+    (publishElRef.current as MoqPublishEl | null)?.audio?.peek()?.device?.preferred.set(id);
+  };
+  const selectCamera = (id: string) => {
+    setSelectedCamera(id);
+    if (!id) return;
+    (publishElRef.current as MoqPublishEl | null)?.video?.peek()?.device?.preferred.set(id);
+  };
+
   const handleLeave = () => {
     cleanup();
     useStore.getState().setAvAudioActive(false);
@@ -301,6 +391,42 @@ export function CallPanel() {
         </div>
       )}
 
+      {/* Device settings — mic + camera pickers */}
+      {showSettings && (
+        <div className="flex flex-col gap-2 px-4 py-3 border-t border-border bg-bg-tertiary/30">
+          <label className="flex items-center gap-3 text-sm">
+            <span className="w-20 shrink-0 opacity-60">Microphone</span>
+            <select
+              value={selectedMic}
+              onChange={(e) => selectMic(e.target.value)}
+              className="flex-1 min-w-0 bg-bg-tertiary text-fg rounded px-2 py-1 text-sm"
+            >
+              <option value="">System default</option>
+              {mics.map((d, i) => (
+                <option key={d.deviceId} value={d.deviceId}>
+                  {d.label || `Microphone ${i + 1}`}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-3 text-sm">
+            <span className="w-20 shrink-0 opacity-60">Camera</span>
+            <select
+              value={selectedCamera}
+              onChange={(e) => selectCamera(e.target.value)}
+              className="flex-1 min-w-0 bg-bg-tertiary text-fg rounded px-2 py-1 text-sm"
+            >
+              <option value="">System default</option>
+              {cameras.map((d, i) => (
+                <option key={d.deviceId} value={d.deviceId}>
+                  {d.label || `Camera ${i + 1}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+
       {/* Controls bar */}
       <div className="flex items-center gap-3 px-4 py-2">
         <div className="flex items-center gap-1.5 text-success font-medium text-sm">
@@ -345,6 +471,19 @@ export function CallPanel() {
           {fullscreen ? <MinimizeIcon size={18} /> : <MaximizeIcon size={18} />}
         </button>
 
+        {/* Device settings */}
+        <button
+          onClick={() => setShowSettings((s) => !s)}
+          className={`p-2 rounded-full transition-colors ${
+            showSettings
+              ? 'bg-accent text-white hover:bg-accent/80'
+              : 'bg-bg-tertiary text-fg hover:bg-bg-tertiary/80'
+          }`}
+          title="Audio & video devices"
+        >
+          <GearIcon size={18} />
+        </button>
+
         {/* Leave */}
         <button
           onClick={handleLeave}
@@ -368,7 +507,7 @@ type Slot = { nick: string; broadcastKey: string; broadcastName: string };
 /// video actually appears on the screen. The avatar sits underneath
 /// as a fallback when the participant hasn't enabled their camera.
 /// Tile sizing — tiny thumbnails inline, large 16:9 tiles in full
-/// screen (16:9 so utopia's video isn't cropped).
+/// screen (16:9 so eliza's video isn't cropped).
 function tileClasses(fullscreen: boolean): string {
   return fullscreen
     ? 'relative w-[42vw] max-w-[820px] min-w-[280px] aspect-video rounded-xl overflow-hidden bg-bg-tertiary flex-shrink-0'
@@ -404,13 +543,24 @@ function RemoteTile({
     // calls snappy) while giving the buffer enough slack for clean
     // audio. Raise toward 100ms+ if stutter shows up on bad networks.
     watchEl.setAttribute('jitter', '80');
+    // `reload` makes moq-watch track the broadcast's announcements and
+    // (re)connect whenever it becomes live — so a tile recovers on its
+    // own from the publish/subscribe race (the peer published after we
+    // subscribed) instead of staying silently dead until a rejoin.
+    watchEl.setAttribute('reload', '');
     watchEl.setAttribute('url', moqOrigin);
     watchEl.setAttribute('name', slot.broadcastName);
     mount.appendChild(watchEl);
     console.log('[call] Subscribing to:', slot.broadcastName);
 
     return () => {
+      // Hard-stop playback before unmounting. Clearing `url` and
+      // removing the element is not enough — moq-watch keeps its audio
+      // backend running, so you keep hearing the participant after the
+      // tile (and even the whole call) is gone.
+      (watchEl as HTMLElement & { paused?: boolean }).paused = true;
       watchEl.setAttribute('url', '');
+      watchEl.setAttribute('name', '');
       watchEl.remove();
     };
   }, [slot.broadcastName, moqOrigin]);
@@ -438,6 +588,15 @@ function MinimizeIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
       <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
+    </svg>
+  );
+}
+
+function GearIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
+      <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/>
     </svg>
   );
 }
