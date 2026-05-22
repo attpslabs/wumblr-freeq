@@ -89,6 +89,8 @@ SLUG_MAP = {
     "security": ("site", "SECURITY.md"),
     "typescript-sdk": ("site", "typescript-sdk.md"),
     "agent-assistance": ("site", "agent-assistance.md"),
+    "av-agents": ("site", "av-agents.md"),
+    "av-protocol": ("site", "av-protocol.md"),
 }
 
 
