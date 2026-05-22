@@ -108,21 +108,34 @@ final class AvSessionTests: XCTestCase {
         XCTAssertFalse(state.isInCall, "isInCall stays false until the server's `started` echo lands")
     }
 
-    // MARK: - 2. startOrJoinVoice: known session → joins directly
+    // MARK: - 2. startOrJoinVoice joins the server-discovered session,
+    // ignoring a stale `activeAvSessions` cache entry.
+    //
+    // Regression: the cache is only cleared by an `av-state=ended` TAGMSG,
+    // which is easily missed (backgrounded, disconnect, or a bot restart
+    // that auto-ends the old session with no broadcast). The old code
+    // early-returned on the cached id and joined a dead session, putting
+    // our MoQ broadcast under a prefix nobody watches — "Eliza can't hear
+    // me on iOS". startOrJoinVoice must now always trust the live probe.
 
-    func testStartOrJoinVoiceWithKnownSessionJoins() {
+    func testStartOrJoinVoiceJoinsDiscoveredSessionIgnoringStaleCache() {
         let (state, sent, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-abc"
+        // A stale id left over from a previous, now-dead session.
+        state.activeAvSessions["#freeq"] = "sess-STALE-dead"
+        // The server's probe is authoritative: the real live session.
+        state.activeSessionProbeForTest = { _ in .found(sessionId: "sess-abc") }
 
         state.startOrJoinVoice(channel: "#freeq")
+        XCTAssertTrue(waitFor { state.isInCall }, "expected to be in-call after discovery")
 
         XCTAssertEqual(sent().count, 1, "should send exactly one line (av-join)")
         let line = sent().first ?? ""
         XCTAssertTrue(line.hasPrefix("@+freeq.at/av-join;"), "expected av-join, got: \(line)")
-        XCTAssertTrue(line.contains("+freeq.at/av-id=sess-abc"))
+        XCTAssertTrue(line.contains("+freeq.at/av-id=sess-abc"),
+                      "must join the probed session, not the stale cache id: \(line)")
+        XCTAssertFalse(line.contains("sess-STALE-dead"), "stale cache id must never reach the wire")
         XCTAssertTrue(line.contains("+freeq.at/av-instance="))
         XCTAssertTrue(line.hasSuffix("TAGMSG #freeq"))
-        XCTAssertTrue(state.isInCall)
         XCTAssertEqual(state.currentCallSessionId, "sess-abc")
         XCTAssertEqual(state.currentCallChannel, "#freeq")
         XCTAssertNotNil(driverRef(), "factory should have been invoked")
@@ -132,13 +145,12 @@ final class AvSessionTests: XCTestCase {
 
     func testStartOrJoinVoiceIsNoOpWhenInCall() {
         let (state, sent, _) = makeHarness()
-        state.activeAvSessions["#first"] = "sess-1"
-        state.startOrJoinVoice(channel: "#first")
+        state.startCall(channel: "#first", sessionId: "sess-1")
         let countAfterFirst = sent().count
         XCTAssertTrue(state.isInCall)
 
-        // Now try to start another call.
-        state.activeAvSessions["#second"] = "sess-2"
+        // Now try to start another call. The `guard !isInCall` bails out
+        // synchronously, before any discovery Task is even spawned.
         state.startOrJoinVoice(channel: "#second")
 
         XCTAssertEqual(sent().count, countAfterFirst,
@@ -180,8 +192,7 @@ final class AvSessionTests: XCTestCase {
 
     func testLeaveCallSendsAvLeaveAndClearsState() {
         let (state, sent, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-xyz"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-xyz")
         guard sent().count == 1 else { return XCTFail("setup: expected 1 wire line (av-join)") }
         let instance = state.currentAvInstance ?? "?"
         XCTAssertTrue(state.isInCall)
@@ -226,8 +237,7 @@ final class AvSessionTests: XCTestCase {
 
     func testAvStateJoinedWhileInCallAppendsParticipant() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         XCTAssertTrue(state.isInCall)
 
         SwiftEventHandler(appState: state).handleEvent(.tagMsg(msg: TagMessage(
@@ -255,8 +265,7 @@ final class AvSessionTests: XCTestCase {
 
     func testAvStateLeftRemovesParticipantAndClearsVideoFlag() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         // Add bob via joined, then a frame so he's in participantsWithVideo too.
         let h = SwiftEventHandler(appState: state)
@@ -285,8 +294,7 @@ final class AvSessionTests: XCTestCase {
 
     func testAvStateEndedTearsDownCurrentCall() {
         let (state, sent, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         XCTAssertTrue(state.isInCall)
         let sentBeforeEnd = sent().count
 
@@ -311,8 +319,7 @@ final class AvSessionTests: XCTestCase {
 
     func testAvStateForOtherChannelDoesNotTouchCurrentCall() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         XCTAssertTrue(state.isInCall)
         XCTAssertEqual(state.currentCallChannel, "#freeq")
 
@@ -348,8 +355,7 @@ final class AvSessionTests: XCTestCase {
     /// multi-device case (the "iOS doesn't show my web client" bug).
     func testSelfEchoFilteredOnlyOnTagMsgPath() {
         let (state, _, _) = makeHarness(myNick: "alice")
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         // FreeqAv path: same-DID second device. The SDK gave us this
         // event after stripping `~instance`, so the bare nick happens
@@ -381,8 +387,7 @@ final class AvSessionTests: XCTestCase {
     /// regress silently.
     func testSameNickTwiceCollapsesToOneTile_KnownLimitation() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
@@ -395,8 +400,7 @@ final class AvSessionTests: XCTestCase {
 
     func testParticipantLeftClearsParticipantAndVideo() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         state.deliverAvEventForTest(.videoFrame(nick: "bob",
@@ -415,8 +419,7 @@ final class AvSessionTests: XCTestCase {
 
     func testVideoFrameBeforeParticipantJoinedIsDropped() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         // Frame arrives ahead of the join announcement. Must not crash,
         // must not create a phantom participant, must not flip
@@ -432,8 +435,7 @@ final class AvSessionTests: XCTestCase {
 
     func testToggleMuteFlipsStateAndCallsDriverOnce() {
         let (state, _, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         let driver = driverRef()!
 
         XCTAssertFalse(state.isMuted)
@@ -452,8 +454,7 @@ final class AvSessionTests: XCTestCase {
 
     func testToggleCameraOnEnablesCameraOnDriver() throws {
         let (state, _, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         let driver = driverRef()!
         XCTAssertNil(state.cameraCapture)
 
@@ -467,8 +468,7 @@ final class AvSessionTests: XCTestCase {
 
     func testToggleCameraOffDisablesCameraAndStopsPushingFrames() throws {
         let (state, _, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         let driver = driverRef()!
 
         state.toggleCamera()  // on
@@ -499,8 +499,7 @@ final class AvSessionTests: XCTestCase {
 
     func testLeaveCallWhileCameraOnStopsLocalCamera() {
         let (state, _, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         let driver = driverRef()!
         state.toggleCamera()
         XCTAssertNotNil(state.cameraCapture)
@@ -520,8 +519,7 @@ final class AvSessionTests: XCTestCase {
 
     func testFreeqAvDisconnectedClearsCallState() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         XCTAssertTrue(state.isInCall)
         XCTAssertEqual(state.callParticipants, ["bob"])
@@ -539,8 +537,7 @@ final class AvSessionTests: XCTestCase {
 
     func testIrcDisconnectTearsDownInProgressCall() {
         let (state, _, driverRef) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         let driver = driverRef()!
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         XCTAssertTrue(state.isInCall)
@@ -576,8 +573,7 @@ final class AvSessionTests: XCTestCase {
     // the user-visible regression.
     func testWebAliceVideoFrameAppearsOnIosAlice() {
         let (state, _, _) = makeHarness(myNick: "alice")
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
         XCTAssertTrue(state.isInCall)
 
         // The SDK's `path == our_name` check filtered the iOS broadcast,
@@ -608,8 +604,7 @@ final class AvSessionTests: XCTestCase {
     // callParticipants, (c) crash on missing video layer.
     func testVideoFrameRaceAheadOfParticipantJoined() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         // Frame arrives first (no join announcement yet).
         state.deliverAvEventForTest(.videoFrame(nick: "racey",
@@ -634,8 +629,7 @@ final class AvSessionTests: XCTestCase {
     // callParticipants — the user is still in the audio call.
     func testVideoTrackStoppedClearsFlagButKeepsParticipant() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         state.deliverAvEventForTest(.videoFrame(nick: "bob",
@@ -658,8 +652,7 @@ final class AvSessionTests: XCTestCase {
     // re-populate participantsWithVideo (avatar swap re-happens cleanly).
     func testVideoCycleOffOnRefillsTile() {
         let (state, _, _) = makeHarness()
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         state.deliverAvEventForTest(.videoFrame(nick: "bob",
@@ -679,8 +672,7 @@ final class AvSessionTests: XCTestCase {
     // MARK: - 25. Three distinct DIDs — all three appear as participants
     func testThreeDistinctDidsAllAppearAsParticipants() {
         let (state, _, _) = makeHarness(myNick: "alice")
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         state.deliverAvEventForTest(.participantJoined(nick: "bob"))
         state.deliverAvEventForTest(.participantJoined(nick: "carol"))
@@ -698,8 +690,7 @@ final class AvSessionTests: XCTestCase {
     // when the local user joins via TAGMSG (server self-echo)
     func testCallParticipantsExcludesLocalUserOnTagMsgJoinedEcho() {
         let (state, _, _) = makeHarness(myNick: "alice")
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         // The server broadcasts av-state=joined for every joiner, including
         // ourselves. We must not list ourselves as a remote tile on that
@@ -719,8 +710,7 @@ final class AvSessionTests: XCTestCase {
     // MARK: - 27. av-state=joined for someone else's DID on iOS adds remote
     func testThreeDidsViaTagMsgPath() {
         let (state, _, _) = makeHarness(myNick: "alice")
-        state.activeAvSessions["#freeq"] = "sess-1"
-        state.startOrJoinVoice(channel: "#freeq")
+        state.startCall(channel: "#freeq", sessionId: "sess-1")
 
         let h = SwiftEventHandler(appState: state)
         h.handleEvent(.tagMsg(msg: TagMessage(from: "server", target: "#freeq", tags: [

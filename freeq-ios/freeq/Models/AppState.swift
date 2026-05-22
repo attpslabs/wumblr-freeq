@@ -278,8 +278,15 @@ protocol AvSessionDriver: AnyObject {
     func setMuted(muted: Bool)
     func setCameraEnabled(enabled: Bool) throws
     func pushVideoFrame(bgra: [UInt8], width: UInt32, height: UInt32, timestampUs: UInt64)
+    func pushAudioFrame(samples: [Float])
     func leave()
     func isConnected() -> Bool
+}
+
+// Default no-op so test fakes don't have to implement audio push — the
+// real `FreeqAv` provides the UniFFI-generated implementation.
+extension AvSessionDriver {
+    func pushAudioFrame(samples: [Float]) {}
 }
 
 extension FreeqAv: AvSessionDriver {}
@@ -346,6 +353,11 @@ class AppState: ObservableObject {
     @Published var isInCall: Bool = false
     @Published var isMuted: Bool = false
     @Published var isCameraOn: Bool = false
+    /// True when the user has expanded the call to fill the screen.
+    @Published var isCallExpanded: Bool = false
+    /// True when call audio is on the loud speaker (vs the quiet handset
+    /// receiver). Defaults on — a call should be audible at arm's length.
+    @Published var isSpeakerOn: Bool = true
     @Published var callParticipants: [String] = []
     /// channel (lowercased) → active session id, populated from `+freeq.at/av-state` TAGMSGs
     @Published var activeAvSessions: [String: String] = [:]
@@ -383,6 +395,10 @@ class AppState: ObservableObject {
     /// call.
     internal var cameraCapture: CallCameraCapture? = nil
 
+    /// Swift-driven mic capture. Runs for the whole call (audio is
+    /// always-on, unlike the camera). Held so `leaveCall` can stop it.
+    internal var micCapture: CallMicCapture? = nil
+
     /// Per-nick remote video display layers, keyed by lower-cased nick. Set
     /// by `RemoteVideoTile` when it appears; cleared when the underlying
     /// view goes away (weak values let the table drop the entry).
@@ -405,8 +421,11 @@ class AppState: ObservableObject {
 
     func startCall(channel: String, sessionId: String) {
         guard client != nil || rawSenderForTest != nil else { return }
-        // Use HTTPS API base — MoQ SFU lives behind the same reverse proxy.
-        let serverUrl = ServerConfig.apiBaseUrl
+        // The MoQ SFU has its own QUIC listener on :8080 — the same endpoint
+        // the web client and the bot use. The :443 reverse-proxy path serves
+        // an older, unstable WebSocket MoQ (moq-lite-02) that starves audio;
+        // don't route the call through it.
+        let serverUrl = ServerConfig.sfuBaseUrl
 
         // iOS won't let cpal/iroh-live open both mic and speaker until the
         // app's AVAudioSession is configured for two-way voice. Without this,
@@ -438,6 +457,9 @@ class AppState: ObservableObject {
                     handler: handler
                 )
             }
+            // Start Swift-driven mic capture for the broadcast. Audio is
+            // always-on for a call, so this runs for the whole session.
+            startLocalMic()
             // Tell peers we joined this session — instance suffix lets the
             // server allocate a per-device participant slot. Send BEFORE
             // flipping `isInCall` so a test observing the synchronously-
@@ -451,6 +473,7 @@ class AppState: ObservableObject {
             // end of the test. Use `runOnMain` so tests see immediate updates.
             runOnMain {
                 self.isInCall = true
+                self.isSpeakerOn = true
                 self.currentCallChannel = channel
                 self.currentCallSessionId = sessionId
                 self.startCallActivity(channel: channel, sessionId: sessionId)
@@ -532,6 +555,8 @@ class AppState: ObservableObject {
         }
         cameraCapture?.stop()
         cameraCapture = nil
+        micCapture?.stop()
+        micCapture = nil
         avSession?.leave()
         avSession = nil
         currentAvInstance = nil
@@ -540,6 +565,7 @@ class AppState: ObservableObject {
             self.isInCall = false
             self.isMuted = false
             self.isCameraOn = false
+            self.isCallExpanded = false
             self.callParticipants = []
             self.participantsWithVideo = []
             self.currentCallChannel = nil
@@ -552,6 +578,18 @@ class AppState: ObservableObject {
         isMuted.toggle()
         avSession?.setMuted(muted: isMuted)
         updateCallActivity()
+    }
+
+    /// Toggle call audio between the loud speaker and the handset
+    /// receiver — the iOS equivalent of a speakerphone button.
+    func toggleSpeaker() {
+        isSpeakerOn.toggle()
+        let port: AVAudioSession.PortOverride = isSpeakerOn ? .speaker : .none
+        do {
+            try AVAudioSession.sharedInstance().overrideOutputAudioPort(port)
+        } catch {
+            print("[av] speaker toggle failed: \(error)")
+        }
     }
 
     /// Test helper: drives the AV event handler synchronously from outside
@@ -571,6 +609,8 @@ class AppState: ObservableObject {
     internal func tearDownCallLocallyOnDisconnect() {
         cameraCapture?.stop()
         cameraCapture = nil
+        micCapture?.stop()
+        micCapture = nil
         avSession?.leave()
         avSession = nil
         currentAvInstance = nil
@@ -579,6 +619,7 @@ class AppState: ObservableObject {
             self.isInCall = false
             self.isMuted = false
             self.isCameraOn = false
+            self.isCallExpanded = false
             self.callParticipants = []
             self.participantsWithVideo = []
             self.currentCallChannel = nil
@@ -648,6 +689,18 @@ class AppState: ObservableObject {
         isCameraOn = next
     }
 
+    /// Start Swift-driven mic capture for the call and feed samples to the
+    /// broadcast. Audio is always-on, so this runs the whole call.
+    fileprivate func startLocalMic() {
+        guard avSession != nil else { return }
+        let cap = CallMicCapture()
+        cap.onSamples = { [weak self] samples in
+            self?.avSession?.pushAudioFrame(samples: samples)
+        }
+        micCapture = cap
+        cap.start()
+    }
+
     /// Spin up `AVCaptureSession` (if needed) and turn on the publish-side
     /// video track. Idempotent.
     fileprivate func startLocalCamera() {
@@ -698,26 +751,20 @@ class AppState: ObservableObject {
     }
 
     /// Start or join a voice session on a channel.
-    /// - If a session is already known to be active, joins it directly.
-    /// - Otherwise sends `av-start` and waits for the server's `+freeq.at/av-state=started`
-    ///   TAGMSG to learn the session id (handled in the inbound TAGMSG path).
+    ///
+    /// Always resolves the channel's *live* session from the server before
+    /// joining — never from the in-memory `activeAvSessions` cache. That
+    /// cache is only cleared by an `av-state=ended` TAGMSG, which is easily
+    /// missed: app backgrounded, a brief disconnect, or a session that the
+    /// server auto-ended with no broadcast (every Eliza/bot restart does
+    /// exactly this — the old session is auto-ended and a new id minted).
+    /// A stale cache entry points at a dead session, and joining it puts
+    /// our MoQ broadcast under a session prefix no other participant
+    /// watches — so we publish audio and video and are still unheard. The
+    /// REST probe in `discoverAndJoinOrStart` is the single source of truth.
     func startOrJoinVoice(channel: String) {
         guard !isInCall else { return }
 
-        if let sessionId = activeAvSessions[channel.lowercased()] {
-            startCall(channel: channel, sessionId: sessionId)
-            return
-        }
-
-        // The TAGMSG broadcast that announces an active session may have
-        // been missed (channel joined after the call started, app restart,
-        // brief disconnect). Hit the REST endpoint to learn whether one's
-        // already running — same pattern as the web client. If we don't do
-        // this, blindly sending av-start gets rejected with "channel busy"
-        // and the user is stuck with the speaker icon doing nothing.
-        //
-        // When the probe hook is installed (tests), run synchronously so
-        // assertions don't race the async Task.
         if let probe = activeSessionProbeForTest {
             Task { @MainActor in
                 switch await probe(channel) {
@@ -725,6 +772,7 @@ class AppState: ObservableObject {
                     self.activeAvSessions[channel.lowercased()] = sessionId
                     self.startCall(channel: channel, sessionId: sessionId)
                 case .none:
+                    self.activeAvSessions.removeValue(forKey: channel.lowercased())
                     self.startFreshAvSession(channel: channel)
                 }
             }
@@ -733,28 +781,52 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Resolve the channel's active AV session from the server and join it,
+    /// or start a fresh one if none is running. Three outcomes:
+    ///  - probe succeeds, a session is Active → join exactly that session id
+    ///  - probe succeeds, nothing Active      → drop any stale cache entry,
+    ///                                          send `av-start`
+    ///  - probe fails (offline/unreachable)   → fall back to a cached id if
+    ///                                          we have one, else `av-start`
     private func discoverAndJoinOrStart(channel: String) async {
+        let key = channel.lowercased()
         let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? channel
         let url = URL(string: "\(ServerConfig.apiBaseUrl)/api/v1/channels/\(encoded)/sessions")
+
         if let url {
             var req = URLRequest(url: url)
             req.timeoutInterval = 4
             if let (data, _) = try? await URLSession.shared.data(for: req),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let active = json["active"] as? [String: Any],
-               let state = active["state"] as? String,
-               state == "Active",
-               let sessionId = active["id"] as? String {
-                await MainActor.run {
-                    self.activeAvSessions[channel.lowercased()] = sessionId
-                    self.startCall(channel: channel, sessionId: sessionId)
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // The probe reached the server and parsed. Its answer is
+                // authoritative — trust it over any cached session id.
+                if let active = json["active"] as? [String: Any],
+                   let sessionState = active["state"] as? String,
+                   sessionState == "Active",
+                   let sessionId = active["id"] as? String {
+                    await MainActor.run {
+                        self.activeAvSessions[key] = sessionId
+                        self.startCall(channel: channel, sessionId: sessionId)
+                    }
+                } else {
+                    await MainActor.run {
+                        self.activeAvSessions.removeValue(forKey: key)
+                        self.startFreshAvSession(channel: channel)
+                    }
                 }
                 return
             }
         }
-        // No active session — start a new one.
+
+        // Probe failed (no network / server unreachable). Fall back to a
+        // cached session id if we have one — it may be stale, but it's the
+        // only hint available; otherwise start fresh.
         await MainActor.run {
-            self.startFreshAvSession(channel: channel)
+            if let cached = self.activeAvSessions[key] {
+                self.startCall(channel: channel, sessionId: cached)
+            } else {
+                self.startFreshAvSession(channel: channel)
+            }
         }
     }
 
@@ -864,9 +936,17 @@ class AppState: ObservableObject {
         if let savedBrokerBase = UserDefaults.standard.string(forKey: "freeq.brokerBase") {
             authBrokerBase = savedBrokerBase
         }
-        // Restore cached web token if still valid
+        // Restore cached web token if still valid. The expiry is kept in
+        // the Keychain — NOT UserDefaults — so it survives an app
+        // reinstall alongside the token itself. When the expiry lived in
+        // UserDefaults, a fresh build wiped it, the still-valid token
+        // could no longer be trusted, and every fresh install was forced
+        // into a broker round-trip that hung the launch on "Reconnecting".
+        // The UserDefaults read is a one-time migration fallback for
+        // installs that predate this change.
         if let savedToken = KeychainHelper.load(key: "webToken"),
-           let expiryStr = UserDefaults.standard.string(forKey: "freeq.webTokenExpiry"),
+           let expiryStr = KeychainHelper.load(key: "webTokenExpiry")
+               ?? UserDefaults.standard.string(forKey: "freeq.webTokenExpiry"),
            let expiryTs = Double(expiryStr) {
             let expiry = Date(timeIntervalSince1970: expiryTs)
             if Date() < expiry {
@@ -874,6 +954,7 @@ class AppState: ObservableObject {
                 cachedWebTokenExpiry = expiry
             } else {
                 KeychainHelper.delete(key: "webToken")
+                KeychainHelper.delete(key: "webTokenExpiry")
             }
         }
         isDarkTheme = UserDefaults.standard.object(forKey: "freeq.darkTheme") as? Bool ?? true
@@ -949,26 +1030,32 @@ class AppState: ObservableObject {
     /// round-trips that didn't need to happen.
     static let webTokenCacheLifetime: TimeInterval = 28 * 60
     private static let proactiveRefreshLeadTime: TimeInterval = 10 * 60  // 10 min
-    private var proactiveRefreshInFlight = false
+    /// One broker `/session` round-trip at a time, ever — shared by the
+    /// reconnect path and the proactive refresh. AT Protocol refresh
+    /// tokens are single-use and rotate on every refresh; two concurrent
+    /// `/session` calls race, and the loser writes back a token the PDS
+    /// has already invalidated — permanently bricking the saved session
+    /// until a fresh login. Serializing every broker fetch is the fix.
+    private var brokerFetchInFlight = false
     private func proactivelyRefreshWebTokenIfStale() {
-        guard !proactiveRefreshInFlight else { return }
+        guard !brokerFetchInFlight else { return }
         guard let brokerToken else { return }
         // Threshold: cached token's remaining lifetime < 10 minutes.
         let remaining = cachedWebTokenExpiry.timeIntervalSinceNow
         guard remaining < Self.proactiveRefreshLeadTime else { return }
-        proactiveRefreshInFlight = true
+        brokerFetchInFlight = true
         Task { [weak self] in
             guard let self else { return }
-            defer { Task { @MainActor in self.proactiveRefreshInFlight = false } }
+            defer { Task { @MainActor in self.brokerFetchInFlight = false } }
             do {
                 let session = try await self.fetchBrokerSession(brokerToken: brokerToken)
                 await MainActor.run {
                     self.cachedWebToken = session.token
                     self.cachedWebTokenExpiry = Date().addingTimeInterval(Self.webTokenCacheLifetime)
                     KeychainHelper.save(key: "webToken", value: session.token)
-                    UserDefaults.standard.set(
-                        String(self.cachedWebTokenExpiry.timeIntervalSince1970),
-                        forKey: "freeq.webTokenExpiry")
+                    KeychainHelper.save(
+                        key: "webTokenExpiry",
+                        value: String(self.cachedWebTokenExpiry.timeIntervalSince1970))
                     authLog.info("proactive web-token refresh succeeded")
                 }
             } catch {
@@ -1032,23 +1119,32 @@ class AppState: ObservableObject {
             // No broker token at all — must log in fresh
             return
         }
+        // Never overlap broker /session calls — see `brokerFetchInFlight`.
+        // reconnectSavedSession fires from several triggers (boot, the
+        // network monitor, the retry scheduler, AV teardown), so without
+        // this guard they stack into concurrent refreshes that race the
+        // rotating refresh token and brick the session.
+        guard !brokerFetchInFlight else { return }
+        brokerFetchInFlight = true
         Task {
             do {
                 let session = try await fetchBrokerSession(brokerToken: brokerToken)
                 await MainActor.run {
+                    self.brokerFetchInFlight = false
                     self.brokerRetryCount = 0
                     self.pendingWebToken = session.token
                     self.cachedWebToken = session.token
                     let expiry = Date().addingTimeInterval(Self.webTokenCacheLifetime)
                     self.cachedWebTokenExpiry = expiry
                     KeychainHelper.save(key: "webToken", value: session.token)
-                    UserDefaults.standard.set(String(expiry.timeIntervalSince1970), forKey: "freeq.webTokenExpiry")
+                    KeychainHelper.save(key: "webTokenExpiry", value: String(expiry.timeIntervalSince1970))
                     self.authenticatedDID = session.did
                     KeychainHelper.save(key: "did", value: session.did)
                     self.connect(nick: session.nick)
                 }
             } catch let error as NSError {
                 await MainActor.run {
+                    self.brokerFetchInFlight = false
                     // If broker token was cleared (genuinely expired), stop retrying
                     if error.code == 401 && self.brokerToken == nil {
                         // Credentials cleared — show login screen
@@ -1056,8 +1152,23 @@ class AppState: ObservableObject {
                     }
 
                     self.brokerRetryCount += 1
-                    // Keep retrying indefinitely with capped backoff (max 60s)
-                    // The user will see "Connecting..." and can cancel after 15s
+                    // After a run of failures the broker isn't blipping —
+                    // the saved session genuinely can't be refreshed (its
+                    // AT Protocol refresh token is dead). Stop looping and
+                    // drop to the sign-in screen so the user can re-auth,
+                    // instead of being trapped on "Connecting…" forever.
+                    if self.brokerRetryCount >= 8 {
+                        authLog.error("broker unrecoverable after \(self.brokerRetryCount, privacy: .public) attempts — clearing session for re-login")
+                        self.brokerToken = nil
+                        self.cachedWebToken = nil
+                        self.cachedWebTokenExpiry = .distantPast
+                        KeychainHelper.delete(key: "brokerToken")
+                        KeychainHelper.delete(key: "webToken")
+                        KeychainHelper.delete(key: "webTokenExpiry")
+                        self.errorMessage = "Couldn't restore your session — please sign in again."
+                        return
+                    }
+                    // Capped-backoff retry (max 60s).
                     let delay: Double
                     if self.brokerRetryCount <= 3 {
                         delay = Double(self.brokerRetryCount) // 1, 2, 3s
@@ -1175,6 +1286,7 @@ class AppState: ObservableObject {
         KeychainHelper.delete(key: "did")
         KeychainHelper.delete(key: "brokerToken")
         KeychainHelper.delete(key: "webToken")
+        KeychainHelper.delete(key: "webTokenExpiry")
         UserDefaults.standard.removeObject(forKey: "freeq.webTokenExpiry")
         UserDefaults.standard.removeObject(forKey: "freeq.channels")
         // Intentionally NOT clearing `freeq.handle` and `freeq.nick`. They're
@@ -1476,6 +1588,7 @@ class AppState: ObservableObject {
                         self.cachedWebTokenExpiry = .distantPast
                         KeychainHelper.delete(key: "brokerToken")
                         KeychainHelper.delete(key: "webToken")
+                        KeychainHelper.delete(key: "webTokenExpiry")
                         UserDefaults.standard.removeObject(forKey: "freeq.webTokenExpiry")
                     }
                 } else {
@@ -2217,6 +2330,7 @@ final class AvCallbackHandler: @unchecked Sendable, AvEventHandler {
             state.participantsWithVideo = []
             state.isCameraOn = false
             state.isMuted = false
+            state.isCallExpanded = false
             state.currentCallChannel = nil
             state.currentCallSessionId = nil
             state.endCallActivity()

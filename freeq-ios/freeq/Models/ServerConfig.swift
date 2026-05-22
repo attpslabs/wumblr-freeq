@@ -16,4 +16,14 @@ struct ServerConfig {
         let host = ircServer.components(separatedBy: ":").first ?? ircServer
         return "https://\(host)"
     }
+
+    /// MoQ SFU base URL — the dedicated QUIC/WebTransport listener on :8080,
+    /// the same endpoint the web client and the `freeq-eliza` bot use.
+    /// NOT the :443 reverse proxy: nginx proxies `/av/moq` there as an older
+    /// `moq-lite-02` WebSocket that delivers audio in starved bursts. The
+    /// :8080 listener speaks `moq-lite-03` over QUIC and is stable.
+    static var sfuBaseUrl: String {
+        let host = ircServer.components(separatedBy: ":").first ?? ircServer
+        return "https://\(host):8080"
+    }
 }

@@ -1072,6 +1072,39 @@ mod av_impl {
         }
     }
 
+    /// Rate Swift resamples mic audio to before pushing it in.
+    pub(super) const PUSH_AUDIO_RATE: u32 = 48_000;
+
+    /// Audio source fed from Swift via `push_audio_frame`. Swift owns the
+    /// real mic capture (`AVAudioEngine`) — the same arrangement as video —
+    /// because iroh-live's audio *input* backend isn't viable on iOS.
+    pub(super) struct PushAudioSource {
+        pub(super) queue: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    }
+
+    impl AudioSource for PushAudioSource {
+        fn format(&self) -> AudioFormat {
+            AudioFormat {
+                sample_rate: PUSH_AUDIO_RATE,
+                channel_count: 1,
+            }
+        }
+        fn pop_samples(&mut self, buf: &mut [f32]) -> anyhow::Result<Option<usize>> {
+            let mut q = self.queue.lock().unwrap();
+            for slot in buf.iter_mut() {
+                *slot = q.pop_front().unwrap_or(0.0);
+            }
+            // Cap the backlog at ~1s so a stalled encoder can't make the
+            // queue grow without bound.
+            let cap = PUSH_AUDIO_RATE as usize;
+            if q.len() > cap {
+                let excess = q.len() - cap;
+                q.drain(..excess);
+            }
+            Ok(Some(buf.len()))
+        }
+    }
+
     pub(super) const DEFAULT_VIDEO_FORMAT: VideoFormat = VideoFormat {
         pixel_format: PixelFormat::Bgra,
         dimensions: [1280, 720],
@@ -1096,6 +1129,8 @@ mod av_impl {
         pub camera_enabled: Arc<AtomicBool>,
         pub pending_frame: Arc<Mutex<Option<VideoFrame>>>,
         pub video_format: Arc<Mutex<VideoFormat>>,
+        /// Mic samples pushed from Swift, drained by the Opus encoder.
+        pub audio_queue: Arc<Mutex<std::collections::VecDeque<f32>>>,
     }
 
     pub(super) fn connect(
@@ -1125,6 +1160,8 @@ mod av_impl {
         let pending_frame: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
         let video_format = Arc::new(Mutex::new(DEFAULT_VIDEO_FORMAT));
         let camera_enabled_flag = Arc::new(AtomicBool::new(false));
+        let audio_queue: Arc<Mutex<std::collections::VecDeque<f32>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
 
         let (session, origin, sub_consumer, audio_backend, broadcast) =
             RUNTIME.block_on(async {
@@ -1132,13 +1169,16 @@ mod av_impl {
                 let audio_backend = iroh_live::media::audio_backend::AudioBackend::default();
                 audio_backend.set_aec_enabled(false);
 
-                let mic = audio_backend
-                    .default_input()
-                    .await
-                    .map_err(|_| FreeqError::ConnectionFailed)?;
-
+                // Mic capture is Swift-driven (AVAudioEngine →
+                // `push_audio_frame` → `PushAudioSource`). iroh-live's audio
+                // *input* backend isn't viable on iOS — the same reason
+                // video capture is Swift-driven. `audio_backend` is still
+                // used, for *playback* of remote audio.
+                let push_audio = PushAudioSource {
+                    queue: audio_queue.clone(),
+                };
                 let muteable = MuteableAudioSource {
-                    inner: Box::new(mic),
+                    inner: Box::new(push_audio),
                     muted: muted.clone(),
                 };
 
@@ -1201,6 +1241,11 @@ mod av_impl {
         let handler_loop = handler.clone();
 
         RUNTIME.spawn(async move {
+            // Per-participant playback tasks live in this set. Aborting
+            // it when the call ends stops inbound audio immediately —
+            // otherwise these tasks run on and you keep hearing people
+            // after you've left the call.
+            let mut remote_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
@@ -1228,7 +1273,7 @@ mod av_impl {
                                 let ab = audio_for_playback.clone();
                                 let h = handler_loop.clone();
                                 let nick_for_task = nick.clone();
-                                tokio::spawn(async move {
+                                remote_tasks.spawn(async move {
                                     handle_remote_broadcast(path_str, broadcast_consumer, ab, h, nick_for_task)
                                         .await;
                                 });
@@ -1247,6 +1292,9 @@ mod av_impl {
                     }
                 }
             }
+            // Call over — abort every per-participant playback task so
+            // inbound audio stops the instant the user leaves.
+            remote_tasks.abort_all();
             handler_loop.on_av_event(AvEvent::Disconnected {
                 reason: "session ended".to_string(),
             });
@@ -1263,6 +1311,7 @@ mod av_impl {
             camera_enabled: camera_enabled_flag,
             pending_frame,
             video_format,
+            audio_queue,
         })
     }
 
@@ -1433,6 +1482,10 @@ mod av_impl {
         );
         *state.pending_frame.lock().unwrap() = Some(frame);
     }
+
+    pub(super) fn push_audio(state: &State, samples: Vec<f32>) {
+        state.audio_queue.lock().unwrap().extend(samples);
+    }
 }
 
 #[cfg(feature = "av")]
@@ -1498,6 +1551,13 @@ impl FreeqAv {
         }
     }
 
+    fn push_audio_frame(&self, samples: Vec<f32>) {
+        let guard = self.state.lock().unwrap();
+        if let Some(state) = guard.as_ref() {
+            av_impl::push_audio(state, samples);
+        }
+    }
+
     fn is_connected(&self) -> bool {
         self.state
             .lock()
@@ -1526,6 +1586,7 @@ impl FreeqAv {
         Err(FreeqError::NotConnected)
     }
     fn push_video_frame(&self, _bgra: Vec<u8>, _w: u32, _h: u32, _ts: u64) {}
+    fn push_audio_frame(&self, _samples: Vec<f32>) {}
     fn is_connected(&self) -> bool { false }
 }
 

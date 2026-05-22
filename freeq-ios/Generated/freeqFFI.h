@@ -321,6 +321,11 @@ int8_t uniffi_freeq_sdk_ffi_fn_method_freeqav_is_connected(void*_Nonnull ptr, Ru
 void uniffi_freeq_sdk_ffi_fn_method_freeqav_leave(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQAV_PUSH_AUDIO_FRAME
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQAV_PUSH_AUDIO_FRAME
+void uniffi_freeq_sdk_ffi_fn_method_freeqav_push_audio_frame(void*_Nonnull ptr, RustBuffer samples, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQAV_PUSH_VIDEO_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_FN_METHOD_FREEQAV_PUSH_VIDEO_FRAME
 void uniffi_freeq_sdk_ffi_fn_method_freeqav_push_video_frame(void*_Nonnull ptr, RustBuffer bgra, uint32_t width, uint32_t height, uint64_t timestamp_us, RustCallStatus *_Nonnull out_status
@@ -831,6 +836,12 @@ uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqav_is_connected(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_LEAVE
 #define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_LEAVE
 uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqav_leave(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_PUSH_AUDIO_FRAME
+#define UNIFFI_FFIDEF_UNIFFI_FREEQ_SDK_FFI_CHECKSUM_METHOD_FREEQAV_PUSH_AUDIO_FRAME
+uint16_t uniffi_freeq_sdk_ffi_checksum_method_freeqav_push_audio_frame(void
     
 );
 #endif

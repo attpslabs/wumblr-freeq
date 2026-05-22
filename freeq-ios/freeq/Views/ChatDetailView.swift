@@ -15,6 +15,12 @@ struct ChatDetailView: View {
 
     private var isChannel: Bool { channelName.hasPrefix("#") }
 
+    /// True when an AV call is active in *this* channel.
+    private var isCallActiveHere: Bool {
+        appState.isInCall && isChannel
+            && appState.currentCallChannel?.lowercased() == channelName.lowercased()
+    }
+
     var body: some View {
         ZStack {
             Theme.bgPrimary.ignoresSafeArea()
@@ -56,39 +62,42 @@ struct ChatDetailView: View {
 
                 // Voice/video call panel — pinned above the message list
                 // when an AV session is active in this channel.
-                if appState.isInCall && isChannel,
-                   appState.currentCallChannel?.lowercased() == channelName.lowercased() {
+                if isCallActiveHere {
                     CallView(channel: channelName)
                 }
 
-                if let channel = channelState {
-                    ZStack {
-                        MessageListView(channel: channel)
-                            .onTapGesture {
-                                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                            }
+                // Message list + composer — hidden while the call is
+                // expanded to fill the screen.
+                if !(isCallActiveHere && appState.isCallExpanded) {
+                    if let channel = channelState {
+                        ZStack {
+                            MessageListView(channel: channel)
+                                .onTapGesture {
+                                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                }
 
-                        // Member list slide-in
-                        if showingMembers {
-                            HStack(spacing: 0) {
-                                Spacer()
-                                Color.black.opacity(0.3)
-                                    .ignoresSafeArea()
-                                    .onTapGesture { showingMembers = false }
-                                MemberListView(channel: channel)
-                                    .frame(width: 260)
-                                    .transition(.move(edge: .trailing))
+                            // Member list slide-in
+                            if showingMembers {
+                                HStack(spacing: 0) {
+                                    Spacer()
+                                    Color.black.opacity(0.3)
+                                        .ignoresSafeArea()
+                                        .onTapGesture { showingMembers = false }
+                                    MemberListView(channel: channel)
+                                        .frame(width: 260)
+                                        .transition(.move(edge: .trailing))
+                                }
+                                .animation(.easeInOut(duration: 0.2), value: showingMembers)
                             }
-                            .animation(.easeInOut(duration: 0.2), value: showingMembers)
                         }
-                    }
 
-                    ComposeView()
-                } else {
-                    Spacer()
-                    Text("Channel not found")
-                        .foregroundColor(Theme.textMuted)
-                    Spacer()
+                        ComposeView()
+                    } else {
+                        Spacer()
+                        Text("Channel not found")
+                            .foregroundColor(Theme.textMuted)
+                        Spacer()
+                    }
                 }
             }
         }

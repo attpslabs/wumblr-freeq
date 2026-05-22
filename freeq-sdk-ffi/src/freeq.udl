@@ -232,6 +232,11 @@ interface FreeqAv {
     // encoder will pull the most-recent queued frame.
     void push_video_frame(sequence<u8> bgra, u32 width, u32 height, u64 timestamp_us);
 
+    // Swift-driven mic capture. Each call queues mono 48 kHz f32 samples
+    // for the Opus encoder. iroh-live's audio input backend isn't viable
+    // on iOS, so capture happens in Swift (AVAudioEngine).
+    void push_audio_frame(sequence<f32> samples);
+
     boolean is_connected();
 };
 

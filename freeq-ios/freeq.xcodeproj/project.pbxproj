@@ -55,6 +55,7 @@
 		B2DF4E800D832B107555FD28 /* CallActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7278D584F74B58B9922F23BC /* CallActivityAttributes.swift */; };
 		B757EEF191C41D1327706DB2 /* FreeqSDK.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 71E14BE7827AB5FE22AC3FF6 /* FreeqSDK.xcframework */; };
 		B792746D241CB91D4B15E377 /* SearchSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F40F27BC70CA9C7E4307D2A3 /* SearchSheet.swift */; };
+		B851BB1F9C23ED67884D5621 /* CallMicCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17EDADA552C222EC7D8D3F34 /* CallMicCapture.swift */; };
 		BA97D2705780ACE7D35F1B5A /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 652094AB12E394FEA901DE7E /* AudioToolbox.framework */; };
 		BBBACE23B6893E0329291726 /* BlueskyEmbed.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58407D4C1041AA5F085B8CDC /* BlueskyEmbed.swift */; };
 		BDDF0B841D6BE174B3422E91 /* MediaCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEAD9DB0C1ADE514854C57B0 /* MediaCapture.swift */; };
@@ -96,6 +97,7 @@
 		0F2B162069D9FEB43A008621 /* JoinChannelSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JoinChannelSheet.swift; sourceTree = "<group>"; };
 		13E68B84D80561E2B74C5B48 /* WatchPayloads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchPayloads.swift; sourceTree = "<group>"; };
 		1613B43E3F87D0A8567A57BB /* CallView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallView.swift; sourceTree = "<group>"; };
+		17EDADA552C222EC7D8D3F34 /* CallMicCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallMicCapture.swift; sourceTree = "<group>"; };
 		1D97CC3F5A8E1F52F2C940FF /* BufferListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BufferListView.swift; sourceTree = "<group>"; };
 		1DE07EAC6B16A20177585C57 /* ImageLightbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageLightbox.swift; sourceTree = "<group>"; };
 		27BC2996888A988136F5405B /* freeqTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = freeqTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -290,6 +292,7 @@
 				DB66829DE40DA60667ECBB43 /* AppState.swift */,
 				FEED28B3F67BF6EC64040A04 /* AvatarCache.swift */,
 				78CD9FF3B40DF51F4177AA84 /* CallCameraCapture.swift */,
+				17EDADA552C222EC7D8D3F34 /* CallMicCapture.swift */,
 				B28D17294C06F964661A5E97 /* KeychainHelper.swift */,
 				5DDE25216F85C26CCEE21C66 /* NetworkMonitor.swift */,
 				D528FB66B3A58A4A06E4379C /* Notifications.swift */,
@@ -532,6 +535,7 @@
 				BBBACE23B6893E0329291726 /* BlueskyEmbed.swift in Sources */,
 				B2DF4E800D832B107555FD28 /* CallActivityAttributes.swift in Sources */,
 				ECAFF392124C53BB4F56182B /* CallCameraCapture.swift in Sources */,
+				B851BB1F9C23ED67884D5621 /* CallMicCapture.swift in Sources */,
 				0D90DB6A860ED297CC10A2CF /* CallView.swift in Sources */,
 				8051F4C388919E36E3F7D21B /* ChannelSettingsSheet.swift in Sources */,
 				9ADC4B8DCD3BCB087C8FF8C2 /* ChatDetailView.swift in Sources */,

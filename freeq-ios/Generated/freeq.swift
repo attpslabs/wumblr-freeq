@@ -470,6 +470,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -540,6 +556,8 @@ public protocol FreeqAvProtocol: AnyObject, Sendable {
     func isConnected()  -> Bool
     
     func leave() 
+    
+    func pushAudioFrame(samples: [Float]) 
     
     func pushVideoFrame(bgra: [UInt8], width: UInt32, height: UInt32, timestampUs: UInt64) 
     
@@ -621,6 +639,13 @@ open func isConnected() -> Bool  {
     
 open func leave()  {try! rustCall() {
     uniffi_freeq_sdk_ffi_fn_method_freeqav_leave(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func pushAudioFrame(samples: [Float])  {try! rustCall() {
+    uniffi_freeq_sdk_ffi_fn_method_freeqav_push_audio_frame(self.uniffiClonePointer(),
+        FfiConverterSequenceFloat.lower(samples),$0
     )
 }
 }
@@ -3011,6 +3036,31 @@ fileprivate struct FfiConverterSequenceUInt8: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
+    typealias SwiftType = [Float]
+
+    public static func write(_ value: [Float], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterFloat.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Float] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Float]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterFloat.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -3102,6 +3152,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqav_leave() != 39649) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freeq_sdk_ffi_checksum_method_freeqav_push_audio_frame() != 55965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freeq_sdk_ffi_checksum_method_freeqav_push_video_frame() != 30541) {

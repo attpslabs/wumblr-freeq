@@ -8,9 +8,14 @@ struct CallView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Participant grid (when video is on or participants exist)
+            // Participant grid — a compact strip, or a full-screen
+            // layout when the call has been expanded.
             if appState.isInCall {
-                participantGrid
+                if appState.isCallExpanded {
+                    expandedGrid
+                } else {
+                    participantGrid
+                }
             }
 
             // Controls bar
@@ -83,6 +88,68 @@ struct CallView: View {
         }
     }
 
+    /// Full-screen layout — every tile fills the screen, stacked
+    /// vertically, so the call is big enough to actually use on a phone.
+    private var expandedGrid: some View {
+        VStack(spacing: 6) {
+            ForEach(appState.callParticipants, id: \.self) { nick in
+                expandedTile(nick: nick, isLocal: false)
+            }
+            expandedTile(nick: appState.currentNick ?? "You", isLocal: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// One large tile in the expanded layout — live video when it's
+    /// arriving, an initials avatar otherwise, with a name label.
+    @ViewBuilder
+    private func expandedTile(nick: String, isLocal: Bool) -> some View {
+        let hasVideo =
+            isLocal
+            ? (appState.isCameraOn && appState.localPreviewCapture != nil)
+            : appState.participantsWithVideo.contains(nick)
+        ZStack {
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color(.secondarySystemBackground))
+
+            if isLocal, appState.isCameraOn, let cap = appState.localPreviewCapture {
+                LocalPreviewView(capture: cap)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !isLocal {
+                RemoteVideoTile(appState: appState, nick: nick)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(hasVideo ? 1 : 0)
+            }
+
+            if !hasVideo {
+                Text(String(nick.prefix(2).uppercased()))
+                    .font(.system(size: 46, weight: .bold))
+                    .foregroundColor(.accentColor)
+            }
+
+            // Name label, bottom-left.
+            VStack {
+                Spacer()
+                HStack {
+                    Text(isLocal ? "You" : nick)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.black.opacity(0.55))
+                        .clipShape(Capsule())
+                    Spacer()
+                }
+                .padding(8)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
     private var controlsBar: some View {
         HStack(spacing: 16) {
             // Status
@@ -98,6 +165,28 @@ struct CallView: View {
             }
 
             Spacer()
+
+            // Expand / collapse the call to fill the screen
+            Button(action: { appState.isCallExpanded.toggle() }) {
+                Image(systemName: appState.isCallExpanded
+                    ? "arrow.down.right.and.arrow.up.left"
+                    : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 16))
+                    .foregroundColor(.white)
+                    .frame(width: 40, height: 40)
+                    .background(Color(.systemGray4))
+                    .clipShape(Circle())
+            }
+
+            // Speaker — loud speaker vs handset receiver
+            Button(action: { appState.toggleSpeaker() }) {
+                Image(systemName: appState.isSpeakerOn ? "speaker.wave.2.fill" : "ear")
+                    .font(.system(size: 16))
+                    .foregroundColor(.white)
+                    .frame(width: 40, height: 40)
+                    .background(appState.isSpeakerOn ? Color.accentColor : Color(.systemGray4))
+                    .clipShape(Circle())
+            }
 
             // Mute
             Button(action: { appState.toggleMute() }) {
