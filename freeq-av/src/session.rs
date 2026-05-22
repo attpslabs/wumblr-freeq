@@ -384,6 +384,25 @@ async fn run_tap(
     };
     tracing::info!(%nick, %path, "audio track live — tapping");
 
+    // Dump what the SFU advertises for this participant — diagnostic for
+    // "she doesn't see my screen" cases (no video rendition? unsupported
+    // codec? camera off?).
+    {
+        let cat = remote.catalog();
+        let video_renditions: Vec<String> =
+            cat.video_renditions().map(str::to_string).collect();
+        let audio_renditions: Vec<String> =
+            cat.audio_renditions().map(str::to_string).collect();
+        tracing::info!(
+            %nick,
+            has_video = remote.has_video(),
+            has_audio = remote.has_audio(),
+            video = ?video_renditions,
+            audio = ?audio_renditions,
+            "participant catalog",
+        );
+    }
+
     let video = VideoHandle::default();
     if tx
         .send(AvParticipant {
@@ -411,7 +430,7 @@ async fn run_tap(
                     video.set(frame);
                 }
             }
-            Err(e) => tracing::debug!(%nick, error = ?e, "no video track"),
+            Err(e) => tracing::warn!(%nick, error = ?e, "video subscribe failed"),
         }
     };
     tokio::select! {
