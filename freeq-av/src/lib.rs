@@ -8,12 +8,17 @@
 //!   agent's own audio, the matching [`PushAudioSource`] for the
 //!   encoder, a participant [`TapBackend`] that surfaces decoded remote
 //!   PCM, and a band-limited [`resample_mono`].
+//! - [`session`] — [`AvSession`]: connect to the MoQ SFU, publish the
+//!   agent's broadcast, and tap every participant's audio, with
+//!   automatic reconnect.
 //!
 //! The IRC-side call *signaling* (av-start / av-join / av-leave and the
 //! `av-state` broadcasts) lives separately in `freeq_sdk::av`.
 
 pub mod audio;
+pub mod session;
 
 pub use audio::{
     resample_mono, PcmFrame, PushAudioSource, Speaker, TapBackend, SPEAK_RATE,
 };
+pub use session::{broadcast_path, path_nick, AvConfig, AvParticipant, AvSession};
