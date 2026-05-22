@@ -1,4 +1,4 @@
-//! freeq-utopia: sample agent that joins freeq AV sessions and
+//! freeq-eliza: sample agent that joins freeq AV sessions and
 //! transcribes the audio.
 //!
 //! Lifecycle:
@@ -19,12 +19,12 @@
 //!    back to the channel.
 //!
 //! Run as a one-shot for development:
-//!   ANTHROPIC_API_KEY=sk-... cargo run --release --bin freeq-utopia -- \
+//!   ANTHROPIC_API_KEY=sk-... cargo run --release --bin freeq-eliza -- \
 //!     --server wss://irc.freeq.at/irc \
 //!     --channel '#avtest' \
 //!     --model-path ./models/ggml-small.en.bin
 //!
-//! Identity files live at `~/.freeq/bots/utopia/`. First run creates
+//! Identity files live at `~/.freeq/bots/eliza/`. First run creates
 //! them; subsequent runs reuse the same DID.
 
 use std::path::PathBuf;
@@ -33,11 +33,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use freeq_utopia::{identity, irc, stt};
+use freeq_eliza::{identity, imagegen, irc, stt};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "freeq-utopia",
+    name = "freeq-eliza",
     about = "Joins freeq AV sessions, transcribes audio, posts the transcript + summary back to the channel."
 )]
 struct Cli {
@@ -52,7 +52,7 @@ struct Cli {
     channel: Vec<String>,
 
     /// Bot identity name. Files live at `~/.freeq/bots/<name>/`.
-    #[arg(long, default_value = "utopia")]
+    #[arg(long, default_value = "eliza")]
     name: String,
 
     /// IRC nick. Defaults to the identity name.
@@ -70,17 +70,35 @@ struct Cli {
     #[arg(long, default_value = "whisper-large-v3-turbo")]
     groq_model: String,
 
-    /// Groq chat model for answering questions addressed to the bot.
+    /// Groq chat model for the visual board (scene generation).
     #[arg(long, default_value = "llama-3.3-70b-versatile")]
     groq_chat_model: String,
 
+    /// Groq model for answering questions addressed to the bot. The
+    /// default (`groq/compound`) is agentic and searches the web; use
+    /// `groq/compound-mini` for lower latency, or a plain chat model
+    /// (e.g. `llama-3.3-70b-versatile`) to disable web search.
+    #[arg(long, default_value = "groq/compound")]
+    groq_answer_model: String,
+
     /// ElevenLabs voice + model for speaking answers aloud. Reads
-    /// `ELEVENLABS_API_KEY` from the environment. The default voice is
-    /// "Utopia" (`aj0fZfXTBc7E3By4X8L2`).
+    /// `ELEVENLABS_API_KEY` from the environment.
     #[arg(long, default_value = "aj0fZfXTBc7E3By4X8L2")]
     elevenlabs_voice: String,
     #[arg(long, default_value = "eleven_turbo_v2_5")]
     elevenlabs_model: String,
+
+    /// AI image-generation provider for scene backdrops, used as a
+    /// fallback when Wikipedia has no image: "openai" or "gemini". The
+    /// API key is read from the environment (OPENAI_API_KEY, or
+    /// GEMINI_API_KEY / GOOGLE_API_KEY). With no key, backdrops come
+    /// from Wikipedia only.
+    #[arg(long, default_value = "openai")]
+    image_provider: String,
+
+    /// Image model for the AI backdrop fallback.
+    #[arg(long, default_value = "gpt-image-1-mini")]
+    image_model: String,
 
     /// Skip the end-of-call summary even if `ANTHROPIC_API_KEY` is set.
     #[arg(long)]
@@ -115,7 +133,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("freeq_utopia=info,freeq_sdk=info,info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("freeq_eliza=info,freeq_sdk=info,info")),
         )
         .init();
 
@@ -157,6 +175,25 @@ async fn main() -> Result<()> {
         tracing::info!("ELEVENLABS_API_KEY not set — spoken replies disabled (text only)");
     }
 
+    // Scene backdrops: Wikipedia is always available; an AI image model
+    // is an optional fallback, enabled when its key is in the env.
+    let image_provider = imagegen::ImageProvider::parse(&cli.image_provider);
+    let image_ai = image_provider
+        .key_vars()
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|k| !k.trim().is_empty()))
+        .map(|key| imagegen::AiImageConfig {
+            provider: image_provider,
+            model: cli.image_model.clone(),
+            key,
+        });
+    if image_ai.is_none() {
+        tracing::info!(
+            provider = ?image_provider,
+            "no image API key in env — scene backdrops will use Wikipedia only"
+        );
+    }
+
     irc::run(irc::RunConfig {
         server: cli.server,
         channels: cli.channel,
@@ -170,9 +207,11 @@ async fn main() -> Result<()> {
         sfu_url_override: cli.sfu_url,
         groq_api_key,
         groq_chat_model: cli.groq_chat_model,
+        groq_answer_model: cli.groq_answer_model,
         elevenlabs_api_key,
         elevenlabs_voice_id: cli.elevenlabs_voice,
         elevenlabs_model: cli.elevenlabs_model,
+        image_ai,
     })
     .await
 }

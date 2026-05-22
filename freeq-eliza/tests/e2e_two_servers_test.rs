@@ -1,8 +1,8 @@
-//! Two-in-process-server end-to-end tests for the utopia bot.
+//! Two-in-process-server end-to-end tests for the eliza bot.
 //!
 //! Each test spins up one or two real `freeq-server` instances in-process
 //! on ephemeral ports (no S2S federation — the servers are independent),
-//! points the bot at one of them via `freeq_utopia::irc::run`,
+//! points the bot at one of them via `freeq_eliza::irc::run`,
 //! and asserts on the IRC/TAGMSG control plane by attaching a *witness*
 //! SDK client to the same channel.
 //!
@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
-use freeq_utopia::identity::{self, Identity};
-use freeq_utopia::irc::{RunConfig, run};
-use freeq_utopia::stt::SttEngine;
+use freeq_eliza::identity::{self, Identity};
+use freeq_eliza::irc::{RunConfig, run};
+use freeq_eliza::stt::SttEngine;
 use tokio::sync::mpsc::Receiver;
 
 // ───────────────────────────── server bootstrap ─────────────────────────────
@@ -288,9 +288,11 @@ fn spawn_bot(
         // tests only exercise the IRC/TAGMSG control plane.
         groq_api_key: None,
         groq_chat_model: "llama-3.3-70b-versatile".to_string(),
+        groq_answer_model: "groq/compound".to_string(),
         elevenlabs_api_key: None,
         elevenlabs_voice_id: "aj0fZfXTBc7E3By4X8L2".to_string(),
         elevenlabs_model: "eleven_turbo_v2_5".to_string(),
+        image_ai: None,
     };
     let handle = tokio::spawn(run(cfg));
     (handle, tmp)

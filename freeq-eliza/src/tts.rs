@@ -17,7 +17,7 @@ pub struct TtsAudio {
 pub const ELEVENLABS_PCM_RATE: u32 = 48_000;
 
 /// Synthesize `text` with ElevenLabs. `voice_id` is the ElevenLabs
-/// voice (e.g. the "Utopia" voice). `model` is e.g.
+/// voice (e.g. the "Eliza" voice). `model` is e.g.
 /// `eleven_turbo_v2_5`. Voice tuning matches the avatar app's
 /// settings. Returns mono f32 PCM at [`ELEVENLABS_PCM_RATE`].
 pub async fn synthesize(

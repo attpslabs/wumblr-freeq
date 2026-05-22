@@ -113,8 +113,15 @@ async fn groq_transcribe(
         .text("model", model.to_string())
         .text("response_format", "json")
         .text("language", "en")
-        // A light prompt nudges the model away from emitting filler
-        // for near-silent windows.
+        // Seed Whisper's vocabulary with the assistant's name. Without
+        // this it mangles "Eliza" at the start of an utterance into
+        // things like "advice of" or "you guys", so the bot never sees
+        // that it was addressed and never replies.
+        .text(
+            "prompt",
+            "A live voice call with the assistant Eliza. \
+             People say \"Eliza\" to ask her questions.",
+        )
         .text("temperature", "0");
 
     let resp = client

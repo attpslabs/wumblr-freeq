@@ -1,16 +1,16 @@
 [package]
-name = "freeq-utopia"
+name = "freeq-eliza"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Utopia — an agent that joins freeq AV calls: transcribes, answers by voice, and shows live visual aids."
+description = "Eliza — an agent that joins freeq AV calls: transcribes, answers by voice, and shows live visual aids."
 
 [lib]
-name = "freeq_utopia"
+name = "freeq_eliza"
 path = "src/lib.rs"
 
 [[bin]]
-name = "freeq-utopia"
+name = "freeq-eliza"
 path = "src/main.rs"
 
 [dependencies]
@@ -37,9 +37,13 @@ futures-util = "0.3"
 whisper-rs = { version = "0.14", default-features = false, optional = true }
 
 # Visuals — render the agent's video tile (audio-reactive presence +
-# LLM-authored visual aids) as SVG, rasterized to RGBA frames.
+# LLM-authored visual aids) as SVG, rasterized to RGBA frames. `image`
+# decodes/resizes AI-generated backdrops; `base64` embeds them as SVG
+# data URIs.
 resvg = "0.45"
 bytes = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 
 # Async + utility
 tokio = { workspace = true }

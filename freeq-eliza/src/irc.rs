@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use freeq_sdk::auth::KeySigner;
@@ -28,9 +28,10 @@ use tokio::task::JoinHandle;
 
 use crate::audio_tap::{PushAudioSource, Speaker, TapBackend, to_whisper_pcm};
 use crate::identity::Identity;
+use crate::imagegen::AiImageConfig;
 use crate::stt::SttEngine;
 use crate::video::VideoTile;
-use crate::{qa, summary, tts};
+use crate::{imagegen, qa, summary, tts};
 
 pub struct RunConfig {
     pub server: String,
@@ -55,13 +56,19 @@ pub struct RunConfig {
     /// Groq API key — powers question-answering (chat). When `None`,
     /// the bot can't answer addressed questions.
     pub groq_api_key: Option<String>,
-    /// Groq chat model for answering addressed questions.
+    /// Groq chat model for the visual board (scene generation).
     pub groq_chat_model: String,
+    /// Groq model for answering addressed questions. Defaults to an
+    /// agentic model (`groq/compound`) so eliza can search the web.
+    pub groq_answer_model: String,
     /// ElevenLabs API key + voice + model for speaking answers aloud.
     /// When the key is `None`, answers are posted as text only.
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_voice_id: String,
     pub elevenlabs_model: String,
+    /// AI image-generation fallback for scene backdrops. `None` leaves
+    /// Wikipedia as the only backdrop source.
+    pub image_ai: Option<AiImageConfig>,
 }
 
 /// Subset of [`RunConfig`] shared with inner tasks. Excludes the
@@ -78,11 +85,17 @@ struct SharedConfig {
     sfu_url_override: Option<String>,
     groq_api_key: Option<String>,
     groq_chat_model: String,
+    groq_answer_model: String,
     elevenlabs_api_key: Option<String>,
     elevenlabs_voice_id: String,
     elevenlabs_model: String,
+    image_ai: Option<AiImageConfig>,
     /// Shared HTTP client for Groq QA + ElevenLabs TTS calls.
     http: reqwest::Client,
+    /// When the bot process started — drives a startup grace period so it
+    /// doesn't answer the burst of channel history (and any replayed
+    /// audio) the server delivers right after it joins.
+    started_at: Instant,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
@@ -92,14 +105,14 @@ struct ActiveCall {
     channel: String,
     session_id: String,
     instance_id: String,
-    /// Lines of `<nick>: <utterance>` heard so far. Buffered (not
-    /// firehosed to the channel) and used to build the end-of-call
-    /// summary + answer `dump` requests.
+    /// Lines of `<nick>: <utterance>` heard so far. Buffered as context
+    /// for answering questions and the end-of-call summary — never
+    /// posted to the channel.
     transcript: Vec<String>,
-    /// Index of the first `transcript` line not yet posted by a `dump`
-    /// request — a `dump` posts `transcript[dumped_upto..]` and advances
-    /// this so a repeat dump only shows what's new.
-    dumped_upto: usize,
+    /// When Eliza last dispatched a spoken answer. Drives a debounce so
+    /// one question — transcribed once per broadcast when a speaker is
+    /// joined from several devices — is answered only once.
+    last_answer: Option<Instant>,
     /// Feeds the bot's outbound broadcast — `enqueue` makes it speak.
     speaker: Speaker,
     /// The agent's video tile (audio-reactive presence + visual-aid
@@ -135,9 +148,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         sfu_url_override,
         groq_api_key,
         groq_chat_model,
+        groq_answer_model,
         elevenlabs_api_key,
         elevenlabs_voice_id,
         elevenlabs_model,
+        image_ai,
     } = cfg;
 
     // Pick websocket vs raw-TCP transport based on URL scheme — mirrors
@@ -165,7 +180,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         server_addr,
         nick: nick.clone(),
         user: nick.clone(),
-        realname: "freeq-utopia".to_string(),
+        realname: "freeq-eliza".to_string(),
         tls: websocket_url.is_some()
             || server.starts_with("https://")
             || server.starts_with("wss://"),
@@ -185,7 +200,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let _ = handle.register_agent("agent").await;
     let _ = handle
         .submit_provenance(&serde_json::json!({
-            "name": "freeq-utopia",
+            "name": "freeq-eliza",
             "version": env!("CARGO_PKG_VERSION"),
             "runtime": "freeq-sdk/rust",
             "capabilities": ["av-transcription", "summary"],
@@ -214,10 +229,13 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         sfu_url_override,
         groq_api_key,
         groq_chat_model,
+        groq_answer_model,
         elevenlabs_api_key,
         elevenlabs_voice_id,
         elevenlabs_model,
+        image_ai,
         http: reqwest::Client::new(),
+        started_at: Instant::now(),
     });
     let handle_arc = Arc::new(handle);
 
@@ -248,13 +266,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             {
                 Ok(call) => {
                     *active.lock().await = Some(call);
-                    let _ = handle_arc
-                        .privmsg(
-                            start_ch,
-                            "[transcript] listening (joined a call in progress). \
-                             Say or type \"utopia: dump\" for the transcript so far.",
-                        )
-                        .await;
                 }
                 Err(e) => tracing::warn!(error = ?e, "failed to join existing session"),
             }
@@ -322,14 +333,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                                     "started transcription"
                                 );
                                 *active_guard = Some(call);
-                                let _ = handle_arc
-                                    .privmsg(
-                                        &channel,
-                                        "[transcript] listening. I'll stay quiet — \
-                                         say or type \"utopia: dump\" anytime for \
-                                         the transcript so far.",
-                                    )
-                                    .await;
                             }
                             Err(e) => {
                                 tracing::warn!(error = ?e, "failed to start transcription");
@@ -408,15 +411,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 let Some(question) = qa::extract_addressed(&text, &cfg.nick) else {
                     continue;
                 };
-                // "utopia: dump" → post the buffered transcript
-                // rather than running it through Q&A.
-                if is_transcript_request(question) {
-                    let handle = handle_arc.clone();
-                    let active = active.clone();
-                    let channel = target.clone();
-                    tokio::spawn(async move {
-                        dump_transcript(&handle, &channel, &active).await;
-                    });
+                // Don't answer the burst of channel history the server
+                // replays right after the bot joins — those messages
+                // predate the bot and aren't being asked of it now.
+                if cfg.started_at.elapsed() < STARTUP_GRACE {
+                    tracing::info!(%from, "ignoring addressed chat message (startup grace)");
                     continue;
                 }
                 if cfg.groq_api_key.is_none() {
@@ -425,27 +424,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         .await;
                     continue;
                 }
-                // Snapshot transcript + speaker handle from the active
-                // call, then answer + speak off the event loop.
-                let (transcript, speaker, video) = {
+                // A typed question gets a typed answer — pass no speaker
+                // or video so `answer_and_speak` posts text rather than
+                // speaking it. The call transcript is still useful context.
+                let transcript = {
                     let guard = active.lock().await;
-                    match guard.as_ref() {
-                        Some(call) => (
-                            call.transcript.join("\n"),
-                            Some(call.speaker.clone()),
-                            Some(call.video.clone()),
-                        ),
-                        None => (String::new(), None, None),
-                    }
+                    guard
+                        .as_ref()
+                        .map(|c| c.transcript.join("\n"))
+                        .unwrap_or_default()
                 };
                 let cfg = cfg.clone();
                 let handle = handle_arc.clone();
                 let channel = target.clone();
-                let question = question.to_string();
                 let asker = from.clone();
                 tokio::spawn(async move {
                     answer_and_speak(
-                        cfg, handle, channel, asker, question, transcript, speaker, video,
+                        cfg, handle, channel, asker, question, transcript, None, None,
                     )
                     .await;
                 });
@@ -457,6 +452,51 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             _ => {}
         }
     }
+}
+
+/// Split an answer into a speakable form plus the links it contained.
+/// Eliza is voice-first and URLs are unpronounceable, so they're pulled
+/// out of what she says aloud — markdown links `[label](url)` keep only
+/// `label` in speech, bare `http(s)`/`www.` URLs are dropped — and the
+/// caller posts the collected URLs into the channel as text instead.
+fn split_speech_and_links(text: &str) -> (String, Vec<String>) {
+    let mut links: Vec<String> = Vec::new();
+    let mut spoken = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Markdown link: [label](url) — speak the label, surface the url.
+        if let Some(stripped) = rest.strip_prefix('[') {
+            if let Some(mid) = stripped.find("](") {
+                if let Some(close) = stripped[mid + 2..].find(')') {
+                    let label = &stripped[..mid];
+                    let url = stripped[mid + 2..mid + 2 + close].trim();
+                    spoken.push_str(label);
+                    if url.starts_with("http") || url.starts_with("www.") {
+                        links.push(url.to_string());
+                    }
+                    rest = &stripped[mid + 2 + close + 1..];
+                    continue;
+                }
+            }
+        }
+        // Bare URL — drop it from speech entirely.
+        if rest.starts_with("http://")
+            || rest.starts_with("https://")
+            || rest.starts_with("www.")
+        {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let url = rest[..end].trim_end_matches(|c| ",.;:!?)]}\"'".contains(c));
+            links.push(url.to_string());
+            rest = &rest[url.len()..];
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        spoken.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    // Collapse the whitespace left where URLs were removed.
+    let spoken = spoken.split_whitespace().collect::<Vec<_>>().join(" ");
+    (spoken, links)
 }
 
 /// Handle one addressed question: ask Groq, post the answer to chat,
@@ -485,7 +525,7 @@ async fn answer_and_speak(
     let answer = match qa::answer(
         &cfg.http,
         key,
-        &cfg.groq_chat_model,
+        &cfg.groq_answer_model,
         &transcript,
         &question,
     )
@@ -501,78 +541,144 @@ async fn answer_and_speak(
         }
     };
 
-    // Post the text answer regardless of whether speech works.
-    let _ = handle
-        .privmsg(&channel, &format!("[utopia→{asker}] {answer}"))
-        .await;
-
-    // Speak it, if we have a broadcast to speak through + an EL key.
-    let Some(speaker) = speaker else {
-        tracing::info!("no active call — answered in text only");
-        return;
-    };
-    let Some(el_key) = cfg.elevenlabs_api_key.as_deref() else {
-        tracing::info!("no ElevenLabs key — answered in text only");
-        return;
-    };
-    match tts::synthesize(
-        &cfg.http,
-        el_key,
-        &cfg.elevenlabs_voice_id,
-        &cfg.elevenlabs_model,
-        &answer,
-    )
-    .await
-    {
-        Ok(audio) => {
-            // Dump the exact synthesized PCM so a "static" report can be
-            // bisected: if /tmp/freeq-tts-last.wav plays clean, the
-            // static is introduced downstream (Opus encode / WebSocket
-            // transport / receiver playout), not by TTS.
-            match std::fs::write(
-                "/tmp/freeq-tts-last.wav",
-                tts::encode_wav(&audio.pcm, audio.sample_rate),
-            ) {
-                Ok(()) => tracing::info!(
-                    samples = audio.pcm.len(),
-                    rate = audio.sample_rate,
-                    "saved TTS audio to /tmp/freeq-tts-last.wav"
-                ),
-                Err(e) => tracing::warn!(error = ?e, "could not save TTS debug WAV"),
-            }
-            speaker.enqueue(&audio.pcm, audio.sample_rate);
-            tracing::info!(
-                queued_secs = speaker.queued_secs(),
-                "spoke answer into the call"
-            );
+    // Eliza is voice-first. URLs are unpronounceable — pull them out of
+    // what she says aloud and post them into the channel as text. This
+    // covers links the model embedded in its answer and the agentic
+    // web-search source. `spoken` is now URL-free.
+    let (mut spoken, body_links) = split_speech_and_links(&answer.text);
+    let mut posted_link = false;
+    for url in &body_links {
+        let _ = handle.privmsg(&channel, &format!("[eliza] {url}")).await;
+        posted_link = true;
+        tracing::info!(%url, "posted answer link");
+    }
+    if let Some(src) = &answer.source {
+        // Skip a source already surfaced as a body link.
+        if !body_links.iter().any(|u| u == &src.url) {
+            let line = if src.title.is_empty() {
+                format!("[eliza] more on this — {}", src.url)
+            } else {
+                let title: String = src.title.chars().take(90).collect();
+                format!("[eliza] {title} — {}", src.url)
+            };
+            let _ = handle.privmsg(&channel, &line).await;
+            tracing::info!(url = %src.url, "posted source link");
         }
-        Err(e) => {
-            tracing::warn!(error = ?e, "TTS failed — answer posted as text only");
-        }
+        posted_link = true;
+    }
+    if posted_link {
+        spoken.push_str(" I've posted a link in the channel if you'd like to read more.");
     }
 
-    // Evolve utopia's visual board for this answer — the model carries
-    // forward still-relevant points and appends new ones; the renderer
-    // animates the new ones in.
-    if let Some(video) = &video {
-        let board = video.board_steps();
-        match qa::generate_scene(
+    // Multimodal: eliza speaks the answer when there's a call to speak
+    // into, and only types it into the channel when it could NOT speak
+    // it — no call, no ElevenLabs key, or a TTS failure.
+    let mut spoke = false;
+    if let (Some(speaker), Some(el_key)) = (speaker.as_ref(), cfg.elevenlabs_api_key.as_deref()) {
+        match tts::synthesize(
             &cfg.http,
-            key,
-            &cfg.groq_chat_model,
-            &question,
-            &answer,
-            &board,
+            el_key,
+            &cfg.elevenlabs_voice_id,
+            &cfg.elevenlabs_model,
+            &spoken,
         )
         .await
         {
-            Some((title, steps)) => {
-                tracing::info!(%title, steps = steps.len(), "updating visual board");
-                video.show_scene(title, steps);
+            Ok(audio) => {
+                // Dump the exact synthesized PCM so a "static" report can
+                // be bisected: if /tmp/freeq-tts-last.wav plays clean, the
+                // static is introduced downstream (Opus encode /
+                // transport / receiver playout), not by TTS.
+                match std::fs::write(
+                    "/tmp/freeq-tts-last.wav",
+                    tts::encode_wav(&audio.pcm, audio.sample_rate),
+                ) {
+                    Ok(()) => tracing::info!(
+                        samples = audio.pcm.len(),
+                        rate = audio.sample_rate,
+                        "saved TTS audio to /tmp/freeq-tts-last.wav"
+                    ),
+                    Err(e) => tracing::warn!(error = ?e, "could not save TTS debug WAV"),
+                }
+                speaker.enqueue(&audio.pcm, audio.sample_rate);
+                tracing::info!(
+                    queued_secs = speaker.queued_secs(),
+                    "spoke answer into the call"
+                );
+                spoke = true;
             }
-            None => tracing::info!("no board update for this answer"),
+            Err(e) => tracing::warn!(error = ?e, "TTS failed — falling back to text"),
         }
     }
+    if !spoke {
+        tracing::info!("answered in text only");
+        let _ = handle
+            .privmsg(&channel, &format!("[eliza→{asker}] {}", answer.text))
+            .await;
+    }
+
+    // Design a visual card for this answer — the model picks a layout
+    // and the renderer animates it in — then fetch a backdrop image for
+    // it off the hot path.
+    if let Some(video) = &video {
+        match qa::generate_scene(&cfg.http, key, &cfg.groq_chat_model, &question, &answer.text).await {
+            Some(spec) => {
+                tracing::info!(
+                    kind = ?spec.kind,
+                    title = %spec.title,
+                    points = spec.points.len(),
+                    "showing scene"
+                );
+                let query = spec.image_query.clone();
+                let scene_id = video.show_scene(spec);
+                spawn_scene_image(&cfg, video, scene_id, query);
+            }
+            None => tracing::info!("no scene for this answer"),
+        }
+    }
+}
+
+/// Fetch a backdrop image for scene `scene_id` and attach it when ready.
+/// Runs entirely off the answer path — image lookup/generation is slow
+/// (Wikipedia ~1s, AI fallback ~15s), so the scene shows text-first and
+/// the backdrop fades in once it arrives.
+fn spawn_scene_image(cfg: &Arc<SharedConfig>, video: &VideoTile, scene_id: u64, query: String) {
+    if query.trim().is_empty() {
+        return;
+    }
+    let cfg = cfg.clone();
+    let video = video.clone();
+    tokio::spawn(async move {
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(45),
+            imagegen::fetch(&cfg.http, &query, cfg.image_ai.as_ref()),
+        )
+        .await;
+        let bytes = match fetched {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "scene backdrop unavailable");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("scene backdrop timed out");
+                return;
+            }
+        };
+        let uri = match tokio::task::spawn_blocking(move || imagegen::to_data_uri(&bytes)).await {
+            Ok(Ok(uri)) => uri,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "scene backdrop processing failed");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "scene backdrop task panicked");
+                return;
+            }
+        };
+        video.set_scene_image(scene_id, uri);
+        tracing::info!(scene_id, "scene backdrop ready");
+    });
 }
 
 /// Clears the video tile's "thinking" mood when an `answer_and_speak`
@@ -721,7 +827,7 @@ async fn start_transcription(
 
     // The agent's video tile. The renderer thread runs for the call's
     // lifetime, producing audio-reactive frames; the audio path shares
-    // the loudness cell so the presence pulses with utopia's voice.
+    // the loudness cell so the presence pulses with eliza's voice.
     let video = VideoTile::new();
     video.spawn_renderer();
 
@@ -754,7 +860,7 @@ async fn start_transcription(
         session_id,
         instance_id,
         transcript: Vec::new(),
-        dumped_upto: 0,
+        last_answer: None,
         speaker,
         video,
         moq_task: task,
@@ -956,6 +1062,16 @@ const MAX_UTTERANCE_SAMPLES: usize = 16_000 * 22;
 /// Don't bother transcribing an utterance with less than this much
 /// actual voiced audio — it's a cough / click / room noise. 0.35s.
 const MIN_VOICED_SAMPLES: usize = (16_000.0 * 0.35) as usize;
+/// After dispatching an answer, ignore further addressed questions for
+/// this long. Collapses the duplicate transcriptions a multi-device
+/// speaker produces (each device's broadcast is tapped separately) and
+/// keeps Eliza from piling answers up while she is still speaking.
+const ANSWER_DEBOUNCE: Duration = Duration::from_secs(8);
+/// After the bot joins, ignore addressed questions for this long. The
+/// server replays a burst of channel history on join (and the SFU can
+/// replay buffered audio) — answering that backlog is an unprompted
+/// "monologue" of stale messages. Live questions come after the burst.
+const STARTUP_GRACE: Duration = Duration::from_secs(15);
 
 /// Known Whisper silence/noise hallucinations. Even with VAD, a short
 /// burst of non-speech noise occasionally slips a window through;
@@ -977,19 +1093,6 @@ fn is_hallucination(text: &str) -> bool {
             | "so"
             | "the"
     )
-}
-
-/// True when an addressed utterance is asking the bot to post the
-/// transcript buffered so far, rather than answer a question. The bot
-/// no longer firehoses every utterance to the channel — people pull the
-/// transcript on demand with "utopia: dump". Matched loosely
-/// because it's typed *and* spoken (whisper punctuation varies).
-pub(crate) fn is_transcript_request(question: &str) -> bool {
-    let q = question
-        .trim()
-        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
-        .to_lowercase();
-    q == "dump" || q.starts_with("dump ") || q.contains("transcript")
 }
 
 /// One per remote broadcast: subscribes to its audio and segments it
@@ -1117,41 +1220,82 @@ async fn tap_participant(
                     tracing::info!(%nick, %text, "transcribed utterance");
 
                     // Voice-addressed Q&A: if the utterance starts with
-                    // the bot's name ("utopia, summarize…"), treat
+                    // the bot's name ("eliza, summarize…"), treat
                     // it as a spoken question — answer + speak back —
                     // instead of just logging it as a transcript line.
                     // In a voice call people address the bot by talking,
                     // not typing.
                     if let Some(question) = qa::extract_addressed(&text, &cfg.nick) {
-                        if is_transcript_request(question) {
-                            dump_transcript(&handle, &channel, &active).await;
-                            return;
-                        }
-                        let _ = handle
-                            .privmsg(&channel, &format!("[transcript] {nick} asked: {text}"))
-                            .await;
-                        let (transcript, speaker, video) = {
-                            let guard = active.lock().await;
-                            match guard.as_ref() {
-                                Some(call) => (
-                                    call.transcript.join("\n"),
-                                    Some(call.speaker.clone()),
-                                    Some(call.video.clone()),
-                                ),
-                                None => (String::new(), None, None),
+                        // Debounce: a speaker joined from several devices
+                        // is tapped once per broadcast, so the same
+                        // question arrives two or three times. Answer the
+                        // first; drop the rest.
+                        let dispatch = {
+                            let mut guard = active.lock().await;
+                            match guard.as_mut() {
+                                // Startup grace: ignore the backlog of
+                                // audio the SFU can replay right after the
+                                // bot joins (a stale "monologue").
+                                Some(_) if cfg.started_at.elapsed() < STARTUP_GRACE => {
+                                    tracing::info!(%nick, "ignoring addressed question (startup grace)");
+                                    None
+                                }
+                                // Barge-in: Eliza is mid-answer and a
+                                // participant re-addressed her by name.
+                                // Stop her immediately and take the new
+                                // question — bypassing the dedupe debounce,
+                                // since a keyword *while she's speaking* is
+                                // a genuine interrupt, not a duplicate.
+                                // `clear()` empties the speech queue so the
+                                // 2-3 duplicate transcriptions that follow
+                                // see `is_speaking() == false` and get
+                                // caught by the debounce arm below.
+                                Some(call) if call.speaker.is_speaking() => {
+                                    tracing::info!(%nick, "barge-in — interrupting current answer");
+                                    call.speaker.clear();
+                                    call.last_answer = Some(Instant::now());
+                                    Some((
+                                        call.transcript.join("\n"),
+                                        call.speaker.clone(),
+                                        call.video.clone(),
+                                    ))
+                                }
+                                // Debounce: a speaker joined from several
+                                // devices is tapped once per broadcast, so
+                                // the same question arrives 2-3 times —
+                                // answer the first, drop the rest.
+                                Some(call)
+                                    if call
+                                        .last_answer
+                                        .map_or(true, |t| t.elapsed() >= ANSWER_DEBOUNCE) =>
+                                {
+                                    call.last_answer = Some(Instant::now());
+                                    Some((
+                                        call.transcript.join("\n"),
+                                        call.speaker.clone(),
+                                        call.video.clone(),
+                                    ))
+                                }
+                                Some(_) => {
+                                    tracing::info!(%nick, "ignoring duplicate addressed question (debounce)");
+                                    None
+                                }
+                                None => None,
                             }
                         };
-                        answer_and_speak(
-                            cfg,
-                            handle,
-                            channel,
-                            nick,
-                            question.to_string(),
-                            transcript,
-                            speaker,
-                            video,
-                        )
-                        .await;
+                        if let Some((transcript, speaker, video)) = dispatch {
+                            answer_and_speak(
+                                cfg,
+                                handle,
+                                channel,
+                                nick,
+                                question,
+                                transcript,
+                                Some(speaker),
+                                Some(video),
+                            )
+                            .await;
+                        }
                         return;
                     }
 
@@ -1325,56 +1469,6 @@ async fn post_long(handle: &ClientHandle, channel: &str, text: &str) {
         let _ = handle.privmsg(channel, line).await;
         // Brief pacing so we don't flood-trip the server.
         tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-}
-
-/// Post the transcript accumulated since the last dump to `channel`.
-/// Called on an explicit `dump` request — this replaces the old
-/// one-PRIVMSG-per-utterance firehose. Advances `dumped_upto` so a
-/// repeated dump only shows what's new since the previous one.
-async fn dump_transcript(
-    handle: &ClientHandle,
-    channel: &str,
-    active: &Arc<AsyncMutex<Option<ActiveCall>>>,
-) {
-    // Snapshot the new lines while holding the lock; post outside it.
-    let snapshot: Option<(Vec<String>, usize)> = {
-        let mut guard = active.lock().await;
-        guard.as_mut().map(|call| {
-            let total = call.transcript.len();
-            let from = call.dumped_upto.min(total);
-            let new = call.transcript[from..].to_vec();
-            call.dumped_upto = total;
-            (new, total)
-        })
-    };
-    match snapshot {
-        None => {
-            let _ = handle
-                .privmsg(channel, "[transcript] no active call right now.")
-                .await;
-        }
-        Some((new, total)) if new.is_empty() => {
-            let msg = if total == 0 {
-                "[transcript] nothing transcribed yet."
-            } else {
-                "[transcript] nothing new since the last dump."
-            };
-            let _ = handle.privmsg(channel, msg).await;
-        }
-        Some((new, _)) => {
-            let _ = handle
-                .privmsg(
-                    channel,
-                    &format!("[transcript] {} line(s) since the last dump:", new.len()),
-                )
-                .await;
-            for line in &new {
-                let _ = handle.privmsg(channel, &format!("  {line}")).await;
-                // Brief pacing so we don't flood-trip the server.
-                tokio::time::sleep(Duration::from_millis(120)).await;
-            }
-        }
     }
 }
 
@@ -1770,41 +1864,6 @@ mod tests {
                 AvAction::Noop,
                 "state {state:?}"
             );
-        }
-    }
-
-    // ---------- is_transcript_request ----------
-
-    #[test]
-    fn transcript_request_matches_dump_phrasings() {
-        for q in [
-            "dump",
-            "dump.",
-            "Dump!",
-            "dump it",
-            "dump the transcript",
-            "dump everything",
-            "transcript",
-            "transcript please",
-            "show me the transcript",
-            "post the transcript",
-            "what's the transcript so far",
-        ] {
-            assert!(is_transcript_request(q), "should match: {q:?}");
-        }
-    }
-
-    #[test]
-    fn transcript_request_rejects_real_questions() {
-        for q in [
-            "",
-            "what time is it",
-            "summarize the action items",
-            "who said that",
-            "how are you",
-            "dumpling recipe", // 'dump' must be a whole word, not a prefix
-        ] {
-            assert!(!is_transcript_request(q), "should not match: {q:?}");
         }
     }
 

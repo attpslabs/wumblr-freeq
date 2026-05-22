@@ -1,4 +1,4 @@
-//! Library facade for `freeq-utopia`.
+//! Library facade for `freeq-eliza`.
 //!
 //! The binary at `src/main.rs` is the real entrypoint; we expose the
 //! modules through `lib.rs` so adversarial unit tests can `cargo test
@@ -6,6 +6,7 @@
 
 pub mod audio_tap;
 pub mod identity;
+pub mod imagegen;
 pub mod irc;
 pub mod qa;
 pub mod stt;

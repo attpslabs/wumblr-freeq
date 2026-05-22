@@ -163,7 +163,7 @@ pub struct PushAudioSource {
     queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
     /// Smoothed loudness of what the encoder just pulled, `[0,1]` as
     /// `f32` bits — read by the video tile so the presence pulses with
-    /// utopia's voice.
+    /// eliza's voice.
     level: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -208,7 +208,7 @@ impl Speaker {
     /// Create a paired `(Speaker, PushAudioSource)`. The source goes to
     /// the `LocalBroadcast`; the speaker is kept by the orchestrator.
     /// `level` is shared with the video tile so the presence animation
-    /// can track utopia's own speech.
+    /// can track eliza's own speech.
     pub fn new(level: Arc<std::sync::atomic::AtomicU32>) -> (Speaker, PushAudioSource) {
         let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         (
@@ -229,6 +229,14 @@ impl Speaker {
     /// True while there's still queued audio the encoder hasn't drained.
     pub fn is_speaking(&self) -> bool {
         !self.queue.lock().expect("speak queue poisoned").is_empty()
+    }
+
+    /// Drop all queued audio — Eliza stops speaking immediately. Used for
+    /// barge-in: when a participant re-addresses her by name mid-answer,
+    /// the rest of the current reply is discarded so she can respond to
+    /// the new prompt instead of talking over it.
+    pub fn clear(&self) {
+        self.queue.lock().expect("speak queue poisoned").clear();
     }
 
     /// Approximate seconds of audio still queued — used to wait out a
