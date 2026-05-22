@@ -22,7 +22,6 @@ use iroh_live::media::codec::{AudioCodec, VideoCodec};
 use iroh_live::media::format::{AudioPreset, VideoPreset};
 use iroh_live::media::publish::LocalBroadcast;
 use iroh_live::media::subscribe::RemoteBroadcast;
-use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
@@ -270,16 +269,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 Err(e) => tracing::warn!(error = ?e, "failed to join existing session"),
             }
         } else {
-            let instance = generate_instance_id();
-            let mut tags = HashMap::new();
-            tags.insert("+freeq.at/av-start".to_string(), String::new());
-            tags.insert("+freeq.at/av-instance".to_string(), instance.clone());
-            tags.insert(
-                "+freeq.at/av-title".to_string(),
-                "transcribed session".to_string(),
-            );
+            let instance = freeq_sdk::av::new_av_instance();
             handle_arc
-                .send_tagmsg(start_ch, tags)
+                .av_start(start_ch, &instance, Some("transcribed session"))
                 .await
                 .with_context(|| format!("sending av-start to {start_ch}"))?;
             tracing::info!(channel = %start_ch, %instance, "sent av-start — initiating a call");
@@ -799,13 +791,9 @@ async fn start_transcription(
             inst
         }
         None => {
-            let instance_id = generate_instance_id();
-            let mut tags = HashMap::new();
-            tags.insert("+freeq.at/av-join".to_string(), String::new());
-            tags.insert("+freeq.at/av-id".to_string(), session_id.clone());
-            tags.insert("+freeq.at/av-instance".to_string(), instance_id.clone());
+            let instance_id = freeq_sdk::av::new_av_instance();
             handle
-                .send_tagmsg(&channel, tags)
+                .av_join(&channel, &session_id, &instance_id)
                 .await
                 .context("sending av-join")?;
             instance_id
@@ -1317,14 +1305,6 @@ async fn tap_participant(
     Ok(())
 }
 
-/// Generate an 8-char hex instance id — same shape as the iOS/web
-/// clients use.
-pub(crate) fn generate_instance_id() -> String {
-    let mut bytes = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Derive the MoQ SFU URL from the IRC server URL. Same host, /av/moq
 /// path, `https`/`http` scheme.
 ///
@@ -1605,31 +1585,6 @@ mod tests {
             .err()
             .expect("expected error");
         assert!(format!("{err:#}").contains("parsing"), "got: {err:#}");
-    }
-
-    // ---------- generate_instance_id ----------
-
-    #[test]
-    fn instance_id_is_8_lowercase_hex_chars() {
-        for _ in 0..200 {
-            let id = generate_instance_id();
-            assert_eq!(id.len(), 8, "got {id:?}");
-            assert!(
-                id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "got {id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn instance_ids_do_not_collide_in_a_thousand_calls() {
-        // 4 bytes of randomness ⇒ ~2.3e-5 collision probability over
-        // 1000 trials. If we ever drop to 2-byte ids the test starts
-        // flaking, which is the warning signal we want.
-        let mut seen = HashSet::new();
-        for _ in 0..1000 {
-            assert!(seen.insert(generate_instance_id()));
-        }
     }
 
     // ---------- wait_for_registration ----------

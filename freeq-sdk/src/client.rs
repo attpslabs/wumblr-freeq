@@ -220,6 +220,44 @@ impl ClientHandle {
         Ok(())
     }
 
+    /// Start a new AV (voice/video) call in `channel`. The server
+    /// replies with an `av-state` TAGMSG carrying the session id —
+    /// watch for it with [`crate::av::parse_av_state`] applied to
+    /// incoming [`Event::TagMsg`](crate::event::Event::TagMsg) tags.
+    /// `instance` is a per-call id from [`crate::av::new_av_instance`].
+    pub async fn av_start(
+        &self,
+        channel: &str,
+        instance: &str,
+        title: Option<&str>,
+    ) -> Result<()> {
+        self.send_tagmsg(channel, crate::av::av_start_tags(instance, title))
+            .await
+    }
+
+    /// Join the active AV call in `channel`. `session_id` is the id from
+    /// the channel's `av-state` broadcast.
+    pub async fn av_join(
+        &self,
+        channel: &str,
+        session_id: &str,
+        instance: &str,
+    ) -> Result<()> {
+        self.send_tagmsg(channel, crate::av::av_join_tags(session_id, instance))
+            .await
+    }
+
+    /// Leave an AV call.
+    pub async fn av_leave(
+        &self,
+        channel: &str,
+        session_id: &str,
+        instance: &str,
+    ) -> Result<()> {
+        self.send_tagmsg(channel, crate::av::av_leave_tags(session_id, instance))
+            .await
+    }
+
     /// Send a reaction to a target (channel or user).
     /// Falls back to PRIVMSG for plain clients.
     pub async fn send_reaction(

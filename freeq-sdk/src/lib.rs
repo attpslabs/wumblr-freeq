@@ -16,6 +16,7 @@
 //! - [`irc`] — IRC message parsing/formatting
 
 pub mod auth;
+pub mod av;
 pub mod bot;
 pub mod canonical;
 pub mod client;
