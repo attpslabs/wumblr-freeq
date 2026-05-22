@@ -20,14 +20,15 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand.workspace = true
 bs58 = "0.5"
 
-# AV / MoQ stack — same versions as freeq-av-client so the workspace
-# resolves them once.
+# Reusable AV layer — MoQ transport, audio capture/playback, and the
+# AvSession publish + participant-tap loop.
+freeq-av = { path = "../freeq-av" }
+# iroh-live stays a direct dep: the video tile renders into its
+# VideoSource / VideoFrame types, and `to_whisper_pcm` reads its
+# AudioFormat.
 iroh-live = { git = "https://github.com/n0-computer/iroh-live", default-features = false, features = ["opus", "h264"] }
-moq-native = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main", default-features = false, features = ["noq", "websocket", "aws-lc-rs"] }
-moq-lite = { git = "https://github.com/Frando/moq", branch = "deps/iroh-main" }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 url = "2"
-futures-util = "0.3"
 
 # STT — whisper.cpp bindings, behind the `stt` feature because the
 # build needs cmake + a C++ toolchain. Without the feature the bot

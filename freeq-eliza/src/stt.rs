@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use iroh_live::media::format::AudioFormat;
 
 /// Async STT engine. Held in an `Arc` and shared across per-participant
 /// tap tasks.
@@ -174,6 +175,80 @@ pub(crate) fn encode_wav_16k_mono(pcm: &[f32]) -> Vec<u8> {
     out
 }
 
+// ── PCM conditioning ─────────────────────────────────────────────────
+
+/// Naïve resampler / channel-downmixer: interleaved multi-channel f32
+/// at `format.sample_rate` → mono f32 at 16 kHz, suitable for whisper.
+///
+/// Uses linear interpolation. Good enough for speech recognition;
+/// don't ship this for music. (The agent's *playback* path uses the
+/// band-limited [`freeq_av::resample_mono`] instead.)
+///
+/// Adversarial input handling:
+///   - `channel_count == 0` is normalized to 1 (mono).
+///   - `sample_rate == 0` returns an empty buffer; same for empty input.
+///   - Inputs shorter than one frame across channels return empty (we
+///     never index past the end).
+///   - Extreme sample rates (1 Hz, 192 kHz) don't panic.
+///   - NaN / ±∞ samples are sanitised to 0.0 — whisper segfaults on
+///     non-finite PCM and we'd rather drop a few samples than crash
+///     the bot.
+pub fn to_whisper_pcm(input: &[f32], format: AudioFormat) -> Vec<f32> {
+    let channels = format.channel_count.max(1) as usize;
+    let in_rate = format.sample_rate as f32;
+    if input.is_empty() || in_rate <= 0.0 {
+        return Vec::new();
+    }
+
+    // Step 1: downmix to mono by averaging channels. `frames` may be 0
+    // when `input.len() < channels`, in which case the loop is a no-op
+    // and we return an empty vec rather than panicking on index OOB.
+    let frames = input.len() / channels;
+    let mut mono = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let mut sum = 0.0f32;
+        for c in 0..channels {
+            // Sanitise non-finite inputs at the source — once they hit
+            // the resample step they propagate, and any downstream
+            // consumer (whisper.cpp, ffmpeg, …) is allowed to crash on
+            // them. Coerce NaN/∞ to 0 so the bot can't be DoSed by a
+            // peer who feeds it junk PCM.
+            let s = input[f * channels + c];
+            sum += if s.is_finite() { s } else { 0.0 };
+        }
+        mono.push(sum / channels as f32);
+    }
+
+    // Step 2: linear resample to 16 kHz.
+    let target_rate = 16_000.0_f32;
+    if (in_rate - target_rate).abs() < 1.0 {
+        return mono;
+    }
+    if mono.is_empty() {
+        return mono;
+    }
+    let ratio = target_rate / in_rate;
+    let out_len_f = mono.len() as f32 * ratio;
+    // Guard against huge resample ratios producing absurd allocations
+    // (e.g. 192 kHz → 16 kHz is fine; 1 Hz → 16 kHz blows up). Cap at
+    // 16× the input length, which still covers normal 8 kHz/16 kHz/22
+    // kHz upsampling.
+    let out_len = if out_len_f.is_finite() && out_len_f >= 0.0 {
+        (out_len_f as usize).min(mono.len().saturating_mul(16))
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = i as f32 / ratio;
+        let i0 = (src_idx as usize).min(mono.len() - 1);
+        let i1 = (i0 + 1).min(mono.len() - 1);
+        let frac = src_idx - i0 as f32;
+        out.push(mono[i0] * (1.0 - frac) + mono[i1] * frac);
+    }
+    out
+}
+
 // ── Local whisper backend (feature-gated) ────────────────────────────
 
 #[cfg(feature = "stt")]
@@ -280,5 +355,170 @@ mod tests {
     fn engine_is_send_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<SttEngine>();
+    }
+
+    // ---------- to_whisper_pcm ----------
+
+    fn fmt(rate: u32, channels: u32) -> AudioFormat {
+        AudioFormat {
+            sample_rate: rate,
+            channel_count: channels,
+        }
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(to_whisper_pcm(&[], AudioFormat::mono_48k()).is_empty());
+    }
+
+    #[test]
+    fn zero_channel_format_does_not_panic_and_treats_as_mono() {
+        // channel_count == 0 is treated as 1 (we max with 1 to avoid
+        // divide-by-zero) — at 16 kHz the input should pass straight
+        // through.
+        let buf = vec![0.1, 0.2, 0.3, 0.4];
+        let out = to_whisper_pcm(&buf, fmt(16_000, 0));
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn zero_sample_rate_returns_empty() {
+        // A 0 Hz format should not panic on division and not produce
+        // bogus output. Drop the buffer.
+        let buf = vec![1.0, 2.0, 3.0];
+        assert!(to_whisper_pcm(&buf, fmt(0, 1)).is_empty());
+    }
+
+    #[test]
+    fn input_shorter_than_one_frame_returns_empty() {
+        // Stereo (2 ch) but only 1 sample → frames == 0. Must not
+        // index past the end.
+        let out = to_whisper_pcm(&[0.5], fmt(48_000, 2));
+        assert!(out.is_empty(), "expected empty, got {out:?}");
+    }
+
+    #[test]
+    fn matching_sample_rate_passes_through_mono() {
+        // 16 kHz mono input ⇒ identical mono output.
+        let buf: Vec<f32> = (0..1000).map(|i| (i as f32) * 0.001).collect();
+        let out = to_whisper_pcm(&buf, fmt(16_000, 1));
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn stereo_is_downmixed_by_averaging() {
+        // L=1.0, R=-1.0 at every frame → mono of zeros.
+        let buf: Vec<f32> = std::iter::repeat([1.0_f32, -1.0])
+            .take(16_000)
+            .flatten()
+            .collect();
+        let out = to_whisper_pcm(&buf, fmt(16_000, 2));
+        assert_eq!(out.len(), 16_000);
+        assert!(out.iter().all(|s| s.abs() < 1e-6));
+    }
+
+    #[test]
+    fn nan_and_inf_are_sanitized_to_zero() {
+        // Whisper.cpp segfaults on non-finite samples. Adversarial PCM
+        // from a malicious peer must be neutralised here.
+        let buf = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5];
+        let out = to_whisper_pcm(&buf, fmt(16_000, 1));
+        for (i, s) in out.iter().enumerate() {
+            assert!(s.is_finite(), "sample {i} = {s} is not finite");
+        }
+        // The 0.5 sample must survive sanitisation untouched.
+        assert!(out.iter().any(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn nan_does_not_propagate_across_downmix() {
+        // One NaN in a stereo frame must NOT poison the averaged mono
+        // sample. With the unguarded code (sum += NaN; sum / 2 == NaN)
+        // this test catches the regression.
+        let buf = vec![f32::NAN, 0.5];
+        let out = to_whisper_pcm(&buf, fmt(16_000, 2));
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn extreme_low_sample_rate_does_not_panic() {
+        // 1 kHz → 16 kHz is a 16× upsample. Without the saturation cap
+        // we'd allocate `16 * mono.len()` floats and might panic on
+        // overflow on 32-bit targets; here we just verify no panic.
+        let buf: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let out = to_whisper_pcm(&buf, fmt(1_000, 1));
+        assert!(!out.is_empty());
+        assert!(out.len() <= buf.len() * 16);
+    }
+
+    #[test]
+    fn extreme_high_sample_rate_downsamples() {
+        // 192 kHz → 16 kHz is 12× downsample.
+        let buf: Vec<f32> = (0..1920).map(|i| (i as f32).sin()).collect();
+        let out = to_whisper_pcm(&buf, fmt(192_000, 1));
+        // 12× shrink from 1920 ≈ 160. Allow a slack of ±1 for
+        // truncation.
+        assert!(
+            (159..=161).contains(&out.len()),
+            "expected ~160, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn extreme_sample_rate_8khz_upsamples_to_16k() {
+        // 8 kHz mono → 16 kHz should double the sample count.
+        let buf: Vec<f32> = (0..800).map(|i| (i as f32) * 0.01).collect();
+        let out = to_whisper_pcm(&buf, fmt(8_000, 1));
+        assert!((1599..=1601).contains(&out.len()), "got {}", out.len());
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn single_sample_mono_at_non_target_rate_no_panic() {
+        // mono.len() == 1, resample path: i0 == i1 == 0; the old code
+        // computed `(i0 + 1).min(mono.len() - 1)` which is fine but a
+        // future refactor that dropped the `.min()` would index OOB.
+        let out = to_whisper_pcm(&[0.5], fmt(8_000, 1));
+        // 2× upsample of 1 sample ⇒ 2 samples, both ≈ 0.5
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn stereo_48k_resamples_and_downmixes_in_one_pass() {
+        // The real participant-audio path: 48 kHz stereo → 16 kHz mono.
+        // L=1.0, R=-1.0 → averaged mono is 0.0 (a "drop one channel"
+        // bug would leave ±1.0); 480 frames at 48k → ~160 at 16k.
+        let frames = 480;
+        let mut input = Vec::with_capacity(frames * 2);
+        for _ in 0..frames {
+            input.push(1.0_f32);
+            input.push(-1.0_f32);
+        }
+        let out = to_whisper_pcm(&input, fmt(48_000, 2));
+        let expected = frames * 16_000 / 48_000;
+        assert!(
+            (out.len() as i64 - expected as i64).abs() <= 1,
+            "expected ~{expected} samples, got {}",
+            out.len(),
+        );
+        assert!(out.iter().all(|s| s.abs() < 1e-3));
+    }
+
+    #[test]
+    fn multichannel_above_stereo_is_averaged() {
+        // 6-channel (5.1-style): 3 channels at +1.0, 3 at -1.0 → mono
+        // average 0.0. Averaging must not panic or index past the end.
+        let frames = 1024;
+        let mut input = Vec::with_capacity(frames * 6);
+        for _ in 0..frames {
+            for c in 0..6 {
+                input.push(if c < 3 { 1.0 } else { -1.0 });
+            }
+        }
+        let out = to_whisper_pcm(&input, fmt(16_000, 6));
+        assert_eq!(out.len(), frames);
+        assert!(out.iter().all(|s| s.abs() < 1e-3));
     }
 }

@@ -7,10 +7,10 @@
 //! SDK client to the same channel.
 //!
 //! The MoQ subscriber side is intentionally NOT exercised: with no real
-//! SFU reachable, the bot's `run_moq_subscriber` task fails to connect to
+//! SFU reachable, the bot's `AvSession` task fails to connect to
 //! `/av/moq` and logs a warning. That failure is isolated in a spawned
-//! task and must not stop the bot from posting `[transcript] listening`
-//! / `session ended` lines. These tests pin exactly that.
+//! task and must not stop the bot from av-joining the call or posting
+//! its `[transcript] session ended.` line. These tests pin exactly that.
 //!
 //! The `stt` feature stays OFF — `stt::Whisper` is a no-op that returns
 //! empty transcriptions, which is fine because we never reach the audio
@@ -458,9 +458,10 @@ async fn scenario_2_cross_server_isolation() {
 
 // ───────────────────────────── scenario 3 ───────────────────────────────────
 
-/// Happy path: publisher starts a call; the bot av-joins and posts
-/// `[transcript] listening …`. Then the publisher ends the call; the bot
-/// posts `[transcript] session ended.` (no ANTHROPIC key → no summary).
+/// Happy path: publisher starts a call and the bot av-joins it
+/// (witnessed via the `av-state=joined` reflection). Then the publisher
+/// ends the call; the bot posts `[transcript] session ended.` (no
+/// ANTHROPIC key → no summary).
 #[tokio::test]
 async fn scenario_3_happy_path() {
     let server = spawn_server("happy-srv");
@@ -500,15 +501,6 @@ async fn scenario_3_happy_path() {
         .await
         .expect("bot never av-joined the call");
     assert!(!av_id.is_empty(), "av-join av-id is empty");
-
-    // Bot must post the listening line.
-    let listening = witness
-        .wait_for(SETTLE, |ev| match ev {
-            Event::Message { text, .. } if text.contains("[transcript] listening") => Some(()),
-            _ => None,
-        })
-        .await;
-    assert!(listening.is_some(), "bot never posted '[transcript] listening'");
 
     // Publisher ends the call with the matching av-id.
     publisher_av_state(&publisher.handle, "#avtest", "ended", Some(&av_id)).await;

@@ -9,26 +9,22 @@
 //! At most one active call at a time. If a second channel starts a
 //! call while we're transcribing one, we log and skip.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use freeq_av::{broadcast_path, AvConfig, AvParticipant, AvSession, Speaker};
 use freeq_sdk::auth::KeySigner;
 use freeq_sdk::client::{self, ClientHandle, ConnectConfig};
 use freeq_sdk::event::Event;
-use iroh_live::media::codec::{AudioCodec, VideoCodec};
-use iroh_live::media::format::{AudioPreset, VideoPreset};
-use iroh_live::media::publish::LocalBroadcast;
-use iroh_live::media::subscribe::RemoteBroadcast;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
-use crate::audio_tap::{PushAudioSource, Speaker, TapBackend, to_whisper_pcm};
 use crate::identity::Identity;
 use crate::imagegen::AiImageConfig;
-use crate::stt::SttEngine;
+use crate::stt::{to_whisper_pcm, SttEngine};
 use crate::video::VideoTile;
 use crate::{imagegen, qa, summary, tts};
 
@@ -806,12 +802,6 @@ async fn start_transcription(
         Some(u) => u.parse().with_context(|| format!("parsing --sfu-url {u:?}"))?,
         None => sfu_url_from_server(&cfg.server)?,
     };
-    let our_broadcast = format!("{session_id}/{}~{instance_id}", cfg.nick);
-    let cfg_for_task = cfg.clone();
-    let channel_for_task = channel.clone();
-    let handle_for_task = handle.clone();
-    let active_for_task = active.clone();
-    let session_for_task = session_id.clone();
 
     // The agent's video tile. The renderer thread runs for the call's
     // lifetime, producing audio-reactive frames; the audio path shares
@@ -819,28 +809,43 @@ async fn start_transcription(
     let video = VideoTile::new();
     video.spawn_renderer();
 
-    // Pair a Speaker (kept here) with a PushAudioSource (handed to the
-    // MoQ task, which publishes it as the bot's broadcast). Enqueueing
-    // on the Speaker makes the bot talk.
+    // Pair a Speaker (kept here) with a PushAudioSource (published by
+    // the AvSession as the bot's broadcast). Enqueueing on the Speaker
+    // makes the bot talk.
     let (speaker, push_source) = Speaker::new(video.level_handle());
 
-    let video_for_task = video.clone();
+    let av_config = AvConfig {
+        sfu_url,
+        session_id: session_id.clone(),
+        our_broadcast: broadcast_path(&session_id, &cfg.nick, &instance_id),
+        my_nick: cfg.nick.clone(),
+    };
+
+    // Dispatcher task: own the AvSession and spawn one transcription
+    // task per participant it taps. The transcription tasks live in a
+    // local JoinSet, so aborting this task (ActiveCall::drop on call
+    // end) drops the AvSession *and* every transcription task.
+    let cfg_for_task = cfg.clone();
+    let channel_for_task = channel.clone();
+    let handle_for_task = handle.clone();
+    let active_for_task = active.clone();
+    let video_for_session = video.clone();
+    let video_for_taps = video.clone();
     let task = tokio::spawn(async move {
-        if let Err(e) = run_moq_subscriber(
-            cfg_for_task,
-            sfu_url,
-            session_for_task,
-            our_broadcast,
-            channel_for_task,
-            push_source,
-            handle_for_task,
-            active_for_task,
-            video_for_task,
-        )
-        .await
-        {
-            tracing::warn!(error = ?e, "MoQ subscriber task ended");
+        let mut session =
+            AvSession::connect(av_config, push_source, move || video_for_session.source());
+        let mut taps: JoinSet<()> = JoinSet::new();
+        while let Some(participant) = session.recv().await {
+            taps.spawn(transcribe_participant(
+                cfg_for_task.clone(),
+                participant,
+                channel_for_task.clone(),
+                handle_for_task.clone(),
+                active_for_task.clone(),
+                video_for_taps.peer_level_handle(),
+            ));
         }
+        tracing::info!("AvSession ended");
     });
 
     Ok(ActiveCall {
@@ -853,184 +858,6 @@ async fn start_transcription(
         video,
         moq_task: task,
     })
-}
-
-/// Long-lived MoQ subscriber/publisher with automatic reconnect.
-///
-/// The MoQ session over the SFU does occasionally drop (network blip,
-/// SFU restart, transport idle). Without reconnect the bot would go
-/// permanently deaf + mute mid-call. This wraps [`run_moq_session`] in
-/// a backoff loop; the only thing that stops it is the whole task
-/// being aborted on call-end (see `ActiveCall`'s `Drop`).
-#[allow(clippy::too_many_arguments)]
-async fn run_moq_subscriber(
-    cfg: Arc<SharedConfig>,
-    sfu_url: url::Url,
-    session_id: String,
-    our_broadcast: String,
-    channel: String,
-    push_source: PushAudioSource,
-    handle: Arc<ClientHandle>,
-    active: Arc<AsyncMutex<Option<ActiveCall>>>,
-    video: VideoTile,
-) -> Result<()> {
-    let mut attempt: u32 = 0;
-    loop {
-        let started = std::time::Instant::now();
-        let result = run_moq_session(
-            &cfg,
-            &sfu_url,
-            &session_id,
-            &our_broadcast,
-            &channel,
-            // Fresh clone per attempt — same shared Speaker queue.
-            push_source.clone(),
-            &handle,
-            &active,
-            &video,
-        )
-        .await;
-        // A session that ran for a healthy while then dropped resets
-        // the backoff — only a tight failure loop escalates.
-        if started.elapsed() > Duration::from_secs(30) {
-            attempt = 0;
-        }
-        match result {
-            Ok(()) => {
-                tracing::info!("MoQ subscription stream ended cleanly");
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, "MoQ session error");
-            }
-        }
-        attempt = attempt.saturating_add(1);
-        let backoff = Duration::from_secs(2u64.pow(attempt.min(4))); // 2,4,8,16,16…
-        tracing::info!(?backoff, attempt, "reconnecting MoQ session");
-        tokio::time::sleep(backoff).await;
-    }
-}
-
-/// One MoQ session: connect, publish the bot's broadcast, tap every
-/// participant, until the transport drops. Tap tasks are owned by a
-/// local `JoinSet` so when this function returns (for any reason)
-/// they're all aborted — a reconnect starts every tap fresh rather
-/// than leaving zombies spinning on a dead transport.
-#[allow(clippy::too_many_arguments)]
-async fn run_moq_session(
-    cfg: &Arc<SharedConfig>,
-    sfu_url: &url::Url,
-    session_id: &str,
-    our_broadcast: &str,
-    channel: &str,
-    push_source: PushAudioSource,
-    handle: &Arc<ClientHandle>,
-    active: &Arc<AsyncMutex<Option<ActiveCall>>>,
-    video: &VideoTile,
-) -> Result<()> {
-    let my_nick = cfg.nick.clone();
-    let session_prefix = format!("{session_id}/");
-    let mut client_config = moq_native::ClientConfig::default();
-    client_config.tls.disable_verify = Some(true);
-    client_config.backend = Some(moq_native::QuicBackend::Noq);
-    let client = client_config.init()?;
-
-    // Publish the bot's own broadcast — an Opus audio stream fed by the
-    // PushAudioSource (silence until the bot speaks) plus an H.264 video
-    // tile (the audio-reactive presence / visual-aid cards).
-    let broadcast = LocalBroadcast::new();
-    broadcast
-        .audio()
-        .set(push_source, AudioCodec::Opus, [AudioPreset::Hq])
-        .context("setting bot broadcast audio source")?;
-    broadcast
-        .video()
-        .set_source(video.source(), VideoCodec::H264, [VideoPreset::P360])
-        .context("setting bot broadcast video source")?;
-    let pub_origin = moq_lite::Origin::produce();
-    pub_origin.publish_broadcast(our_broadcast, broadcast.consume());
-
-    let sub_origin = moq_lite::Origin::produce();
-    let mut sub_consumer = sub_origin.consume();
-
-    let session_handle = client
-        .with_publish(pub_origin.consume())
-        .with_consume(sub_origin)
-        .connect(sfu_url.clone())
-        .await
-        .context("MoQ connect")?;
-
-    // Keep the encoder alive for the session's lifetime.
-    let _broadcast = broadcast;
-    tracing::info!(%our_broadcast, "MoQ connected — publishing bot audio + watching participants");
-
-    // Tap tasks live here — dropping the JoinSet on return aborts them.
-    let mut taps: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let mut tapped: HashSet<String> = HashSet::new();
-
-    loop {
-        tokio::select! {
-            announced = sub_consumer.announced() => {
-                match announced {
-                    Some((path, Some(broadcast_consumer))) => {
-                        let path_str = path.to_string();
-                        if path_str == our_broadcast {
-                            continue;
-                        }
-                        // Only tap broadcasts in *our* session — the SFU
-                        // announces everything, including stale broadcasts
-                        // from prior sessions (no live catalog → "no
-                        // audio renditions").
-                        if !path_str.starts_with(&session_prefix) {
-                            tracing::debug!(%path_str, "skipping broadcast outside our session");
-                            continue;
-                        }
-                        let last = path_str.split('/').last().unwrap_or("unknown");
-                        let nick = last.split('~').next().unwrap_or(last).to_string();
-                        // Skip the bot's own broadcast — that's our TTS
-                        // audio; transcribing it would be a feedback loop.
-                        if nick.eq_ignore_ascii_case(&my_nick) {
-                            continue;
-                        }
-                        if !tapped.insert(path_str.clone()) {
-                            continue;
-                        }
-                        tracing::info!(%nick, %path_str, "subscribing to participant");
-
-                        let cfg = cfg.clone();
-                        let channel = channel.to_string();
-                        let handle = handle.clone();
-                        let active = active.clone();
-                        let peer_level = video.peer_level_handle();
-                        taps.spawn(async move {
-                            if let Err(e) = tap_participant(
-                                cfg,
-                                path_str,
-                                broadcast_consumer,
-                                nick,
-                                channel,
-                                handle,
-                                active,
-                                peer_level,
-                            )
-                            .await
-                            {
-                                tracing::warn!(error = ?e, "tap task ended");
-                            }
-                        });
-                    }
-                    Some((path, None)) => {
-                        tracing::info!(path = %path.to_string(), "participant broadcast removed");
-                    }
-                    None => {
-                        return Ok(()); // subscription stream closed
-                    }
-                }
-            }
-            res = session_handle.closed() => {
-                anyhow::bail!("MoQ transport closed: {res:?}");
-            }
-        }
-    }
 }
 
 // ── Voice-activity segmentation tuning ──────────────────────────────
@@ -1083,44 +910,25 @@ fn is_hallucination(text: &str) -> bool {
     )
 }
 
-/// One per remote broadcast: subscribes to its audio and segments it
-/// into utterances by voice activity — accumulate while the speaker is
-/// talking, flush to STT on a natural pause. This kills both the
-/// "Thank you." silence hallucinations (silent stretches never reach
-/// STT) and the mid-sentence splits (we cut at pauses, not on a fixed
-/// clock).
-#[allow(clippy::too_many_arguments)]
-async fn tap_participant(
+/// Consume one participant's decoded-PCM stream (from an [`AvSession`])
+/// and segment it into utterances by voice activity — accumulate while
+/// the speaker is talking, flush to STT on a natural pause. This kills
+/// both the "Thank you." silence hallucinations (silent stretches never
+/// reach STT) and the mid-sentence splits (we cut at pauses, not on a
+/// fixed clock).
+async fn transcribe_participant(
     cfg: Arc<SharedConfig>,
-    path_str: String,
-    broadcast_consumer: moq_lite::BroadcastConsumer,
-    nick: String,
+    participant: AvParticipant,
     channel: String,
     handle: Arc<ClientHandle>,
     active: Arc<AsyncMutex<Option<ActiveCall>>>,
     // Shared loudness cell — fed the participant's level so the video
     // presence can show a "listening" mood when a human is talking.
     peer_level: Arc<std::sync::atomic::AtomicU32>,
-) -> Result<()> {
+) {
+    let AvParticipant { path, nick, mut audio } = participant;
     let stt = cfg.stt.clone();
-    let remote = RemoteBroadcast::new(&path_str, broadcast_consumer)
-        .await
-        .context("RemoteBroadcast::new")?;
-    let (backend, mut rx) = TapBackend::channel();
-    // `audio_ready()` blocks on the catalog watcher until the broadcast
-    // advertises an audio rendition, then subscribes. The plain
-    // `audio()` is a one-shot catalog read — a participant who joined
-    // before their mic catalog populated (or whose Opus track lands a
-    // beat after the broadcast is announced) fails permanently with
-    // "no audio renditions". Same race we hit on the video path.
-    let _audio_track = match remote.audio_ready(&backend).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(%nick, error = ?e, "audio subscribe failed");
-            return Ok(());
-        }
-    };
-    tracing::info!(%nick, "audio track live — transcribing");
+    tracing::info!(%nick, %path, "participant audio live — transcribing");
 
     // Utterance accumulator + VAD state.
     let mut buf: Vec<f32> = Vec::new();
@@ -1128,7 +936,7 @@ async fn tap_participant(
     let mut trailing_silence: usize = 0;
     let mut frames_seen: u64 = 0;
 
-    while let Some(frame) = rx.recv().await {
+    while let Some(frame) = audio.recv().await {
         frames_seen += 1;
         let pcm = to_whisper_pcm(&frame.samples, frame.format);
         if pcm.is_empty() {
@@ -1302,7 +1110,7 @@ async fn tap_participant(
             }
         });
     }
-    Ok(())
+    tracing::info!(%nick, "participant audio stream ended");
 }
 
 /// Derive the MoQ SFU URL from the IRC server URL. Same host, /av/moq
@@ -1477,7 +1285,6 @@ fn _pathbuf_marker() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use tokio::sync::mpsc;
 
     // ---------- sfu_url_from_server ----------
