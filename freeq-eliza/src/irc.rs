@@ -515,14 +515,19 @@ async fn answer_and_speak(
         };
 
     // A visual question we can actually see → the vision model with the
-    // asker's latest frame; otherwise the normal streaming QA. Either
-    // way, completed sentences go to the speaker task.
+    // asker's latest frame. A visual question with no frame → a useful
+    // hint (otherwise QA answers "I'm a language model"). Anything else
+    // → the normal streaming QA. Completed sentences always go to the
+    // speaker task.
     let mut chunker = qa::SentenceChunker::new();
-    let frame = asker_video
-        .filter(|_| vision::is_visual_question(&question))
-        .and_then(|vh| vh.latest());
+    let visual = vision::is_visual_question(&question);
+    let frame = if visual {
+        asker_video.as_ref().and_then(|vh| vh.latest())
+    } else {
+        None
+    };
 
-    let result = if let Some(frame) = frame {
+    let result: Result<qa::Answer> = if let Some(frame) = frame {
         tracing::info!("answering as a visual question");
         vision::describe(&cfg.http, key, &cfg.vision_model, &question, &frame)
             .await
@@ -532,6 +537,13 @@ async fn answer_and_speak(
                 }
                 qa::Answer { text, source: None }
             })
+    } else if visual {
+        tracing::info!("visual question but no video frame from asker");
+        let text = "I can't see anything right now — turn on your camera or share your screen, then ask again.".to_string();
+        for sentence in chunker.push(&text) {
+            let _ = tx.send(sentence);
+        }
+        Ok(qa::Answer { text, source: None })
     } else {
         qa::answer_streaming(
             &cfg.http,
