@@ -61,15 +61,19 @@ pub fn split_speech_and_links(text: &str) -> (String, Vec<String>) {
                 }
             }
         }
-        // Any HTML tag (<img …>, <video …>, <iframe …>, etc.) — drop
-        // the whole tag. Catches `<img src="…" alt="…">` and the same
-        // shape for video/iframe/audio. Inner content for tags like
-        // `<a>label</a>` will still survive (we strip the tag markers,
-        // not the text between them) — handled by stripping just up to
-        // the next `>`.
+        // Any HTML/XML-ish tag — drop it. Two cases:
+        //
+        // 1. A paired `<tag>…</tag>` block (e.g. `<tool>python(print("…"))</tool>`).
+        //    Agentic LLMs emit these as tool-call envelopes — the content
+        //    inside is implementation noise (code, JSON, scratch state)
+        //    that must NEVER be spoken. We strip the entire span.
+        //
+        // 2. An unpaired tag (`<img src=…>`, a stray `<video>` opener with
+        //    no close in this chunk). Strip up to the next `>`.
+        //
+        // Bare `<` not followed by alpha or `/` is preserved (so literal
+        // `"5 < 10"` survives).
         if rest.starts_with('<') {
-            // Only treat as a tag if it starts with `<` + ASCII alpha
-            // or `</`. Otherwise it's likely literal punctuation.
             let after = &rest[1..];
             let looks_like_tag = after
                 .chars()
@@ -77,6 +81,30 @@ pub fn split_speech_and_links(text: &str) -> (String, Vec<String>) {
                 .is_some_and(|c| c == '/' || c.is_ascii_alphabetic());
             if looks_like_tag {
                 if let Some(end) = rest.find('>') {
+                    // Try the paired form: extract the tag name (skip any
+                    // leading `/` on closers; the name runs until the
+                    // first non-word char). If we find a matching
+                    // `</name>` *after* this opener, drop everything from
+                    // here through that closer.
+                    if let Some(name) = parse_tag_name(&rest[1..end]) {
+                        let close_marker = format!("</{name}");
+                        let search_from = end + 1;
+                        if search_from < rest.len() {
+                            // Case-insensitive search for the closer.
+                            let hay_lower = rest[search_from..].to_lowercase();
+                            let close_lower = close_marker.to_lowercase();
+                            if let Some(rel_close) = hay_lower.find(&close_lower) {
+                                let close_abs = search_from + rel_close;
+                                // Skip past the closer's `>`.
+                                if let Some(close_end) = rest[close_abs..].find('>') {
+                                    rest = &rest[close_abs + close_end + 1..];
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Unpaired (or no close in this chunk): drop the tag
+                    // alone — content after it, if any, is spoken.
                     rest = &rest[end + 1..];
                     continue;
                 }
@@ -120,6 +148,35 @@ pub fn split_speech_and_links(text: &str) -> (String, Vec<String>) {
     // Collapse the whitespace left where URLs were removed.
     let spoken = spoken.split_whitespace().collect::<Vec<_>>().join(" ");
     (spoken, links)
+}
+
+/// Pull the tag name out of the body of an opening tag — i.e. what's
+/// between `<` and `>` in `<tool foo="bar">` is `tool foo="bar"`, and
+/// the name is `tool`. Returns `None` if the body doesn't start with a
+/// letter (which means it's a closer like `/tool` or junk). We only
+/// keep ASCII alphanumeric/`-`/`_` characters for the name — enough
+/// for every real tag, and conservative against pathological input.
+fn parse_tag_name(body: &str) -> Option<String> {
+    let body = body.trim_start();
+    let mut chars = body.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut name = String::new();
+    name.push(first.to_ascii_lowercase());
+    for c in chars {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            name.push(c.to_ascii_lowercase());
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Whether `url` looks like an image or video — we use this to decide
@@ -260,6 +317,47 @@ mod tests {
             let (spoken, _) = split_speech_and_links(&format!("before {tag} after"));
             assert_eq!(spoken, "before after", "tag wasn't stripped: {tag}");
         }
+    }
+
+    #[test]
+    fn paired_tool_block_strips_inner_content() {
+        // Agentic Groq compound model emitted exactly this in production
+        // and we were speaking the python code aloud. The whole block
+        // must be gone — content included.
+        let leaky = r#"Yes, I can hear you clearly. <tool>python(print("Scene card: 'Audio Connection', key points: ['Hearing confirmed']"))</tool>"#;
+        let (spoken, _) = split_speech_and_links(leaky);
+        assert!(!spoken.to_lowercase().contains("scene card"), "leaked: {spoken:?}");
+        assert!(!spoken.to_lowercase().contains("python"), "leaked: {spoken:?}");
+        assert!(!spoken.to_lowercase().contains("hearing confirmed"), "leaked: {spoken:?}");
+        assert!(spoken.contains("hear you clearly"));
+    }
+
+    #[test]
+    fn paired_function_call_block_strips_inner_content() {
+        // Different envelope same lesson — function/function_call/code
+        // blocks are all tool-call artifacts.
+        for tag in ["function", "function_call", "code"] {
+            let s = format!("Answer: <{tag}>secret_internal_payload</{tag}> done.");
+            let (spoken, _) = split_speech_and_links(&s);
+            assert!(
+                !spoken.to_lowercase().contains("secret_internal_payload"),
+                "leaked from <{tag}>: {spoken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpaired_tag_only_strips_the_tag_itself() {
+        // No matching close in this chunk → fall back to single-tag drop
+        // so the rest of the prose still survives.
+        let (spoken, _) = split_speech_and_links("Look <span>at this");
+        assert_eq!(spoken, "Look at this");
+    }
+
+    #[test]
+    fn paired_tag_match_is_case_insensitive() {
+        let (spoken, _) = split_speech_and_links("a <TOOL>x</tool> b");
+        assert_eq!(spoken, "a b");
     }
 
     #[test]

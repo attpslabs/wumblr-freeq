@@ -41,14 +41,13 @@ const TICK: Duration = Duration::from_secs(8);
 /// Lead-in before the first tick fires. Long enough to gather a handful
 /// of words; short enough that she manifests almost immediately.
 const FIRST_TICK_DELAY: Duration = Duration::from_secs(4);
-/// Smallest gap between concrete-subject scene escalations. An image
-/// backdrop is loud; back-to-back swaps would make the tile feel twitchy.
-/// Still short enough that a sustained topic gets a real image within
-/// half a minute.
-const SCENE_COOLDOWN: Duration = Duration::from_secs(30);
+/// Smallest gap between scene escalations. Short — a fresh visual on
+/// roughly every other ambient tick keeps the tile feeling alive.
+/// Existing scenes get replaced; the renderer fades the new one in.
+const SCENE_COOLDOWN: Duration = Duration::from_secs(15);
 /// Don't escalate while she just spoke — her own scene/board is still
 /// the right visual.
-const POST_ANSWER_GRACE: Duration = Duration::from_secs(12);
+const POST_ANSWER_GRACE: Duration = Duration::from_secs(10);
 /// Need at least this many new transcript words since the last tick to
 /// even bother calling the LLM. Avoids a hot loop while the call is silent.
 const MIN_NEW_WORDS: usize = 5;
@@ -58,20 +57,25 @@ const RECENT_CONCEPTS_MAX: usize = 4;
 
 const AMBIENT_SYSTEM: &str = "You are watching a live voice conversation. \
 Your job is to PICK a single short concept that captures what's being \
-talked about right now, plus a colour that *feels* like it. The picks \
-drive Eliza's silent video tile — they should never speak, only paint.\n\n\
+talked about right now, a colour that *feels* like it, AND an image \
+prompt that visualizes it. The picks drive Eliza's silent video tile — \
+she never speaks them, the tile just paints.\n\n\
 Output strictly JSON, no prose, no markdown:\n\
-{\"concept\": \"1-3 short words\", \"accent\": \"#RRGGBB\", \"image_query\": \"concrete subject or empty\"}\n\n\
+{\"concept\": \"1-3 short words\", \"accent\": \"#RRGGBB\", \"image_query\": \"vivid image prompt\"}\n\n\
 Rules:\n\
 - `concept` is what the conversation is ABOUT — a topic, not an emotion. \
   1-3 words max. Title case. Examples: \"Deep Ocean\", \"Apollo Program\", \
-  \"Slow Mornings\", \"Bridge Engineering\".\n\
+  \"Social Unrest\", \"Bridge Engineering\".\n\
 - `accent` is a hex colour that evokes the topic. Be playful — moss green \
-  for plants, deep blue for water, copper for rust, neon for futurism.\n\
-- `image_query` is OPTIONAL. Only fill it when the topic is a SPECIFIC \
-  concrete subject a viewer could picture in a photo: a named person, \
-  place, animal, object, event, artwork, organism. NEVER fill it for \
-  abstract topics (feelings, opinions, meta-talk, software process, math).\n\
+  for plants, deep blue for water, copper for rust, neon for futurism, \
+  blood red for conflict.\n\
+- `image_query` MUST be filled. Always. It is a vivid, evocative search/\
+  image-generation prompt that depicts the concept — 4-10 words, concrete \
+  visual language. For literal subjects, name the subject (\"Eiffel Tower \
+  at night\", \"Apollo 11 lunar lander\"). For abstract topics, paint a \
+  scene that *evokes* them (\"protest crowd at night with torches\" for \
+  Social Unrest, \"empty office at dawn\" for Burnout, \"glowing neural \
+  network diagram\" for Machine Learning). NEVER leave it empty.\n\
 - Do NOT repeat a concept the user has recently shown (a list is provided). \
   Pick a different angle if needed.\n\
 - If the snippet is too small or off-topic for a confident pick, output \
