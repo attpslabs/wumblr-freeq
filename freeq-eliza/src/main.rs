@@ -51,9 +51,13 @@ struct Cli {
     #[arg(long, default_values_t = vec!["#avtest".to_string()])]
     channel: Vec<String>,
 
-    /// Bot identity name. Files live at `~/.freeq/bots/<name>/`.
-    #[arg(long, default_value = "eliza")]
-    name: String,
+    /// Bot identity name. Files live at `~/.freeq/bots/<name>/`. When
+    /// not given, defaults to the active character ("eliza" for the
+    /// SVG backend; the `--ghostly-character` value for the particles
+    /// backend) — so each character gets its own DID + nick rather
+    /// than colliding on "eliza".
+    #[arg(long)]
+    name: Option<String>,
 
     /// IRC nick. Defaults to the identity name.
     #[arg(long)]
@@ -167,10 +171,24 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
-    let nick = cli.nick.clone().unwrap_or_else(|| cli.name.clone());
+    // Identity defaults to the active character — `--render-backend
+    // particles --ghostly-character oblivion` lands in
+    // `~/.freeq/bots/oblivion/` with a fresh DID and bound nick
+    // "oblivion", instead of sharing eliza's identity and getting
+    // server-side rebound to her nick. Explicit `--name` always wins.
+    let identity_name = cli.name.clone().unwrap_or_else(|| {
+        if cli.render_backend == "particles" && !cli.ghostly_character.is_empty() {
+            cli.ghostly_character.clone()
+        } else {
+            "eliza".to_string()
+        }
+    });
+    // Nick defaults to the identity name, so a freshly-minted oblivion
+    // identity advertises itself as `oblivion` on the channel.
+    let nick = cli.nick.clone().unwrap_or_else(|| identity_name.clone());
 
     // Load or create the bot's did:key identity.
-    let ident = identity::load_or_create(&cli.name).context("loading bot identity")?;
+    let ident = identity::load_or_create(&identity_name).context("loading bot identity")?;
     tracing::info!(did = %ident.did, "bot identity ready");
 
     // Pick the STT backend. Priority: Groq (hosted, fast, no local
