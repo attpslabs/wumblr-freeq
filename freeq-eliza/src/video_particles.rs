@@ -1,0 +1,156 @@
+//! Alternative tile renderer — ghostly particle face.
+//!
+//! Activated by `--render-backend particles --ghostly-character NAME`.
+//! Replaces the SVG presence with a procedural particle face from the
+//! sibling [`ghostly`] crate.
+//!
+//! ## Mood → Emotion mapping
+//!
+//! The SVG path categorises Eliza into five moods (Idle, Listening,
+//! Thinking, Speaking, Vision). Ghostly's sentiment system has eight
+//! emotion targets; we map the moods to the closest emotion so the
+//! palette shifts visibly per mood:
+//!
+//! | Mood      | Emotion (ghostly) |
+//! | --------- | ----------------- |
+//! | Idle      | Calm              |
+//! | Listening | Curiosity         |
+//! | Thinking  | Curiosity         |
+//! | Speaking  | Passion           |
+//! | Vision    | Awe               |
+//!
+//! The emotion is applied at low intensity (~0.45) so the *character's*
+//! own palette still reads as the dominant identity.
+//!
+//! ## What's not wired (yet)
+//!
+//! - Scene cards, whiteboards, ambient HUD, vision PiP, EQ strip —
+//!   these are SVG-only overlays. On the particles backend
+//!   `show_scene` / `show_board` / `set_vision_thumb` / `set_ambient`
+//!   become no-ops in the user-visible output (the SVG-side state
+//!   still updates but isn't rendered). Composite mode is future work.
+//! - Lip-sync mouth — the SVG face's `level`-driven mouth aperture
+//!   does not yet drive the particle field. We pass `level` into the
+//!   per-frame breath so the whole face pulses with her speech, but a
+//!   true lip-syncing geometry update is TODO.
+
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use ghostly::{
+    apply_emotion, characters as gho_characters, Character as GhoCharacter, Emotion, FaceState,
+    RenderSettings, Renderer,
+};
+use iroh_live::media::format::VideoFrame;
+
+use crate::video::{VideoTile, VIDEO_H, VIDEO_W};
+
+const FPS: u64 = 15;
+/// Particle count at 640×360. ~12K reads as a dense face on CPU at
+/// 15 fps with budget to spare. Bump for higher resolutions.
+const PARTICLES: usize = 12_000;
+/// Emotion-blend intensity — how strongly the mood mood overrides the
+/// character's resting palette. Low so a fully-Joy Eliza still reads as
+/// Eliza, not a generic solar face.
+const EMOTION_INTENSITY: f32 = 0.45;
+
+/// Particle-backend render loop. Drains the tile's mood/audio cells
+/// each frame, picks an emotion + intensity, asks ghostly to render,
+/// and publishes the frame back to the tile.
+pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
+    let base_character = match gho_characters::by_name(character_name) {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                character = %character_name,
+                "unknown ghostly character; falling back to 'eliza'"
+            );
+            gho_characters::by_name("eliza").expect("eliza always exists")
+        }
+    };
+    tracing::info!(character = %base_character.name, particles = PARTICLES, "particle-face renderer started");
+
+    let settings = RenderSettings {
+        width: VIDEO_W,
+        height: VIDEO_H,
+        ..RenderSettings::default()
+    };
+    let Some(mut renderer) = Renderer::new(settings) else {
+        tracing::error!("particle renderer: failed to allocate {VIDEO_W}x{VIDEO_H} pixmap");
+        return;
+    };
+
+    let state = FaceState::new(&base_character, PARTICLES, 2.8, 42);
+    // Most recently-rebuilt character — apply_emotion produces a new
+    // value, but we don't want to rebuild every frame when the
+    // emotion is steady. Compare against the last applied (emotion,
+    // intensity) and reuse when unchanged.
+    let mut current_character = apply_emotion(&base_character, Emotion::Calm, EMOTION_INTENSITY);
+    let mut last_applied: (Emotion, u32) = (Emotion::Calm, quantize(EMOTION_INTENSITY));
+
+    let frame_dt = Duration::from_millis(1000 / FPS);
+    let started = Instant::now();
+    while tile.running.load(Ordering::Relaxed) {
+        let tick = Instant::now();
+        let t = started.elapsed().as_secs_f32();
+
+        // Snapshot the same signals the SVG loop reads.
+        let level = f32::from_bits(tile.level.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+        let peer = f32::from_bits(tile.peer_level.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+        let thinking = tile.thinking.load(Ordering::Relaxed);
+        let has_vision_thumb = tile
+            .vision_thumb
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+
+        // Mood classification — mirrors `presence_svg` in video.rs.
+        let emotion = if has_vision_thumb {
+            Emotion::Awe
+        } else if level > 0.03 {
+            Emotion::Passion
+        } else if thinking {
+            Emotion::Curiosity
+        } else if peer > 0.03 {
+            Emotion::Curiosity
+        } else {
+            Emotion::Calm
+        };
+
+        // Re-blend the character only when the emotion changes — cheap
+        // but not free (rebuilds the contour path Vec).
+        let key = (emotion, quantize(EMOTION_INTENSITY));
+        if key != last_applied {
+            current_character = apply_emotion(&base_character, emotion, EMOTION_INTENSITY);
+            last_applied = key;
+        }
+
+        let pixmap = renderer.render(&current_character, &state, t);
+
+        // Publish the frame. Match the iroh-live frame format the SVG
+        // path produces (RGBA, same dimensions, zero timestamp — the
+        // encoder timestamps frames itself).
+        let data = Bytes::copy_from_slice(pixmap.data());
+        let frame = VideoFrame::new_rgba(data, VIDEO_W, VIDEO_H, Duration::ZERO);
+        if let Ok(mut g) = tile.latest.lock() {
+            *g = Some(frame);
+        }
+
+        if let Some(rest) = frame_dt.checked_sub(tick.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    tracing::info!("particle-face renderer stopped");
+    // Silence unused-import warning when this fn returns.
+    let _ = std::mem::size_of::<GhoCharacter>();
+}
+
+/// Quantize intensity to a u32 so a small change doesn't churn the
+/// "did the blend change?" check. `0.001` resolution is more than the
+/// renderer can perceive.
+#[inline]
+fn quantize(f: f32) -> u32 {
+    (f * 1000.0) as u32
+}

@@ -142,6 +142,17 @@ struct Cli {
     /// extra cost (one fast LLM call every 20s) when you don't want it.
     #[arg(long)]
     no_ambient: bool,
+
+    /// Video tile renderer: `svg` (default — full freeq cyberpunk
+    /// presence with EQ strip, scene cards, ambient HUD, vision PiP) or
+    /// `particles` (ghostly particle face — face only, no overlays).
+    #[arg(long, default_value = "svg")]
+    render_backend: String,
+
+    /// Ghostly character used when `--render-backend particles`. One of
+    /// `eliza`, `narrator`, `utopia`, `oblivion`.
+    #[arg(long, default_value = "eliza")]
+    ghostly_character: String,
 }
 
 #[tokio::main]
@@ -231,6 +242,8 @@ async fn main() -> Result<()> {
         image_ai,
         proactive_enabled: !cli.no_proactive,
         ambient_enabled: !cli.no_ambient,
+        render_backend: cli.render_backend.clone(),
+        ghostly_character: cli.ghostly_character.clone(),
     })
     .await
 }

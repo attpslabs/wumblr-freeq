@@ -171,20 +171,43 @@ impl Scene {
     }
 }
 
+/// Which renderer powers the tile.
+///
+/// - `Svg` (default) is the full freeq cyberpunk presence — corner
+///   brackets, EQ strip, state sticker, HUD chip, scene cards,
+///   whiteboards, vision PiP, ambient topic. Owns every overlay the
+///   rest of `freeq-eliza` orchestrates.
+/// - `Particles { character }` is the ghostly particle-face renderer —
+///   a 12K-particle procedural face from `~/src/ghostly`. Scene cards,
+///   whiteboards, and the ambient HUD are NO-OPS on this path (the
+///   particle render is a single-layer face, not a UI). Mood + audio
+///   level still drive palette and breath.
+#[derive(Clone, Debug)]
+pub enum Backend {
+    Svg,
+    Particles { character: String },
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Backend::Svg
+    }
+}
+
 /// Shared handle to eliza's video tile. Clone-cheap.
 #[derive(Clone)]
 pub struct VideoTile {
-    latest: Arc<Mutex<Option<VideoFrame>>>,
+    pub(crate) latest: Arc<Mutex<Option<VideoFrame>>>,
     /// eliza's own speech loudness, `f32` bits in `[0,1]`.
-    level: Arc<AtomicU32>,
+    pub(crate) level: Arc<AtomicU32>,
     /// Loudest participant's loudness — drives the "listening" mood.
-    peer_level: Arc<AtomicU32>,
+    pub(crate) peer_level: Arc<AtomicU32>,
     /// Set while an LLM call is in flight — drives the "thinking" mood.
-    thinking: Arc<AtomicBool>,
+    pub(crate) thinking: Arc<AtomicBool>,
     /// `data:image/jpeg;base64,…` of the frame currently being analyzed
     /// by the vision model. While set, the tile shows a PiP of it and
     /// flips into [`Mood::Vision`].
-    vision_thumb: Arc<Mutex<Option<String>>>,
+    pub(crate) vision_thumb: Arc<Mutex<Option<String>>>,
     scene: Arc<Mutex<Option<Scene>>>,
     /// Whiteboard takes priority over the scene card when both are set.
     board: Arc<Mutex<Option<Board>>>,
@@ -193,11 +216,19 @@ pub struct VideoTile {
     ambient: Arc<Mutex<Option<Ambient>>>,
     /// Hands out a fresh id per scene so async image jobs can target one.
     next_id: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
+    pub(crate) running: Arc<AtomicBool>,
+    /// Which renderer to spawn. Cloned into the render thread.
+    backend: Backend,
 }
 
 impl VideoTile {
     pub fn new() -> Self {
+        Self::with_backend(Backend::Svg)
+    }
+
+    /// Build a tile with an explicit renderer choice. CLI plumbs this
+    /// from `--render-backend` + `--ghostly-character`.
+    pub fn with_backend(backend: Backend) -> Self {
         Self {
             latest: Arc::new(Mutex::new(None)),
             level: Arc::new(AtomicU32::new(0)),
@@ -209,6 +240,7 @@ impl VideoTile {
             ambient: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
+            backend,
         }
     }
 
@@ -331,9 +363,15 @@ impl VideoTile {
     /// Spawn the render loop on a dedicated thread.
     pub fn spawn_renderer(&self) {
         let tile = self.clone();
+        let backend = tile.backend.clone();
         std::thread::Builder::new()
             .name("eliza-video".into())
-            .spawn(move || tile.render_loop())
+            .spawn(move || match backend {
+                Backend::Svg => tile.render_loop(),
+                Backend::Particles { character } => {
+                    crate::video_particles::render_loop(tile, &character)
+                }
+            })
             .expect("spawn video renderer");
     }
 

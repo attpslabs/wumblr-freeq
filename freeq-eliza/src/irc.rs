@@ -80,6 +80,11 @@ pub struct RunConfig {
     /// listens, and escalates to an image scene on concrete subjects.
     /// Toggle with `--no-ambient` on the CLI.
     pub ambient_enabled: bool,
+    /// Video tile renderer choice. `svg` = the rich freeq presence;
+    /// `particles` = ghostly particle face.
+    pub render_backend: String,
+    /// Ghostly character name when `render_backend == "particles"`.
+    pub ghostly_character: String,
 }
 
 /// Subset of [`RunConfig`] shared with inner tasks. Excludes the
@@ -113,6 +118,10 @@ pub(crate) struct SharedConfig {
     pub(crate) proactive_enabled: bool,
     /// Whether the ambient monitor runs (`--no-ambient` disables it).
     pub(crate) ambient_enabled: bool,
+    /// Renderer choice — `"svg"` (default) or `"particles"`.
+    pub(crate) render_backend: String,
+    /// Ghostly character name when `render_backend == "particles"`.
+    pub(crate) ghostly_character: String,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
@@ -186,6 +195,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         image_ai,
         proactive_enabled,
         ambient_enabled,
+        render_backend,
+        ghostly_character,
     } = cfg;
 
     // Pick websocket vs raw-TCP transport based on URL scheme — mirrors
@@ -270,6 +281,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         image_ai,
         proactive_enabled,
         ambient_enabled,
+        render_backend,
+        ghostly_character,
         http: reqwest::Client::new(),
         started_at: Instant::now(),
     });
@@ -927,7 +940,13 @@ async fn start_transcription(
     // The agent's video tile. The renderer thread runs for the call's
     // lifetime, producing audio-reactive frames; the audio path shares
     // the loudness cell so the presence pulses with eliza's voice.
-    let video = VideoTile::new();
+    let backend = match cfg.render_backend.as_str() {
+        "particles" => crate::video::Backend::Particles {
+            character: cfg.ghostly_character.clone(),
+        },
+        _ => crate::video::Backend::Svg,
+    };
+    let video = VideoTile::with_backend(backend);
     video.spawn_renderer();
 
     // Pair a Speaker (kept here) with a PushAudioSource (published by
