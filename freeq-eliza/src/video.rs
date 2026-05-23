@@ -1555,6 +1555,131 @@ fn timeline_body(s: &SceneSpec, e: f32, accent: &str) -> String {
     format!("{titlesvg}{underline}{nodes}")
 }
 
+// ---------------------------------------------------------------------
+// Overlay layer for the particles render backend
+// ---------------------------------------------------------------------
+
+/// Build an SVG layer that contains JUST the rich overlays from this
+/// module — scene card (with backdrop image), whiteboard, ambient HUD
+/// chip, vision PiP — without the orb / corner brackets / EQ strip /
+/// state sticker (those would fight the particle face).
+///
+/// Returns `None` when nothing's worth drawing — so the particles
+/// renderer can skip the rasterize + composite step on quiet frames.
+/// The caller (`video_particles::render_loop`) rasterizes the SVG to
+/// a Pixmap and draw-pixmaps it on top of the particle field.
+///
+/// `time` is monotonic seconds since the renderer started (drives the
+/// HUD blink + the no-image backdrop's drifting glow).
+pub(crate) fn overlay_svg_for_particles(tile: &VideoTile, time: f32) -> Option<String> {
+    // ── Snapshot the overlay state ──
+    let scene_data = tile.scene.lock().ok().and_then(|g| {
+        g.as_ref().filter(|s| s.is_visible()).map(|s| {
+            let e = s.shown_at.elapsed().as_secs_f32();
+            let body = match s.spec.kind {
+                SceneKind::Hero => hero_body(&s.spec, e, &s.spec.accent),
+                SceneKind::KeyPoints => key_points_body(&s.spec, e, &s.spec.accent),
+                SceneKind::Stat => stat_body(&s.spec, e, &s.spec.accent),
+                SceneKind::Quote => quote_body(&s.spec, e, &s.spec.accent),
+                SceneKind::Timeline => timeline_body(&s.spec, e, &s.spec.accent),
+            };
+            let image = s
+                .image
+                .as_ref()
+                .map(|(uri, at)| (uri.clone(), at.elapsed().as_secs_f32()));
+            (s.spec.accent.clone(), body, image)
+        })
+    });
+    let board_data = tile.board.lock().ok().and_then(|g| {
+        g.as_ref().filter(|b| b.is_visible()).map(|b| {
+            let elapsed_ms = b.shown_at.elapsed().as_millis() as u32;
+            let mut body = String::new();
+            for (i, step) in b.steps.iter().enumerate() {
+                let reveal_at = i as u32 * BOARD_STEP_MS;
+                if reveal_at > elapsed_ms {
+                    continue;
+                }
+                let age = elapsed_ms - reveal_at;
+                let progress = (age as f32 / BOARD_REVEAL_MS as f32).clamp(0.0, 1.0);
+                body.push_str(&render_step(step, progress, &b.accent));
+            }
+            (b.accent.clone(), body)
+        })
+    });
+    let ambient = tile.ambient.lock().ok().and_then(|g| {
+        g.as_ref()
+            .filter(|a| a.is_visible())
+            .map(|a| (a.concept.clone(), a.accent.clone()))
+    });
+    let vision_thumb = tile.vision_thumb.lock().ok().and_then(|g| g.clone());
+
+    // Quiet frame — nothing to draw, skip the rasterize cost.
+    if scene_data.is_none()
+        && board_data.is_none()
+        && ambient.is_none()
+        && vision_thumb.is_none()
+    {
+        return None;
+    }
+
+    // ── Pick an accent for the shared `defs()` (gradients tint to it).
+    let accent = scene_data
+        .as_ref()
+        .map(|(a, _, _)| a.clone())
+        .or_else(|| board_data.as_ref().map(|(a, _)| a.clone()))
+        .or_else(|| ambient.as_ref().map(|(_, a)| a.clone()))
+        .unwrap_or_else(|| DEFAULT_ACCENT.to_string());
+
+    // ── Compose the document ──
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{VIDEO_W}" height="{VIDEO_H}" viewBox="0 0 {VIDEO_W} {VIDEO_H}">
+"##,
+    ));
+    svg.push_str(&defs(&accent));
+
+    // Scene card (with image backdrop if available) takes the centre
+    // of the canvas. The backdrop fills the whole frame; the particle
+    // face renders UNDER this overlay so it shows through the
+    // semi-transparent scrim around the image.
+    if let Some((sa, body, image)) = scene_data {
+        let img_ref = image.as_ref().map(|(uri, age)| (uri.as_str(), *age));
+        svg.push_str(&backdrop(&sa, time, img_ref));
+        svg.push_str(&body);
+    } else if let Some((_, body)) = board_data {
+        // Board has no backdrop — it's strokes-on-the-particle-field.
+        svg.push_str(&body);
+    }
+
+    // Ambient HUD chip — inlined from `hud_sticker` so we don't need
+    // a full PresenceState.
+    if let Some((concept, amb_accent)) = ambient {
+        let tick = if (time * 1.5).sin() > 0.0 { "●" } else { "○" };
+        let text: String = concept
+            .chars()
+            .take(22)
+            .collect::<String>()
+            .to_uppercase();
+        let chars = 2 + text.chars().count() as i32;
+        let w = (24 + chars * 11).max(120);
+        svg.push_str(&format!(
+            r##"<g transform="translate(30 50) rotate(2 0 0)">
+<rect x="-8" y="-14" width="{w}" height="28" rx="3" fill="#0a0f1f" stroke="{amb_accent}" stroke-width="1.5" opacity="0.92"/>
+<text x="4" y="5" font-family="{FONT}" font-size="14" font-weight="900" fill="{amb_accent}" letter-spacing="2.5">{tick} {text}</text>
+</g>
+"##
+        ));
+    }
+
+    // Vision PiP — show what she's looking at.
+    if let Some(thumb) = vision_thumb {
+        svg.push_str(&vision_pip(&thumb, &accent));
+    }
+
+    svg.push_str("</svg>");
+    Some(svg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

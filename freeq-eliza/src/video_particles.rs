@@ -43,8 +43,10 @@ use ghostly::{
     RenderSettings, Renderer,
 };
 use iroh_live::media::format::VideoFrame;
+use resvg::tiny_skia::{Pixmap, PixmapPaint, Transform};
+use resvg::usvg;
 
-use crate::video::{VideoTile, VIDEO_H, VIDEO_W};
+use crate::video::{overlay_svg_for_particles, VideoTile, VIDEO_H, VIDEO_W};
 
 const FPS: u64 = 15;
 /// Particle count at 640×360. ~12K reads as a dense face on CPU at
@@ -82,6 +84,19 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
     };
 
     let mut state = FaceState::new(&base_character, PARTICLES, 2.8, 42);
+
+    // Scratch pixmap for rasterizing the overlay SVG each frame. We
+    // allocate once and reuse so the per-frame cost is just the
+    // resvg::render pass, not heap thrashing.
+    let mut overlay_pixmap = match Pixmap::new(VIDEO_W, VIDEO_H) {
+        Some(p) => p,
+        None => {
+            tracing::error!("particle renderer: failed to allocate overlay pixmap");
+            return;
+        }
+    };
+    let mut usvg_opt = usvg::Options::default();
+    usvg_opt.fontdb_mut().load_system_fonts();
     // Most recently-rebuilt character — apply_emotion produces a new
     // value, but we don't want to rebuild every frame when the
     // emotion is steady. Compare against the last applied (emotion,
@@ -136,10 +151,39 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
 
         let pixmap = renderer.render(&current_character, &state, t);
 
+        // ── Overlay pass ──
+        // Scene card / whiteboard / ambient HUD / vision PiP — same
+        // rich visual aids the SVG backend draws, composited on top
+        // of the particle face. Skips entirely when there's nothing
+        // to draw (quiet listening with no ambient pick yet).
+        let mut composed = pixmap.clone();
+        if let Some(overlay_svg) = overlay_svg_for_particles(&tile, t) {
+            if let Ok(tree) = usvg::Tree::from_str(&overlay_svg, &usvg_opt) {
+                // Clear scratch (overlay rasterizes onto a transparent
+                // canvas; we composite that onto the particle pixmap).
+                overlay_pixmap.data_mut().fill(0);
+                resvg::render(
+                    &tree,
+                    Transform::identity(),
+                    &mut overlay_pixmap.as_mut(),
+                );
+                composed.draw_pixmap(
+                    0,
+                    0,
+                    overlay_pixmap.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+            } else {
+                tracing::debug!("particle overlay SVG failed to parse, skipping");
+            }
+        }
+
         // Publish the frame. Match the iroh-live frame format the SVG
         // path produces (RGBA, same dimensions, zero timestamp — the
         // encoder timestamps frames itself).
-        let data = Bytes::copy_from_slice(pixmap.data());
+        let data = Bytes::copy_from_slice(composed.data());
         let frame = VideoFrame::new_rgba(data, VIDEO_W, VIDEO_H, Duration::ZERO);
         if let Ok(mut g) = tile.latest.lock() {
             *g = Some(frame);
