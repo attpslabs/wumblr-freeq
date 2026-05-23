@@ -131,6 +131,11 @@ struct Cli {
     /// `https://irc.freeq.at:4443/av/moq`.
     #[arg(long)]
     sfu_url: Option<String>,
+
+    /// Disable the proactive monitor — Eliza only speaks when addressed.
+    /// Useful when she's chatty and you want quiet.
+    #[arg(long)]
+    no_proactive: bool,
 }
 
 #[tokio::main]
@@ -218,6 +223,7 @@ async fn main() -> Result<()> {
         elevenlabs_voice_id: cli.elevenlabs_voice,
         elevenlabs_model: cli.elevenlabs_model,
         image_ai,
+        proactive_enabled: !cli.no_proactive,
     })
     .await
 }

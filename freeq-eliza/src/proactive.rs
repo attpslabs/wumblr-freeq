@@ -1,0 +1,276 @@
+//! Proactive participation — Eliza chimes in when she has something
+//! useful to add, without being addressed.
+//!
+//! Every ~30s a monitor task wakes, snapshots the rolling transcript,
+//! and asks a fast LLM "should you say something?" with a strict
+//! threshold. Most of the time the answer is no. When the model is
+//! confident enough (priority ≥ 7), she streams a short comment through
+//! the same TTS + lip-sync + EQ pipeline as a normal answer — softened
+//! with a preamble like "Quick note —" so the interruption reads as
+//! deliberate, not random.
+//!
+//! Safety guardrails (the whole game here is calibration):
+//! - **Cooldown**: at least 90s between proactive comments, plus 30s
+//!   after she finished her last answer of any kind.
+//! - **Never interrupt herself**: skip the tick when [`Speaker::is_speaking`].
+//! - **High bar**: the model is told most checks should return false;
+//!   we then require priority ≥ 7 to actually speak.
+//! - **Off switch**: `--no-proactive` disables the monitor entirely
+//!   ([`crate::irc::RunConfig::proactive_enabled`]).
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use freeq_agent_kit::split_speech_and_links;
+use freeq_av::Speaker;
+use freeq_sdk::client::ClientHandle;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
+
+use crate::irc::{ActiveCall, SharedConfig};
+use crate::qa::SentenceChunker;
+use crate::tts;
+use crate::video::VideoTile;
+
+const TICK: Duration = Duration::from_secs(30);
+const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(90);
+const POST_ANSWER_GRACE: Duration = Duration::from_secs(30);
+/// Priority threshold for actually speaking — the model is told to
+/// score 0-10 and we only chime in for the genuinely worthwhile.
+const PRIORITY_THRESHOLD: u64 = 7;
+
+const PROACTIVE_SYSTEM: &str = "You are Eliza, listening to a live \
+voice call. Decide whether to chime in unprompted.\n\n\
+DEFAULT TO NO. Most ticks should return speak=false. Chime in only when:\n\
+- Someone stated something clearly, factually wrong (and you're sure).\n\
+- A direct question went unanswered and the conversation moved past it.\n\
+- The conversation is plainly stuck and a single sentence would unstick it.\n\n\
+DO NOT chime in to:\n\
+- Say hi, acknowledge, or react.\n\
+- Echo what someone said.\n\
+- Add tangential trivia or context nobody asked for.\n\
+- Comment on opinions, vibes, or feelings.\n\
+- Summarize, pivot, or moderate unless explicitly stuck.\n\
+- Repeat a point you already made in a previous proactive comment.\n\n\
+Score 0-10. priority>=7 means clearly worth interrupting. ANYTHING <7 \
+must be speak=false. People find unprompted bots annoying — be picky.\n\n\
+When you DO speak: 1-2 short sentences, conversational. Start with a \
+softener like \"Quick note —\", \"Just to jump in —\", or \"Small thing —\" \
+so the interruption reads as deliberate.\n\n\
+Output strictly JSON, no prose, no markdown:\n\
+{\"speak\": bool, \"priority\": 0-10, \"reason\": \"why\", \"say\": \"what to say\"}";
+
+/// Spawn the per-call proactive monitor. Holds a clone of the active-call
+/// handle and watches for moments worth chiming in on. The returned
+/// task is aborted by [`ActiveCall::drop`] when the call ends.
+pub(crate) fn spawn_monitor(
+    cfg: Arc<SharedConfig>,
+    handle: Arc<ClientHandle>,
+    channel: String,
+    active: Arc<AsyncMutex<Option<ActiveCall>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_monitor(cfg, handle, channel, active))
+}
+
+async fn run_monitor(
+    cfg: Arc<SharedConfig>,
+    handle: Arc<ClientHandle>,
+    channel: String,
+    active: Arc<AsyncMutex<Option<ActiveCall>>>,
+) {
+    tracing::info!(%channel, "proactive monitor armed");
+    let mut last_proactive: Option<Instant> = None;
+    // Skip the first tick — let the call settle.
+    tokio::time::sleep(TICK).await;
+    loop {
+        tokio::time::sleep(TICK).await;
+        let Some(key) = cfg.groq_api_key.as_deref() else {
+            continue;
+        };
+
+        // Snapshot without holding the lock across awaits.
+        let snapshot = {
+            let guard = active.lock().await;
+            let Some(call) = guard.as_ref() else {
+                tracing::info!("proactive monitor: call ended, stopping");
+                return;
+            };
+            ProactiveSnapshot {
+                transcript: call.transcript.join("\n"),
+                speaker: call.speaker.clone(),
+                video: call.video.clone(),
+                last_answer: call.last_answer,
+                is_speaking: call.speaker.is_speaking(),
+            }
+        };
+
+        // Guardrails: don't interrupt herself, hold off after an
+        // answered question, respect the proactive cooldown, need
+        // material to react to.
+        if snapshot.is_speaking {
+            tracing::debug!("proactive: she's still speaking, skip");
+            continue;
+        }
+        let since_proactive = last_proactive.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
+        if since_proactive < PROACTIVE_COOLDOWN {
+            tracing::debug!(?since_proactive, "proactive: cooldown, skip");
+            continue;
+        }
+        if let Some(last) = snapshot.last_answer {
+            if last.elapsed() < POST_ANSWER_GRACE {
+                tracing::debug!("proactive: just answered something, skip");
+                continue;
+            }
+        }
+        if snapshot.transcript.split_whitespace().count() < 12 {
+            tracing::debug!("proactive: too little transcript, skip");
+            continue;
+        }
+
+        // Last ~30 lines for context. Older lines fall off naturally —
+        // the model should react to recent conversation, not the whole
+        // call history.
+        let lines: Vec<&str> = snapshot.transcript.lines().collect();
+        let tail_start = lines.len().saturating_sub(30);
+        let recent = lines[tail_start..].join("\n");
+
+        let secs_since = since_proactive.as_secs().min(9999) as u32;
+        match decide(&cfg.http, key, &cfg.groq_chat_model, &recent, secs_since).await {
+            Some(say) => {
+                tracing::info!(text = %say, "proactive: chiming in");
+                last_proactive = Some(Instant::now());
+                // Mark the active call as "she just spoke" so the
+                // answer-debounce + post-answer grace both see it.
+                {
+                    let mut guard = active.lock().await;
+                    if let Some(call) = guard.as_mut() {
+                        call.last_answer = Some(Instant::now());
+                    } else {
+                        return;
+                    }
+                }
+                let cfg = cfg.clone();
+                let handle = handle.clone();
+                let channel = channel.clone();
+                let speaker = snapshot.speaker;
+                let video = snapshot.video;
+                tokio::spawn(async move {
+                    speak_now(cfg, handle, channel, speaker, video, say).await;
+                });
+            }
+            None => {
+                tracing::debug!("proactive: nothing worth saying");
+            }
+        }
+    }
+}
+
+struct ProactiveSnapshot {
+    transcript: String,
+    speaker: Speaker,
+    video: VideoTile,
+    last_answer: Option<Instant>,
+    is_speaking: bool,
+}
+
+/// Stream `text` through the TTS + Speaker pipeline — the same
+/// sentence-chunked path normal answers use, so lip-sync, EQ, and the
+/// state sticker all light up identically.
+async fn speak_now(
+    cfg: Arc<SharedConfig>,
+    _handle: Arc<ClientHandle>,
+    _channel: String,
+    speaker: Speaker,
+    _video: VideoTile,
+    text: String,
+) {
+    let Some(el_key) = cfg.elevenlabs_api_key.clone() else {
+        tracing::warn!("proactive: no ElevenLabs key, can't speak");
+        return;
+    };
+    let http = cfg.http.clone();
+    let voice = cfg.elevenlabs_voice_id.clone();
+    let model = cfg.elevenlabs_model.clone();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let speak_task = tokio::spawn(async move {
+        while let Some(sentence) = rx.recv().await {
+            let (spoken, _) = split_speech_and_links(&sentence);
+            if !spoken.chars().any(char::is_alphanumeric) {
+                continue;
+            }
+            if let Err(e) = tts::synthesize_streaming(
+                &http,
+                &el_key,
+                &voice,
+                &model,
+                &spoken,
+                |pcm| speaker.enqueue(pcm, tts::ELEVENLABS_PCM_RATE),
+            )
+            .await
+            {
+                tracing::warn!(error = ?e, "proactive streaming TTS failed");
+            }
+        }
+    });
+
+    let mut chunker = SentenceChunker::new();
+    for sentence in chunker.push(&text) {
+        let _ = tx.send(sentence);
+    }
+    if let Some(last) = chunker.flush() {
+        let _ = tx.send(last);
+    }
+    drop(tx);
+    let _ = speak_task.await;
+}
+
+/// Ask the chat model whether to chime in. Returns the spoken text
+/// when it's a clear yes (high priority), `None` otherwise.
+async fn decide(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    recent_transcript: &str,
+    seconds_since_last_proactive: u32,
+) -> Option<String> {
+    let user = format!(
+        "Recent call transcript (older lines first):\n{recent_transcript}\n\n\
+         Seconds since your last proactive comment (large = it's been quiet a while): \
+         {seconds_since_last_proactive}\n\n\
+         Decide. Output strictly the JSON object."
+    );
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 220,
+        "temperature": 0.3,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system", "content": PROACTIVE_SYSTEM },
+            { "role": "user", "content": user },
+        ],
+    });
+    let resp = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let content = v["choices"][0]["message"]["content"].as_str()?;
+    let plan: serde_json::Value = serde_json::from_str(content).ok()?;
+    let speak = plan["speak"].as_bool().unwrap_or(false);
+    let priority = plan["priority"].as_u64().unwrap_or(0);
+    let reason = plan["reason"].as_str().unwrap_or("").to_string();
+    let say = plan["say"].as_str().unwrap_or("").trim().to_string();
+    tracing::info!(speak, priority, %reason, "proactive: decision");
+    if speak && priority >= PRIORITY_THRESHOLD && !say.is_empty() {
+        Some(say)
+    } else {
+        None
+    }
+}

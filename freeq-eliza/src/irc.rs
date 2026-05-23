@@ -71,65 +71,80 @@ pub struct RunConfig {
     /// AI image-generation fallback for scene backdrops. `None` leaves
     /// Wikipedia as the only backdrop source.
     pub image_ai: Option<AiImageConfig>,
+    /// Enable the proactive monitor — when true, Eliza chimes in
+    /// unprompted with high-confidence observations. Toggle with
+    /// `--no-proactive` on the CLI.
+    pub proactive_enabled: bool,
 }
 
 /// Subset of [`RunConfig`] shared with inner tasks. Excludes the
 /// PrivateKey (already moved into the signer) so it's `Clone`-friendly
-/// inside an `Arc`.
-struct SharedConfig {
-    server: String,
-    channels: Vec<String>,
-    nick: String,
-    stt: Arc<SttEngine>,
-    window_secs: f32,
-    summary_model: String,
-    anthropic_key: Option<String>,
-    sfu_url_override: Option<String>,
-    groq_api_key: Option<String>,
-    groq_chat_model: String,
-    groq_answer_model: String,
-    vision_model: String,
-    elevenlabs_api_key: Option<String>,
-    elevenlabs_voice_id: String,
-    elevenlabs_model: String,
-    image_ai: Option<AiImageConfig>,
+/// inside an `Arc`. `pub(crate)` so the [`proactive`](crate::proactive)
+/// monitor can read the same config.
+pub(crate) struct SharedConfig {
+    pub(crate) server: String,
+    pub(crate) channels: Vec<String>,
+    pub(crate) nick: String,
+    pub(crate) stt: Arc<SttEngine>,
+    pub(crate) window_secs: f32,
+    pub(crate) summary_model: String,
+    pub(crate) anthropic_key: Option<String>,
+    pub(crate) sfu_url_override: Option<String>,
+    pub(crate) groq_api_key: Option<String>,
+    pub(crate) groq_chat_model: String,
+    pub(crate) groq_answer_model: String,
+    pub(crate) vision_model: String,
+    pub(crate) elevenlabs_api_key: Option<String>,
+    pub(crate) elevenlabs_voice_id: String,
+    pub(crate) elevenlabs_model: String,
+    pub(crate) image_ai: Option<AiImageConfig>,
     /// Shared HTTP client for Groq QA + ElevenLabs TTS calls.
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     /// When the bot process started — drives a startup grace period so it
     /// doesn't answer the burst of channel history (and any replayed
     /// audio) the server delivers right after it joins.
-    started_at: Instant,
+    pub(crate) started_at: Instant,
+    /// Whether the proactive monitor runs (`--no-proactive` disables it).
+    pub(crate) proactive_enabled: bool,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
 /// because the av-state handler and the av-state=ended handler need
-/// to mutate it from different async paths.
-struct ActiveCall {
-    channel: String,
-    session_id: String,
-    instance_id: String,
+/// to mutate it from different async paths. `pub(crate)` so the
+/// proactive monitor can snapshot the transcript + speaker.
+pub(crate) struct ActiveCall {
+    pub(crate) channel: String,
+    pub(crate) session_id: String,
+    pub(crate) instance_id: String,
     /// Lines of `<nick>: <utterance>` heard so far. Buffered as context
     /// for answering questions and the end-of-call summary — never
     /// posted to the channel.
-    transcript: Vec<String>,
-    /// When Eliza last dispatched a spoken answer. Drives a debounce so
-    /// one question — transcribed once per broadcast when a speaker is
-    /// joined from several devices — is answered only once.
-    last_answer: Option<Instant>,
+    pub(crate) transcript: Vec<String>,
+    /// When Eliza last dispatched a spoken answer (or proactive comment).
+    /// Drives a debounce so one question — transcribed once per broadcast
+    /// when a speaker is joined from several devices — is answered only
+    /// once, and so the proactive monitor doesn't pile on right after
+    /// she just spoke.
+    pub(crate) last_answer: Option<Instant>,
     /// Feeds the bot's outbound broadcast — `enqueue` makes it speak.
-    speaker: Speaker,
+    pub(crate) speaker: Speaker,
     /// The agent's video tile (audio-reactive presence + visual-aid
     /// cards). `show_card` puts up an LLM-drawn visual.
-    video: VideoTile,
+    pub(crate) video: VideoTile,
     /// The MoQ subscriber/publisher task. Aborted by `Drop` on call
     /// end — a plain `JoinHandle` drop only *detaches*, which would
     /// leave the reconnect loop running forever after the call ends.
     moq_task: JoinHandle<()>,
+    /// The proactive-monitor task (if enabled). Same drop story.
+    proactive_task: Option<JoinHandle<()>>,
 }
 
 impl Drop for ActiveCall {
     fn drop(&mut self) {
         self.moq_task.abort();
+        if let Some(t) = &self.proactive_task {
+            t.abort();
+        }
         self.video.stop();
     }
 }
@@ -157,6 +172,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         elevenlabs_voice_id,
         elevenlabs_model,
         image_ai,
+        proactive_enabled,
     } = cfg;
 
     // Pick websocket vs raw-TCP transport based on URL scheme — mirrors
@@ -239,6 +255,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         elevenlabs_voice_id,
         elevenlabs_model,
         image_ai,
+        proactive_enabled,
         http: reqwest::Client::new(),
         started_at: Instant::now(),
     });
@@ -934,6 +951,19 @@ async fn start_transcription(
         tracing::info!("AvSession ended");
     });
 
+    // Proactive monitor — chimes in unprompted when she has something
+    // useful to add. The task aborts via ActiveCall::drop on call-end.
+    let proactive_task = if cfg.proactive_enabled {
+        Some(crate::proactive::spawn_monitor(
+            cfg.clone(),
+            handle.clone(),
+            channel.clone(),
+            active.clone(),
+        ))
+    } else {
+        None
+    };
+
     Ok(ActiveCall {
         channel,
         session_id,
@@ -943,6 +973,7 @@ async fn start_transcription(
         speaker,
         video,
         moq_task: task,
+        proactive_task,
     })
 }
 

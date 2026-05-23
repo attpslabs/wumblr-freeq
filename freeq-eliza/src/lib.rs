@@ -7,6 +7,7 @@
 pub mod identity;
 pub mod imagegen;
 pub mod irc;
+pub mod proactive;
 pub mod qa;
 pub mod stt;
 pub mod summary;
