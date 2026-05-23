@@ -517,10 +517,11 @@ pub async fn anthropic_answer_streaming(
     mut on_delta: impl FnMut(&str),
 ) -> Result<Answer> {
     let system = system_override.unwrap_or(SYSTEM);
+    // Note: no `temperature` field — `claude-opus-4-7` deprecated it
+    // (the model picks its own sampling). Setting it returns 400.
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 320,
-        "temperature": 0.3,
         "stream": true,
         "system": system,
         "messages": [
