@@ -83,11 +83,11 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
         return;
     };
 
-    // Scale 5.0 — the face now FILLS the tile, basically edge to
-    // edge at peak yaw. Per user feedback the 3.6 version was still
-    // too small; this lands much closer to the avatar reference's
-    // "she's RIGHT there" presence.
-    const SCALE: f32 = 5.0;
+    // Scale 6.5 — the face dominates almost the entire tile. Every
+    // character renders at this scale (not just Oblivion); the user
+    // wants the agent to feel *present*, not floating in a small
+    // patch of a bigger frame.
+    const SCALE: f32 = 6.5;
     let mut state = FaceState::new(&base_character, PARTICLES, SCALE, 42);
 
     // Scratch pixmap for rasterizing the overlay SVG each frame. We
@@ -158,6 +158,8 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
         // seconds and eases the current yaw/pitch toward it. Makes
         // the face feel like a real being looking around the room.
         state.step_gaze(t, frame_dt.as_secs_f32());
+        // Blinks every 3-7s.
+        state.step_blink(t, frame_dt.as_secs_f32());
 
         // Tick the ember swarm (only does anything when the character
         // configured an EmberConfig — Oblivion's signature flavour).
