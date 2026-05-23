@@ -149,14 +149,19 @@ export function CallPanel() {
         : `${sessionId}/${myNick}`;
       pub.setAttribute('url', moqOrigin);
       pub.setAttribute('name', broadcastName);
-      pub.setAttribute('source', 'camera');
-      // Initialise visibility from the current camera-toggle state.
-      // Avoids a race where the camera was already on before the call
-      // started: the avCameraOn effect won't fire (no state change) and
-      // the camera would silently stay off.
+      // CRITICAL: set `invisible` BEFORE `source`. moq-publish reacts to
+      // the `source` attribute immediately by opening a single
+      // getUserMedia({audio:true, video:true}). If we set `source` first
+      // and `invisible` second, that grab can already be in flight; if
+      // the camera is busy or permission denied, the whole call (audio
+      // included) fails and the catalog ships with no audio track —
+      // Eliza/peers then see a participant who never speaks. With
+      // `invisible` set first, moq-publish grabs audio only and only
+      // adds video when we later remove `invisible`.
       if (!useStore.getState().avCameraOn) {
         pub.setAttribute('invisible', '');
       }
+      pub.setAttribute('source', 'camera');
       console.log('[call] Publishing:', broadcastName);
 
       pollParticipants();
