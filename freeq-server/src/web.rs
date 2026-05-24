@@ -3023,9 +3023,16 @@ async fn av_call_page() -> impl IntoResponse {
 /// Serve AV JS assets (moq-publish, moq-watch, etc).
 async fn av_asset(Path(filename): Path<String>) -> impl IntoResponse {
     let files: &[(&str, &str)] = &[
-        ("watch-CQEo0ml-.js", include_str!("../static/av/assets/watch-CQEo0ml-.js")),
-        ("publish-0_tfMLVg.js", include_str!("../static/av/assets/publish-0_tfMLVg.js")),
-        ("time-Do1uKez-.js", include_str!("../static/av/assets/time-Do1uKez-.js")),
+        // Rebuilt 2026-05-24 — see `freeq-server/static/av/assets/`.
+        // Old hashes (watch-CQEo0ml-, publish-0_tfMLVg, time-Do1uKez-) were
+        // from Apr 25; their moq components crashed at init in the
+        // browser ("missing <moq-publish> element", "Cannot read
+        // properties of null"). Rebuilt with @moq/hang pinned to
+        // 0.2.5 because @moq/hang@0.2.6 transitively depends on
+        // @moq/loc which is unpublished.
+        ("watch-DdXJRVCU.js", include_str!("../static/av/assets/watch-DdXJRVCU.js")),
+        ("publish-CKcN3504.js", include_str!("../static/av/assets/publish-CKcN3504.js")),
+        ("time-NjxxPrvf.js", include_str!("../static/av/assets/time-NjxxPrvf.js")),
         ("main-DGBFe0O7-CIZu5tmC.js", include_str!("../static/av/assets/main-DGBFe0O7-CIZu5tmC.js")),
         ("main-DGBFe0O7-DQ8if_La.js", include_str!("../static/av/assets/main-DGBFe0O7-DQ8if_La.js")),
         ("libav-opus-af-BlMWboA7-B4GfDr9_.js", include_str!("../static/av/assets/libav-opus-af-BlMWboA7-B4GfDr9_.js")),
