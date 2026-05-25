@@ -67,12 +67,16 @@ export function CallPanel() {
   const [showSettings, setShowSettings] = useState(false);
 
   const myNick = getNick();
-  // Connect to the SFU's QUIC/WebTransport listener (udp :8080) rather
-  // than MoQ-over-WebSocket. WebTransport is the proper real-time media
-  // transport; the WebSocket path degrades into static under publish
-  // load. The `https://` scheme tells moq-publish/moq-watch to use
-  // WebTransport. See docs/AV-QUIC-MIGRATION.md.
-  const moqOrigin = `https://${location.hostname}:8080/av/moq`;
+  // Use the nginx-proxied :443 WebSocket endpoint. The direct-to-
+  // :8080 WebTransport path (commented original below) currently
+  // half-connects: moq-watch logs "connected via WebTransport" but
+  // the catalog never arrives and no frames decode (reproduced in
+  // headless chromium against the live broadcast — black tile for
+  // every viewer). Until the WebTransport path is fixed the
+  // WS-via-nginx route is the only working transport.
+  //
+  // Original WebTransport URL: `https://${location.hostname}:8080/av/moq`
+  const moqOrigin = `wss://${location.hostname}/av/moq`;
 
   // ── Device enumeration ──────────────────────────────────────
   // Device labels are blank until the matching permission is granted, so
