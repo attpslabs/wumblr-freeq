@@ -1,0 +1,35 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.community.membership.grant",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Owner's cryptographic grant of membership to a specific DID for a specific community. Stored on the owner's (or future moderator's) PDS. Together with com.wumblr.community.member on the member's PDS, constitutes effective membership. Revocation = delete this record. Rkey convention: <community-rkey>-<member-did-tail> for deterministic lookup, e.g. solarpunk-3jl7m4.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["community", "member", "role", "grantedAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the com.wumblr.community record."
+          },
+          "member": {
+            "type": "string",
+            "format": "did",
+            "description": "The DID being granted membership."
+          },
+          "role": {
+            "type": "string",
+            "knownValues": ["owner", "mod", "member"]
+          },
+          "grantedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

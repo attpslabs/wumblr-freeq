@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.community.channel",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A channel within a community. Stored on the owner's PDS. The IRC transport channel name (#<community-rkey>-<name>) is derived at runtime by wumblr-backend, not stored — keeps the lexicon transport-agnostic.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["community", "name", "kind", "createdAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the com.wumblr.community record."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "description": "Display name shown in the UI (e.g. 'general'). Lowercase alphanumerics and dashes only; backend enforces ^[a-z0-9-]+$ at write time."
+          },
+          "topic": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Optional channel topic/header text."
+          },
+          "kind": {
+            "type": "string",
+            "knownValues": ["text", "voice", "video"],
+            "default": "text"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Display order within the channel list. Lower = earlier."
+          },
+          "category": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Optional category grouping (e.g. 'TEXT CHANNELS', 'INFO')."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}
