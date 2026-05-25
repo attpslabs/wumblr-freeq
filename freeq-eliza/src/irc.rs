@@ -479,6 +479,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             .await
             {
                 Ok(call) => {
+                    spawn_hello_on_join(&cfg, call.speaker.clone());
                     *active.lock().await = Some(call);
                 }
                 Err(e) => tracing::warn!(error = ?e, "failed to join existing session"),
