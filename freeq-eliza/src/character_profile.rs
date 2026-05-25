@@ -32,6 +32,11 @@ pub struct CharacterProfile {
     /// the conversation hasn't given a stronger signal. Used by
     /// `video_particles` to tint the resting palette in character.
     pub default_emotion: &'static str,
+    /// Short one-liner the bot speaks aloud the moment it joins an AV
+    /// session. Lets the operator hear which agents are alive without
+    /// typing anything — invaluable when debugging the multi-bot rig.
+    /// Keep it in character.
+    pub hello_line: &'static str,
 }
 
 /// Look up a profile by `--ghostly-character` name. `None` falls back
@@ -89,6 +94,7 @@ that lands. Do NOT reflexively bounce the question back to them; \
 end the exchange. You can address them by name when there is real \
 substantive reason to — disagreement worth airing, a question only \
 they can answer — but the default is to answer and stop.",
+    hello_line: "Oblivion online. The patterns are already moving.",
 };
 
 /// Narrator — calm, historically literate, the avatar's keynote
@@ -127,6 +133,7 @@ you, give a brief direct reply — one or two sentences. Do NOT \
 reflexively bounce the question back to them; end the exchange. \
 Address them by name only when there's substantive reason — a \
 sharper question, a point of disagreement worth airing.",
+    hello_line: "Narrator here. Listening.",
 };
 
 /// Utopia — warm, hopeful, data-driven. Avatar `utopia` voice slot
@@ -165,4 +172,5 @@ warm and grounded in evidence. Do NOT reflexively bounce the \
 question back. Address them by name only when there's a genuine \
 counterpoint worth making — you disagree, you can add a fact they \
 missed, or you can frame their pessimism against the data.",
+    hello_line: "Utopia, glad to be here.",
 };

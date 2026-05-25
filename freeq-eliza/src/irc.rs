@@ -539,6 +539,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                                     session_id = %session_id,
                                     "started transcription"
                                 );
+                                // Debugging affordance: speak a short,
+                                // in-character greeting the moment the
+                                // call is live. Lets the operator hear
+                                // which agents are alive (and which
+                                // aren't) without typing anything. Fires
+                                // only once per call — the speaker
+                                // clone keeps the audio queued even if
+                                // the bot's task panics elsewhere.
+                                spawn_hello_on_join(&cfg, call.speaker.clone());
                                 *active_guard = Some(call);
                             }
                             Err(e) => {
@@ -1058,6 +1067,54 @@ async fn answer_and_speak(
 /// Runs entirely off the answer path — image lookup/generation is slow
 /// (Wikipedia ~1s, AI fallback ~15s), so the scene shows text-first and
 /// the backdrop fades in once it arrives.
+/// Speak the character's `hello_line` through ElevenLabs + the per-
+/// character voice chain + the call speaker, then return. Runs once
+/// per call activation. Silent no-op if any of (ElevenLabs key,
+/// character profile) is missing.
+fn spawn_hello_on_join(cfg: &Arc<SharedConfig>, speaker: freeq_av::Speaker) {
+    let Some(el_key) = cfg.elevenlabs_api_key.clone() else {
+        tracing::info!("hello-on-join skipped — no ELEVENLABS_API_KEY");
+        return;
+    };
+    let Some(profile) = crate::character_profile::by_name(&cfg.ghostly_character) else {
+        return;
+    };
+    let text = profile.hello_line.to_string();
+    let voice_id = cfg.elevenlabs_voice_id.clone();
+    let model = cfg.elevenlabs_model.clone();
+    let http = cfg.http.clone();
+    let character = cfg.ghostly_character.clone();
+    tokio::spawn(async move {
+        let voice_profile = ghostly::audio::profile::for_character(&character);
+        let mut chain = ghostly::audio::VoiceChain::new(
+            voice_profile,
+            tts::ELEVENLABS_PCM_RATE as f32,
+        );
+        let mut work: Vec<f32> = Vec::with_capacity(4096);
+        let chain_ref = &mut chain;
+        let work_ref = &mut work;
+        let sp_ref = &speaker;
+        match tts::synthesize_streaming(
+            &http,
+            &el_key,
+            &voice_id,
+            &model,
+            &text,
+            |pcm| {
+                work_ref.clear();
+                work_ref.extend_from_slice(pcm);
+                chain_ref.process(work_ref);
+                sp_ref.enqueue(work_ref, tts::ELEVENLABS_PCM_RATE);
+            },
+        )
+        .await
+        {
+            Ok(n) => tracing::info!(%character, %text, samples = n, "hello-on-join spoken"),
+            Err(e) => tracing::warn!(error = ?e, "hello-on-join TTS failed"),
+        }
+    });
+}
+
 fn spawn_scene_image(cfg: &Arc<SharedConfig>, video: &VideoTile, scene_id: u64, query: String) {
     if query.trim().is_empty() {
         return;
