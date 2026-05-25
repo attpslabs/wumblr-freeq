@@ -9,6 +9,7 @@ pub mod character_profile;
 pub mod identity;
 pub mod imagegen;
 pub mod irc;
+pub mod memory;
 pub mod proactive;
 pub mod qa;
 pub mod stt;

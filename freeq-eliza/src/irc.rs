@@ -45,6 +45,38 @@ fn address_with_aliases(text: &str, nick: &str) -> Option<String> {
     }
     None
 }
+
+/// Multi-agent chatter guard. Records `asker` in the rolling
+/// addressing-chain history and returns `false` if the recent K
+/// addressers are *all* peer agents — that's the loop signature.
+/// As soon as a human addresses the bot, the streak resets and
+/// the next address goes through. Allows up to 2 bot-to-bot
+/// exchanges without a human break (so a real "Oblivion, what do
+/// you think?" → "Utopia, ..." → "Oblivion, ..." exchange lands)
+/// and stops at the 3rd.
+fn is_address_allowed(cfg: &SharedConfig, asker: &str) -> bool {
+    const RECENT_K: usize = 3;
+    const HISTORY_KEEP: usize = 5;
+    let asker_lc = asker.to_ascii_lowercase();
+    let mut chain = cfg.addressing_chain.lock().expect("addressing chain poisoned");
+    chain.push_back(asker_lc.clone());
+    while chain.len() > HISTORY_KEEP {
+        chain.pop_front();
+    }
+    // Lone agent (no peers configured) → always allow.
+    if cfg.peer_agents.is_empty() {
+        return true;
+    }
+    // Only suppress if we have enough recent history AND every entry
+    // in the last K window is a known peer. A single human in the
+    // window unlocks the next exchange.
+    if chain.len() < RECENT_K {
+        return true;
+    }
+    let tail: Vec<&String> = chain.iter().rev().take(RECENT_K).collect();
+    let all_peer = tail.iter().all(|n| cfg.peer_agents.contains(*n));
+    !all_peer
+}
 use crate::imagegen::AiImageConfig;
 use crate::stt::{to_whisper_pcm, SttEngine};
 use crate::video::VideoTile;
@@ -112,6 +144,12 @@ pub struct RunConfig {
     /// Utopia personality). `None` falls back to the default Eliza
     /// prompt in `qa.rs`.
     pub character_system_prompt: Option<String>,
+    /// Other agent nicks in the channel. When set, the bot can hold a
+    /// bounded multi-agent dialogue (e.g. Oblivion + Utopia debating)
+    /// but won't run away: after a streak of bot-to-bot exchanges
+    /// without a human break, the bot stops responding until a human
+    /// addresses it again.
+    pub peer_agents: Vec<String>,
 }
 
 /// Subset of [`RunConfig`] shared with inner tasks. Excludes the
@@ -153,6 +191,23 @@ pub(crate) struct SharedConfig {
     /// Per-character system prompt — when present, replaces the
     /// default Eliza prompt in [`qa::answer_streaming`].
     pub(crate) character_system_prompt: Option<String>,
+    /// Lowercased nicks of OTHER agents in the channel — peers this
+    /// bot recognises by name. Used to prevent multi-agent runaway: a
+    /// bot can engage with another bot when called, but won't keep
+    /// chaining bot-to-bot replies without a human breaking in. When
+    /// empty (the default), this bot acts alone.
+    pub(crate) peer_agents: std::collections::HashSet<String>,
+    /// Rolling history of the last ~5 addressers (lowercased). When
+    /// the recent K (3) are all peer agents, this bot suppresses its
+    /// reply — that breaks reply loops between bots. A human
+    /// addressing the bot resets the streak immediately.
+    pub(crate) addressing_chain:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Persistent conversation memory — past exchanges queryable via
+    /// FTS5. Retrieved before each answer (top-K relevant) and stored
+    /// after. `None` if a memory DB couldn't be opened (the bot will
+    /// just run without recall).
+    pub(crate) memory: Option<std::sync::Arc<crate::memory::Memory>>,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
@@ -230,6 +285,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         render_backend,
         ghostly_character,
         character_system_prompt,
+        peer_agents,
     } = cfg;
 
     // Pick websocket vs raw-TCP transport based on URL scheme — mirrors
@@ -293,6 +349,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     }
 
     let active: Arc<AsyncMutex<Option<ActiveCall>>> = Arc::new(AsyncMutex::new(None));
+
+    // Persistent conversation memory — per-bot SQLite at
+    // ~/.freeq/bots/<name>/memory.db. Soft failure: if it can't open,
+    // the bot runs without recall.
+    let memory = dirs::home_dir()
+        .map(|h| h.join(".freeq").join("bots").join(&nick).join("memory.db"))
+        .and_then(|p| match crate::memory::Memory::open(&p) {
+            Ok(m) => {
+                tracing::info!(path = %p.display(), "memory store ready");
+                Some(std::sync::Arc::new(m))
+            }
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = ?e, "failed to open memory store — bot will run without recall");
+                None
+            }
+        });
+
     // Reassemble a sharable config without the (already-moved) private
     // key for the inner tasks.
     let cfg = Arc::new(SharedConfig {
@@ -318,6 +391,14 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         render_backend,
         ghostly_character,
         character_system_prompt,
+        peer_agents: peer_agents
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect(),
+        addressing_chain: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::new(),
+        )),
+        memory,
         http: reqwest::Client::new(),
         started_at: Instant::now(),
     });
@@ -495,6 +576,17 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     tracing::info!(%from, "ignoring addressed chat message (startup grace)");
                     continue;
                 }
+                // Multi-agent chatter guard: if the last several
+                // addressers are all peer bots (no human breaking in),
+                // stop responding. A human addressing me resets the
+                // streak so the next exchange goes through.
+                if !is_address_allowed(&cfg, &from) {
+                    tracing::info!(
+                        %from,
+                        "suppressing chat reply — recent addressers all peer agents (waiting for a human)"
+                    );
+                    continue;
+                }
                 if cfg.groq_api_key.is_none() {
                     let _ = handle_arc
                         .privmsg(&target, &format!("{from}: Q&A needs a Groq key — not configured."))
@@ -554,8 +646,13 @@ async fn answer_and_speak(
     // The guard clears it on every exit path.
     if let Some(v) = &video {
         v.set_thinking(true);
+        // Sticky gaze: while the bot is composing + speaking the
+        // answer, its eyes turn toward `asker`. The FocusGuard
+        // releases the lock on every exit path.
+        v.set_focus_nick(Some(asker.clone()));
     }
     let _thinking = ThinkingGuard(video.clone());
+    let _focus = FocusGuard(video.clone());
     // The vision PiP (if any) is also cleared on every exit path.
     let _vision_thumb = VisionThumbGuard(video.clone());
 
@@ -611,6 +708,26 @@ async fn answer_and_speak(
             }
             _ => None,
         };
+
+    // Pull relevant past exchanges from memory and prepend to the
+    // transcript so the model can reference prior conversations
+    // ("last time you asked about X, you ended up at Y…"). Scoped
+    // to this channel by default — cross-channel recall would be a
+    // separate, more invasive product decision.
+    let transcript = if let Some(mem) = cfg.memory.as_ref() {
+        match mem.recall(&question, Some(&channel), 3) {
+            Ok(recs) => match crate::memory::Memory::format_for_prompt(&recs) {
+                Some(block) => format!("{block}\n{transcript}"),
+                None => transcript,
+            },
+            Err(e) => {
+                tracing::warn!(error = ?e, "memory recall failed; continuing without it");
+                transcript
+            }
+        }
+    } else {
+        transcript
+    };
 
     // A visual question we can actually see → the vision model with the
     // asker's latest frame. A visual question with no frame → a useful
@@ -738,6 +855,14 @@ async fn answer_and_speak(
     // Log the full answer text — invaluable for debugging when she's
     // saying something weird (e.g. reading image alt attributes).
     tracing::info!(text = %answer.text, "answer text (sent to TTS)");
+
+    // Persist to memory so future sessions can recall this exchange.
+    // Soft failure: a memory write error doesn't break the response.
+    if let Some(mem) = cfg.memory.as_ref() {
+        if let Err(e) = mem.record(&channel, &asker, &question, &answer.text) {
+            tracing::warn!(error = ?e, "failed to record exchange to memory");
+        }
+    }
 
     // Links: Eliza is voice-first, so URLs go to the channel as text
     // rather than into speech. Collect them from the full answer.
@@ -879,6 +1004,19 @@ impl Drop for ThinkingGuard {
     fn drop(&mut self) {
         if let Some(v) = &self.0 {
             v.set_thinking(false);
+        }
+    }
+}
+
+/// Releases the sticky gaze target on every exit path of
+/// `answer_and_speak`. Idle random gaze resumes a moment later
+/// (the lock-clear pushes a short cooldown into `step_gaze`).
+struct FocusGuard(Option<VideoTile>);
+
+impl Drop for FocusGuard {
+    fn drop(&mut self) {
+        if let Some(v) = &self.0 {
+            v.set_focus_nick(None);
         }
     }
 }
@@ -1210,6 +1348,14 @@ async fn transcribe_participant(
                     // In a voice call people address the bot by talking,
                     // not typing.
                     if let Some(question) = address_with_aliases(&text, &cfg.nick) {
+                        // Multi-agent chatter guard: see is_address_allowed.
+                        if !is_address_allowed(&cfg, &nick) {
+                            tracing::info!(
+                                %nick,
+                                "suppressing voice reply — recent addressers all peer agents"
+                            );
+                            return;
+                        }
                         // Debounce: a speaker joined from several devices
                         // is tapped once per broadcast, so the same
                         // question arrives two or three times. Answer the

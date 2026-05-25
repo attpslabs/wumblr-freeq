@@ -160,6 +160,16 @@ struct Cli {
     /// `eliza`, `narrator`, `utopia`, `oblivion`.
     #[arg(long, default_value = "eliza")]
     ghostly_character: String,
+
+    /// Other agent nicks this bot recognises as peers — e.g.
+    /// `--peer-agents oblivion,utopia` when running Eliza alongside
+    /// the other two for a multi-agent demo. The bot will respond
+    /// when one peer addresses it by name, but a streak of 3+
+    /// peer-only addresses (no human break) triggers a chatter guard
+    /// that suppresses further replies until a human speaks. Empty
+    /// (the default) = lone agent, no special handling.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    peer_agents: Vec<String>,
 }
 
 #[tokio::main]
@@ -282,6 +292,7 @@ async fn main() -> Result<()> {
             .unwrap_or(cli.elevenlabs_voice),
         character_system_prompt: character_profile::by_name(&cli.ghostly_character)
             .map(|p| p.system_prompt.to_string()),
+        peer_agents: cli.peer_agents,
     })
     .await
 }

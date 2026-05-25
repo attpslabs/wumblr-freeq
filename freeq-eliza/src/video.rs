@@ -251,6 +251,12 @@ pub struct VideoTile {
     /// Hands out a fresh id per scene so async image jobs can target one.
     next_id: Arc<AtomicU64>,
     pub(crate) running: Arc<AtomicBool>,
+    /// Sticky gaze target — the nick the bot is currently addressing
+    /// or being addressed by. The particles render loop reads this
+    /// and calls `FaceState::set_gaze_lock`, so the bot's eyes turn
+    /// toward whoever the conversation is focused on. Cleared once
+    /// the exchange ends, idle gaze resumes.
+    pub(crate) focus_nick: Arc<Mutex<Option<String>>>,
     /// Which renderer to spawn. Cloned into the render thread.
     backend: Backend,
 }
@@ -275,7 +281,17 @@ impl VideoTile {
             ambient_image: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
+            focus_nick: Arc::new(Mutex::new(None)),
             backend,
+        }
+    }
+
+    /// Lock the rendered face's gaze on `nick`. Call with `Some(asker)`
+    /// at the start of an answer; clear with `None` when done. The
+    /// particles render loop picks this up next frame.
+    pub fn set_focus_nick(&self, nick: Option<String>) {
+        if let Ok(mut g) = self.focus_nick.lock() {
+            *g = nick;
         }
     }
 

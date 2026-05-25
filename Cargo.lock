@@ -2361,6 +2361,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "resvg",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -2819,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "ghostly"
 version = "0.1.0"
-source = "git+https://github.com/chad/ghostly?branch=main#19267a878365709f21c6271669335fac9a48276d"
+source = "git+https://github.com/chad/ghostly?branch=main#151b3ab0d1ae569e6b2636b84ebc96a63f7aaedd"
 dependencies = [
  "fastrand",
  "fundsp",

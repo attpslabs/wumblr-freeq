@@ -66,6 +66,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = "6"
 chrono = "0.4"
+# SQLite for the conversation-memory module. FTS5 powers the "she
+# remembers" feature — past exchanges retrieved on each addressed
+# question and injected into the LLM context.
+rusqlite = { workspace = true }
 
 [features]
 default = []

@@ -155,6 +155,12 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
         // breathes.
         state.set_audio_level(level.max(peer));
 
+        // Sticky gaze — when the bot is mid-exchange with someone,
+        // its eyes turn toward that nick (deterministic hash → angle).
+        // Cleared elsewhere when the exchange ends; idle drift resumes.
+        let focus = tile.focus_nick.lock().ok().and_then(|g| g.clone());
+        state.set_gaze_lock(focus);
+
         let dt_secs = frame_dt.as_secs_f32();
         // Drive the head turn — picks a new gaze target every few
         // seconds and eases the current yaw/pitch toward it. Makes
