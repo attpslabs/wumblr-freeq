@@ -6,6 +6,8 @@
 
 pub mod ambient;
 pub mod character_profile;
+pub mod decisions;
+pub mod diagram;
 pub mod identity;
 pub mod imagegen;
 pub mod irc;

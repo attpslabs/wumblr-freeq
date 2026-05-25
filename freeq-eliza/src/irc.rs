@@ -208,6 +208,24 @@ pub(crate) struct SharedConfig {
     /// after. `None` if a memory DB couldn't be opened (the bot will
     /// just run without recall).
     pub(crate) memory: Option<std::sync::Arc<crate::memory::Memory>>,
+    /// Per-channel decision log — commitments extracted from the live
+    /// transcript ("let's ship Friday", "I'll handle the deploy"). Read
+    /// back to the channel when the session ends so the room has a
+    /// captured summary of what it actually decided. Empty between
+    /// sessions; the End handler drains the entry for its channel.
+    pub(crate) decisions: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<crate::decisions::Decision>>,
+        >,
+    >,
+    /// Per-channel live diagram — accumulating graph of concepts +
+    /// relationships extracted from every transcribed utterance. The
+    /// transcribe loop ingests text into the channel's entry; when
+    /// new edges appear, the rendered steps are pushed to the
+    /// whiteboard. Cleared when the session ends.
+    pub(crate) diagrams: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::diagram::Diagram>>,
+    >,
 }
 
 /// Active-call state. Held inside an `Arc<AsyncMutex<Option<...>>>`
@@ -399,6 +417,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             std::collections::VecDeque::new(),
         )),
         memory,
+        decisions: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        diagrams: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         http: reqwest::Client::new(),
         started_at: Instant::now(),
     });
@@ -512,6 +536,45 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         // Drop the active call (tears down MoQ task).
                         drop(call);
                         drop(active_guard);
+
+                        // Decision read-back: drain the per-channel
+                        // decision log and post it to the channel. The
+                        // room hears what it actually committed to
+                        // without anyone taking notes — the demo
+                        // proof-of-concept for "conversation as the
+                        // source of knowledge work".
+                        let drained: Vec<crate::decisions::Decision> = cfg
+                            .decisions
+                            .lock()
+                            .ok()
+                            .and_then(|mut g| g.remove(&channel_for_post))
+                            .unwrap_or_default();
+                        if !drained.is_empty() {
+                            let _ = handle
+                                .privmsg(
+                                    &channel_for_post,
+                                    "[eliza] decisions captured this session:",
+                                )
+                                .await;
+                            for d in &drained {
+                                let line = match &d.when {
+                                    Some(w) => format!(
+                                        "[eliza]  • {} — {} (by {})",
+                                        d.who, d.what, w
+                                    ),
+                                    None => format!("[eliza]  • {} — {}", d.who, d.what),
+                                };
+                                let _ = handle
+                                    .privmsg(&channel_for_post, &line)
+                                    .await;
+                            }
+                        }
+
+                        // Clear the live diagram so the next session
+                        // starts on a blank canvas.
+                        if let Ok(mut g) = cfg.diagrams.lock() {
+                            g.remove(&channel_for_post);
+                        }
 
                         if !cfg.summary_enabled || !cfg.anthropic_key.is_some() || transcript.is_empty() {
                             let _ = handle
@@ -861,6 +924,19 @@ async fn answer_and_speak(
     if let Some(mem) = cfg.memory.as_ref() {
         if let Err(e) = mem.record(&channel, &asker, &question, &answer.text) {
             tracing::warn!(error = ?e, "failed to record exchange to memory");
+        }
+    }
+
+    // Decision capture: extract commitments from both sides of the
+    // exchange and append to the per-channel decision log. The asker
+    // might commit ("let's ship Friday"); the bot might commit ("I'll
+    // pull the metrics"). Both are decisions the room should hear back
+    // when the session ends.
+    let mut captured = crate::decisions::Decision::extract(&asker, &question);
+    captured.extend(crate::decisions::Decision::extract(&cfg.nick, &answer.text));
+    if !captured.is_empty() {
+        if let Ok(mut log) = cfg.decisions.lock() {
+            log.entry(channel.clone()).or_default().extend(captured);
         }
     }
 
@@ -1434,9 +1510,40 @@ async fn transcribe_participant(
                     // utterance to the channel. A `dump` request posts
                     // what's accumulated.
                     let log_line = format!("{nick}: {text}");
-                    let mut guard = active.lock().await;
-                    if let Some(call) = guard.as_mut() {
-                        call.transcript.push(log_line);
+                    let video_snapshot = {
+                        let mut guard = active.lock().await;
+                        if let Some(call) = guard.as_mut() {
+                            call.transcript.push(log_line);
+                            Some(call.video.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    // Live diagram: feed every transcribed utterance to
+                    // the per-channel graph. When new edges appear, push
+                    // the updated step list to the whiteboard so the room
+                    // sees the diagram of the conversation form in real
+                    // time — the visual half of "conversation as source
+                    // of knowledge work".
+                    if let Some(video) = video_snapshot {
+                        let added = {
+                            let mut log = cfg.diagrams.lock().expect("diagrams poisoned");
+                            log.entry(channel.clone())
+                                .or_default()
+                                .ingest(&text)
+                        };
+                        if added > 0 {
+                            let steps = {
+                                let log = cfg.diagrams.lock().expect("diagrams poisoned");
+                                log.get(&channel)
+                                    .map(|d| d.to_steps())
+                                    .unwrap_or_default()
+                            };
+                            if !steps.is_empty() {
+                                // Mint teal accent — matches the Eliza palette.
+                                video.show_board(steps, "#7FE7CB".into());
+                            }
+                        }
                     }
                 }
                 Err(e) => {
