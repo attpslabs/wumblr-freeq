@@ -3023,16 +3023,28 @@ async fn av_call_page() -> impl IntoResponse {
 /// Serve AV JS assets (moq-publish, moq-watch, etc).
 async fn av_asset(Path(filename): Path<String>) -> impl IntoResponse {
     let files: &[(&str, &str)] = &[
-        // Rebuilt 2026-05-24 — see `freeq-server/static/av/assets/`.
-        // Old hashes (watch-CQEo0ml-, publish-0_tfMLVg, time-Do1uKez-) were
-        // from Apr 25; their moq components crashed at init in the
-        // browser ("missing <moq-publish> element", "Cannot read
-        // properties of null"). Rebuilt with @moq/hang pinned to
-        // 0.2.5 because @moq/hang@0.2.6 transitively depends on
-        // @moq/loc which is unpublished.
-        ("watch-DdXJRVCU.js", include_str!("../static/av/assets/watch-DdXJRVCU.js")),
-        ("publish-CKcN3504.js", include_str!("../static/av/assets/publish-CKcN3504.js")),
-        ("time-NjxxPrvf.js", include_str!("../static/av/assets/time-NjxxPrvf.js")),
+        // Rebuilt 2026-05-25 as component-only bundles (side-effect
+        // imports of @moq/publish/element and @moq/watch/element).
+        //
+        // Previous bundles (watch-DdXJRVCU.js / publish-CKcN3504.js)
+        // were built from iroh-live-relay/web's demo app — they
+        // include the demo wrapper that does
+        // `document.getElementById("publish")` and throws on missing
+        // element. That's why the browser console showed:
+        //   "missing <moq-publish> element"
+        //   "Cannot read properties of null (reading 'addEventListener')"
+        // No amount of placeholder elements in moq-loader.ts could
+        // satisfy the demo wrapper, because it looks for IDs
+        // ("publish", "watch", "landing", ...) not tag names.
+        //
+        // Build source: /tmp/moq-components-bundle (a minimal Vite
+        // project with src/{publish,watch}-elem.ts each containing
+        // just `import "@moq/{publish,watch}/element"`). Built with
+        // @moq/hang pinned to 0.2.5 because 0.2.6 transitively
+        // depends on @moq/loc which is unpublished on npm.
+        ("watch-CTz_Tjt7.js", include_str!("../static/av/assets/watch-CTz_Tjt7.js")),
+        ("publish-Du5ksDQe.js", include_str!("../static/av/assets/publish-Du5ksDQe.js")),
+        ("time-D4Xqna_f.js", include_str!("../static/av/assets/time-D4Xqna_f.js")),
         ("main-DGBFe0O7-CIZu5tmC.js", include_str!("../static/av/assets/main-DGBFe0O7-CIZu5tmC.js")),
         ("main-DGBFe0O7-DQ8if_La.js", include_str!("../static/av/assets/main-DGBFe0O7-DQ8if_La.js")),
         ("libav-opus-af-BlMWboA7-B4GfDr9_.js", include_str!("../static/av/assets/libav-opus-af-BlMWboA7-B4GfDr9_.js")),

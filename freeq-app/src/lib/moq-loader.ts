@@ -10,12 +10,12 @@ let loaded = false;
 let loading: Promise<void> | null = null;
 
 const SCRIPTS = [
-  '/av/assets/publish-CKcN3504.js',
-  '/av/assets/watch-DdXJRVCU.js',
+  '/av/assets/publish-Du5ksDQe.js',
+  '/av/assets/watch-CTz_Tjt7.js',
 ];
 
 const PRELOADS = [
-  '/av/assets/time-NjxxPrvf.js',
+  '/av/assets/time-D4Xqna_f.js',
 ];
 
 export function loadMoqComponents(): Promise<void> {
