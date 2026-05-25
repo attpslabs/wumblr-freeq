@@ -89,8 +89,25 @@ fn is_address_allowed(cfg: &SharedConfig, asker: &str) -> bool {
         return true;
     }
     let tail: Vec<&String> = chain.iter().rev().take(RECENT_K).collect();
-    let all_peer = tail.iter().all(|n| cfg.peer_agents.contains(*n));
+    let all_peer = tail.iter().all(|n| is_peer_nick(&cfg.peer_agents, n));
     !all_peer
+}
+
+/// True if `nick` matches one of `peers` either exactly or by the
+/// pre-dash prefix. The server suffixes fresh DIDs with `-<bs58>` so
+/// `oblivion-z6mkfa8x` should still match a configured peer of
+/// `"oblivion"`. Case-insensitive (`peers` are lowercased on load).
+fn is_peer_nick(peers: &std::collections::HashSet<String>, nick: &str) -> bool {
+    let nick_lc = nick.to_ascii_lowercase();
+    if peers.contains(&nick_lc) {
+        return true;
+    }
+    if let Some((prefix, _)) = nick_lc.split_once('-') {
+        if peers.contains(prefix) {
+            return true;
+        }
+    }
+    false
 }
 use crate::imagegen::AiImageConfig;
 use crate::stt::{to_whisper_pcm, SttEngine};
