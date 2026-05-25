@@ -555,6 +555,16 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                                     call.speaker.clone(),
                                     call.video.peer_level_handle(),
                                 );
+                                // Backchannels: listen-mode "mm" /
+                                // "right" while a peer is talking.
+                                // Aborts when the call's MoQ task
+                                // drops (the speaker handle stops
+                                // accepting enqueues).
+                                let _ = spawn_backchannel_loop(
+                                    cfg.clone(),
+                                    call.speaker.clone(),
+                                    call.video.peer_level_handle(),
+                                );
                                 *active_guard = Some(call);
                             }
                             Err(e) => {
@@ -668,6 +678,34 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     continue;
                 }
                 if from.eq_ignore_ascii_case(&cfg.nick) {
+                    continue;
+                }
+                // Shared whiteboard: peer agents emit "[diag] X|R|Y"
+                // bullets to broadcast new edges. We parse those into
+                // our local diagram so every tile draws the same
+                // whiteboard. Skip the address path entirely for these.
+                if let Some(rest) = text.strip_prefix("[diag] ") {
+                    if is_peer_nick(&cfg.peer_agents, &from) {
+                        let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                        if parts.len() == 3 {
+                            if let Ok(mut log) = cfg.diagrams.lock() {
+                                let d = log.entry(target.clone()).or_default();
+                                let sentence =
+                                    format!("{} {} {}", parts[0], parts[1], parts[2]);
+                                if d.ingest(&sentence) > 0 {
+                                    let steps = d.to_steps();
+                                    if !steps.is_empty() {
+                                        if let Some(call) = active.lock().await.as_ref() {
+                                            call.video.show_board(
+                                                steps,
+                                                "#7FE7CB".into(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 let Some(question) = address_with_aliases(&text, &cfg.nick) else {
@@ -1128,6 +1166,113 @@ async fn wait_for_room_quiet(peer_level: &Arc<std::sync::atomic::AtomicU32>) {
     }
 }
 
+/// Periodic backchannel: every few seconds, check whether a peer has
+/// been continuously talking. If so, drop a barely-audible "mm" /
+/// "hm" through the bot's own voice chain so the listening agent
+/// feels present. Rate-limited per bot so it never piles up. Aborts
+/// when the call ends (the caller holds the JoinHandle on
+/// `ActiveCall::backchannel_task`).
+fn spawn_backchannel_loop(
+    cfg: Arc<SharedConfig>,
+    speaker: freeq_av::Speaker,
+    peer_level: Arc<std::sync::atomic::AtomicU32>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(el_key) = cfg.elevenlabs_api_key.clone() else {
+            return;
+        };
+        // Skip backchannels for characters without a profile (e.g.
+        // plain "eliza"); the rest map to TTS voices we know.
+        let Some(profile) = crate::character_profile::by_name(&cfg.ghostly_character)
+        else {
+            return;
+        };
+        let voice_id = cfg.elevenlabs_voice_id.clone();
+        let model = cfg.elevenlabs_model.clone();
+        let http = cfg.http.clone();
+        let character = cfg.ghostly_character.clone();
+        let _ = profile; // voice_id is already pulled from cfg
+        let voice_profile = ghostly::audio::profile::for_character(&character);
+
+        let mut chain =
+            ghostly::audio::VoiceChain::new(voice_profile, tts::ELEVENLABS_PCM_RATE as f32);
+        let mut counter: u32 = 0;
+        let mut last_backchannel = Instant::now() - Duration::from_secs(60);
+        let mut peer_loud_since: Option<Instant> = None;
+        // Min seconds between two backchannels from this bot.
+        const MIN_GAP: f32 = 9.0;
+        // Peer must be talking continuously for this long before we
+        // chime in (so we don't backchannel a stray syllable).
+        const SUSTAIN: Duration = Duration::from_millis(1800);
+        const PEER_THRESHOLD: f32 = 0.04;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let level = f32::from_bits(
+                peer_level.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if level >= PEER_THRESHOLD {
+                if peer_loud_since.is_none() {
+                    peer_loud_since = Some(Instant::now());
+                }
+            } else {
+                peer_loud_since = None;
+                continue;
+            }
+            let Some(loud_since) = peer_loud_since else { continue };
+            if loud_since.elapsed() < SUSTAIN {
+                continue;
+            }
+            // Skip if our own speaker is currently playing audio —
+            // backchanneling over our own answer reads as a stutter,
+            // not as listening.
+            if speaker.is_speaking() {
+                continue;
+            }
+            let elapsed = last_backchannel.elapsed().as_secs_f32();
+            let Some(phrase) =
+                crate::social::pick_backchannel(&character, elapsed, MIN_GAP, counter)
+            else {
+                continue;
+            };
+            counter = counter.wrapping_add(1);
+            last_backchannel = Instant::now();
+
+            // Synthesize + softly enqueue. We mix the PCM at reduced
+            // gain by attenuating BEFORE the voice chain — the chain's
+            // output_gain pushes back up to consistent loudness with
+            // the per-character tuning, but the input attenuation keeps
+            // the backchannel quieter than a real answer.
+            let mut work: Vec<f32> = Vec::with_capacity(4096);
+            let chain_ref = &mut chain;
+            let work_ref = &mut work;
+            let sp_ref = &speaker;
+            if let Err(e) = tts::synthesize_streaming(
+                &http,
+                &el_key,
+                &voice_id,
+                &model,
+                phrase,
+                |pcm| {
+                    work_ref.clear();
+                    work_ref.extend_from_slice(pcm);
+                    // 0.35× pre-chain attenuation — the "mm" sits
+                    // under the conversation, never over it.
+                    for s in work_ref.iter_mut() {
+                        *s *= 0.35;
+                    }
+                    chain_ref.process(work_ref);
+                    sp_ref.enqueue(work_ref, tts::ELEVENLABS_PCM_RATE);
+                },
+            )
+            .await
+            {
+                tracing::warn!(error = ?e, "backchannel TTS failed");
+            }
+        }
+    })
+}
+
 /// Speak the character's `hello_line` through ElevenLabs + the per-
 /// character voice chain + the call speaker, then return. Runs once
 /// per call activation. Silent no-op if any of (ElevenLabs key,
@@ -1144,7 +1289,21 @@ fn spawn_hello_on_join(
     let Some(profile) = crate::character_profile::by_name(&cfg.ghostly_character) else {
         return;
     };
-    let text = profile.hello_line.to_string();
+    // Session recall: prepend a one-line "I remember…" hook drawn
+    // from the most recent past exchange, so the bot opens a fresh
+    // call with continuity instead of a cold restart. Best-effort —
+    // when memory is unavailable or empty, fall through to the
+    // plain hello-line.
+    let mut text = profile.hello_line.to_string();
+    if let Some(mem) = cfg.memory.as_ref() {
+        // Cross-channel: we want the bot's last memorable exchange
+        // wherever it happened, not necessarily this room.
+        if let Ok(recs) = mem.recall("decided shipped agreed planned", None, 4) {
+            if let Some(hook) = crate::social::format_session_recall(&recs) {
+                text = format!("{text} {hook}");
+            }
+        }
+    }
     let voice_id = cfg.elevenlabs_voice_id.clone();
     let model = cfg.elevenlabs_model.clone();
     let http = cfg.http.clone();
@@ -1578,6 +1737,54 @@ async fn transcribe_participant(
                     }
                     tracing::info!(%nick, %text, "transcribed utterance");
 
+                    // Peer-aware gaze: if this utterance is a human
+                    // addressing one of the OTHER agents in the room,
+                    // swing our head toward that peer. Reads as a real
+                    // meeting — three people in a room, when one is
+                    // called on, the others look at them.
+                    if !is_peer_nick(&cfg.peer_agents, &nick) {
+                        let peer_names: Vec<&str> = cfg
+                            .peer_agents
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect();
+                        if let Some(addressee) =
+                            crate::social::extract_addressee(&text, &peer_names)
+                        {
+                            // Only swing gaze when the addressee is
+                            // NOT us — when WE are being addressed,
+                            // the answer flow's FocusGuard already
+                            // points our eyes at the asker.
+                            let self_canonical = cfg
+                                .nick
+                                .split_once('-')
+                                .map(|(p, _)| p)
+                                .unwrap_or(cfg.nick.as_str())
+                                .to_ascii_lowercase();
+                            if addressee != self_canonical {
+                                if let Some(call) = active.lock().await.as_ref() {
+                                    call.video.set_focus_nick(Some(addressee.clone()));
+                                    tracing::info!(
+                                        target = %addressee,
+                                        "peer-aware gaze — looking at addressed peer"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Hand-raise: my name was dropped mid-
+                        // sentence but not directly addressed.
+                        // Brighten the halo briefly so the operator
+                        // sees "I have something to add" without me
+                        // actually speaking.
+                        if crate::social::mention_without_address(&text, &cfg.nick) {
+                            if let Some(call) = active.lock().await.as_ref() {
+                                call.video.flash_hand_raise();
+                                tracing::info!("hand-raise — my name was mentioned");
+                            }
+                        }
+                    }
+
                     // Voice-addressed Q&A: if the utterance starts with
                     // the bot's name ("eliza, summarize…"), treat
                     // it as a spoken question — answer + speak back —
@@ -1682,11 +1889,15 @@ async fn transcribe_participant(
                     };
                     // Live diagram: feed every transcribed utterance to
                     // the per-channel graph. When new edges appear, push
-                    // the updated step list to the whiteboard so the room
-                    // sees the diagram of the conversation form in real
-                    // time — the visual half of "conversation as source
-                    // of knowledge work".
+                    // the updated step list to the whiteboard AND
+                    // broadcast each fresh triple to peer agents over
+                    // IRC so every tile in the room renders the same
+                    // shared whiteboard.
                     if let Some(video) = video_snapshot {
+                        let edges_before = {
+                            let log = cfg.diagrams.lock().expect("diagrams poisoned");
+                            log.get(&channel).map(|d| d.edge_count()).unwrap_or(0)
+                        };
                         let added = {
                             let mut log = cfg.diagrams.lock().expect("diagrams poisoned");
                             log.entry(channel.clone())
@@ -1694,15 +1905,47 @@ async fn transcribe_participant(
                                 .ingest(&text)
                         };
                         if added > 0 {
-                            let steps = {
-                                let log = cfg.diagrams.lock().expect("diagrams poisoned");
-                                log.get(&channel)
+                            // Snapshot the new edges (those appended
+                            // after `edges_before`) so we broadcast
+                            // exactly the deltas, not the whole graph.
+                            let (steps, new_edges) = {
+                                let log =
+                                    cfg.diagrams.lock().expect("diagrams poisoned");
+                                let d = log.get(&channel);
+                                let steps = d
                                     .map(|d| d.to_steps())
-                                    .unwrap_or_default()
+                                    .unwrap_or_default();
+                                let new_edges: Vec<(String, String, String)> = d
+                                    .map(|d| {
+                                        d.edges()
+                                            .skip(edges_before)
+                                            .map(|e| {
+                                                (
+                                                    e.from.clone(),
+                                                    e.relation.clone(),
+                                                    e.to.clone(),
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                (steps, new_edges)
                             };
                             if !steps.is_empty() {
-                                // Mint teal accent — matches the Eliza palette.
                                 video.show_board(steps, "#7FE7CB".into());
+                            }
+                            // Broadcast the new triples so peer bots
+                            // merge them into their local diagram.
+                            // Format: `[diag] from|relation|to` — peers
+                            // parse this on PRIVMSG, humans see it as
+                            // small structured bullet they can ignore.
+                            for (f, r, t) in new_edges {
+                                let _ = handle
+                                    .privmsg(
+                                        &channel,
+                                        &format!("[diag] {f}|{r}|{t}"),
+                                    )
+                                    .await;
                             }
                         }
                     }

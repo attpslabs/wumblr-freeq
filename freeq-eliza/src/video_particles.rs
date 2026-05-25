@@ -161,7 +161,16 @@ pub(crate) fn render_loop(tile: VideoTile, character_name: &str) {
         // whether the agent is hearing sound and whether it has a
         // call in flight — visible regardless of which way the face
         // happens to be turned.
-        state.set_listening_level(peer);
+        //
+        // Hand-raise flash boosts the listening level briefly when
+        // the bot was name-dropped but not addressed: "I have
+        // something to add." Decays linearly over 3 s so the boost
+        // reads as a deliberate pulse, not a steady state.
+        let hand_raise = match tile.hand_raise_seconds_ago() {
+            Some(elapsed) if elapsed < 3.0 => 1.0 - (elapsed / 3.0),
+            _ => 0.0,
+        };
+        state.set_listening_level((peer + hand_raise * 0.7).clamp(0.0, 1.0));
         state.set_working(thinking);
 
         // Sticky gaze — when the bot is mid-exchange with someone,

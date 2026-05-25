@@ -234,6 +234,11 @@ pub struct VideoTile {
     pub(crate) peer_level: Arc<AtomicU32>,
     /// Set while an LLM call is in flight — drives the "thinking" mood.
     pub(crate) thinking: Arc<AtomicBool>,
+    /// Monotonic SystemTime epoch (millis) of the last `flash_hand_raise`
+    /// call. The particles render loop checks `now - hand_raise_at < N`
+    /// and brightens the status halo + tilts the head while that window
+    /// is open. The flash decays naturally without needing a timer task.
+    pub(crate) hand_raise_at: Arc<AtomicU64>,
     /// `data:image/jpeg;base64,…` of the frame currently being analyzed
     /// by the vision model. While set, the tile shows a PiP of it and
     /// flips into [`Mood::Vision`].
@@ -274,6 +279,7 @@ impl VideoTile {
             level: Arc::new(AtomicU32::new(0)),
             peer_level: Arc::new(AtomicU32::new(0)),
             thinking: Arc::new(AtomicBool::new(false)),
+            hand_raise_at: Arc::new(AtomicU64::new(0)),
             vision_thumb: Arc::new(Mutex::new(None)),
             scene: Arc::new(Mutex::new(None)),
             board: Arc::new(Mutex::new(None)),
@@ -396,6 +402,35 @@ impl VideoTile {
     }
 
     /// Mark whether an LLM call is in flight (drives the thinking mood).
+    /// Fire a hand-raise pulse — the renderer brightens the halo and
+    /// gently tilts the head for ~3 s. Call when the bot has been name-
+    /// dropped but not directly addressed; visual-only ("I have
+    /// something to add") without breaking the strict address policy.
+    pub fn flash_hand_raise(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.hand_raise_at
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Snapshot of the time since the most recent hand-raise (seconds).
+    /// `None` if no flash has ever been requested. Used by the
+    /// particles renderer to decay the visual.
+    pub fn hand_raise_seconds_ago(&self) -> Option<f32> {
+        let stamp = self.hand_raise_at.load(std::sync::atomic::Ordering::Relaxed);
+        if stamp == 0 {
+            return None;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let elapsed_ms = now_ms.saturating_sub(stamp);
+        Some(elapsed_ms as f32 / 1000.0)
+    }
+
     pub fn set_thinking(&self, on: bool) {
         self.thinking.store(on, Ordering::Relaxed);
     }
