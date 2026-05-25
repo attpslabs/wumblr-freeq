@@ -63,7 +63,6 @@ fn address_with_aliases(text: &str, nick: &str) -> Option<String> {
 /// you think?" → "Utopia, ..." → "Oblivion, ..." exchange lands)
 /// and stops at the 3rd.
 fn is_address_allowed(cfg: &SharedConfig, asker: &str) -> bool {
-    const RECENT_K: usize = 3;
     const HISTORY_KEEP: usize = 5;
     let asker_lc = asker.to_ascii_lowercase();
     let mut chain = cfg.addressing_chain.lock().expect("addressing chain poisoned");
@@ -75,15 +74,14 @@ fn is_address_allowed(cfg: &SharedConfig, asker: &str) -> bool {
     if cfg.peer_agents.is_empty() {
         return true;
     }
-    // Only suppress if we have enough recent history AND every entry
-    // in the last K window is a known peer. A single human in the
-    // window unlocks the next exchange.
-    if chain.len() < RECENT_K {
-        return true;
-    }
-    let tail: Vec<&String> = chain.iter().rev().take(RECENT_K).collect();
-    let all_peer = tail.iter().all(|n| is_peer_nick(&cfg.peer_agents, n));
-    !all_peer
+    // Multi-agent room: only humans address agents directly. If the
+    // current addresser is a known peer agent, suppress — peer ↔ peer
+    // exchanges spiral too easily (one bot's reply mentions another
+    // by name, which the LLM is happy to do despite the prompt rule
+    // against it, and the loop is off). The cost is that we lose the
+    // "bots argue with each other" mode entirely; the operator has
+    // direct control over who speaks instead.
+    !is_peer_nick(&cfg.peer_agents, &asker_lc)
 }
 
 /// True if `nick` matches one of `peers` either exactly or by the
