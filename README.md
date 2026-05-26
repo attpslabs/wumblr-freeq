@@ -1,3 +1,20 @@
+# attpslabs/wumblr-freeq
+
+This is the public companion to [`attpslabs/wumblr`](https://github.com/attpslabs/wumblr) — the wumblr web/mobile frontend. Everything that isn't UI code (the OAuth-glue backend, the VerifiableCredential issuer, the IRC server, deployment infra, lexicon shapes) lives here, MIT-licensed.
+
+The wumblr-specific surface:
+- [`wumblr-backend/`](wumblr-backend/) — OAuth-glue Rust service for the wumblr frontend
+- [`wumblr-issuer/`](wumblr-issuer/) — Ed25519 VerifiableCredential signer for `wumblr_member:<community>` credentials
+- [`wumblr-freeq-client/`](wumblr-freeq-client/) — TS SDK wrapper for the chat client
+- [`wumblr-lexicons/`](wumblr-lexicons/) — `com.wumblr.*` lexicon JSONs + TS exports
+- [`wumblr-shared/`](wumblr-shared/) — TS utility code consumed by the wumblr frontend
+- [`wumblr-deploy/`](wumblr-deploy/) — `Dockerfile` + `docker-compose.yml` + `nginx.conf` for the full stack
+- [`docs/`](docs/) — milestone closeout notes ([M2-CLOSEOUT.md](docs/M2-CLOSEOUT.md))
+
+Everything else is upstream freeq, branded for wumblr. The upstream README follows.
+
+---
+
 <p align="center">
   <img src="freeq.png" alt="freeq logo" width="200">
 </p>
