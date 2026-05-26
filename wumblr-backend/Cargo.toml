@@ -3,8 +3,7 @@ name = "wumblr-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
-description = "wumblr product API — approval queue, freeq credential issuer, broker/appview glue"
+description = "wumblr backend — OAuth-glue session bridge between freeq-auth-broker and the wumblr frontend"
 
 [dependencies]
 tokio.workspace = true

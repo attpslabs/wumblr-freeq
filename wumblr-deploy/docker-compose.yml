@@ -78,10 +78,25 @@ services:
       - "3090"
     networks: [wumblr]
 
+  backend:
+    image: wumblr-freeq:latest
+    restart: unless-stopped
+    entrypoint: ["wumblr-backend"]
+    environment:
+      WUMBLR_LISTEN: "0.0.0.0:8787"
+      WUMBLR_PUBLIC_ORIGIN: "${WUMBLR_BACKEND_PUBLIC_ORIGIN:-https://api.wumblr.com}"
+      WUMBLR_BROKER_URL: "http://broker:3080"
+      WUMBLR_ADMIN_DIDS: "${WUMBLR_ADMIN_DIDS:-}"
+      WUMBLR_DEV_CALLBACK_TARGET: "${WUMBLR_DEV_CALLBACK_TARGET:-}"
+      RUST_LOG: "wumblr_backend=info,tower_http=info"
+    expose:
+      - "8787"
+    networks: [wumblr]
+
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
-    depends_on: [freeq, broker, issuer]
+    depends_on: [freeq, broker, issuer, backend]
     ports:
       - "443:443"
       - "80:80"

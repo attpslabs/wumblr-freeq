@@ -14,6 +14,7 @@ members = [
     "freeq-agent-kit",
     "freeq-eliza",
     "wumblr-issuer",
+    "wumblr-backend",
 ]
 exclude = [
     "freeq-app/src-tauri",
@@ -26,6 +27,7 @@ license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
@@ -52,7 +54,7 @@ open = "5"
 dirs = "5"
 rusqlite = { version = "0.38", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws", "multipart"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 hmac = "0.12"

@@ -20,11 +20,13 @@ COPY freeq-av/          freeq-av/
 COPY freeq-agent-kit/   freeq-agent-kit/
 COPY freeq-eliza/       freeq-eliza/
 COPY wumblr-issuer/     wumblr-issuer/
+COPY wumblr-backend/    wumblr-backend/
 
 RUN cargo build --release \
     -p freeq-server \
     -p freeq-auth-broker \
-    -p wumblr-issuer
+    -p wumblr-issuer \
+    -p wumblr-backend
 
 
 FROM debian:bookworm-slim AS runtime
@@ -37,11 +39,12 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/freeq-server      /usr/local/bin/freeq-server
 COPY --from=builder /src/target/release/freeq-auth-broker /usr/local/bin/freeq-auth-broker
 COPY --from=builder /src/target/release/wumblr-issuer     /usr/local/bin/wumblr-issuer
+COPY --from=builder /src/target/release/wumblr-backend    /usr/local/bin/wumblr-backend
 
 VOLUME /data
 USER wumblr
 
 ENV RUST_LOG=info
-EXPOSE 3080 3090 6667 8080
+EXPOSE 3080 3090 6667 8080 8787
 
 ENTRYPOINT ["freeq-server"]
