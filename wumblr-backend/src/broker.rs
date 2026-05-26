@@ -1,46 +1,47 @@
-//! freeq-auth-broker client (stubbed in M1 step 4).
+//! freeq-auth-broker client.
 //!
-//! When wired up in M2, this module will:
-//!  - POST OAuth-session blobs to `<broker>/sessions`, receiving an opaque ID.
-//!  - GET `<broker>/whoami` with a bearer to resolve a session → `did + handle + profile`.
-//!  - POST DPoP-proxied PDS writes via `<broker>/xrpc/com.atproto.repo.createRecord`.
+//! The broker is the OAuth orchestrator: it runs `/auth/login` →
+//! bsky.social → `/auth/callback` itself, stores encrypted sessions in its
+//! own SQLite, and exposes a single client-facing endpoint `POST /session`
+//! that exchanges a `broker_token` (received by the browser as part of
+//! the broker's `return_to` redirect) for the user's `{did, handle}` plus
+//! a freeq web-token usable for SASL on the chat WebSocket.
 //!
-//! For step 4 we ship a `Mock` impl that records what *would* have been sent
-//! and returns synthesized DIDs. This unblocks the M1 ship-gate
-//! ("log in with Bluesky → see DID on Home") without needing a running broker.
+//! See freeq-auth-broker/src/main.rs:942-1021 for the canonical shape.
+//!
+//! There is no `/whoami` or `/sessions` ingest endpoint; the previous
+//! M1 trait that accepted an OAuth-blob from the client is gone. The
+//! frontend now redirects directly to the broker and presents the
+//! returned `broker_token` to this backend, which forwards it.
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
+/// Result of resolving a broker token. The fields mirror the broker's
+/// `BrokerSessionResponse` (see freeq-auth-broker/src/main.rs:294-299).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WhoAmI {
+pub struct ResolvedSession {
     pub did: String,
-    pub handle: Option<String>,
+    pub handle: String,
+    /// Opaque freeq web-token; the client passes this on the WebSocket
+    /// SASL handshake to freeq-server (which trusts it because the broker
+    /// minted it via an HMAC-authed `/auth/broker/web-token` push).
+    pub freeq_web_token: String,
+    pub nick: String,
 }
 
-/// Capability the backend needs from the broker. Real HTTP impl lands in M2.
+#[async_trait::async_trait]
 pub trait BrokerClient: Send + Sync {
-    /// Resolve a session bearer → DID/handle. Returns `None` when unknown.
-    fn whoami(&self, session_id: &str) -> Result<Option<WhoAmI>>;
-
-    /// Store an OAuth-session blob (as serialized by `@atproto/oauth-client-expo`)
-    /// and return an opaque session_id the client can present on subsequent requests.
-    fn register_session(&self, did: &str, session_blob: Value) -> Result<String>;
+    /// Exchange a one-time `broker_token` (delivered to the client by the
+    /// broker's OAuth-callback redirect) for the session it represents.
+    /// Returns `None` if the token is unknown or expired.
+    async fn resolve_broker_token(&self, broker_token: &str) -> Result<Option<ResolvedSession>>;
 }
 
-/// In-memory mock used in M1. Real `HttpBroker` impl lands in M2.
-///
-/// Behavior:
-///  - `register_session` records the session blob and returns
-///    `wumblr-session-<rand>`. The DID is taken from the call's `did` arg,
-///    which the RN client extracts from the `OAuthSession.did` returned by
-///    `@atproto/oauth-client-expo.signIn()`.
-///  - `whoami` looks up the registered session and returns the DID.
-///  - All state is process-local — restarting wumblr-backend invalidates
-///    every session. Fine for dev; real broker has SQLite persistence.
+/// In-memory test/dev impl. Maps pre-seeded tokens → sessions. Used by
+/// unit tests; the runtime binding is `HttpBroker` in `app.rs`.
 #[derive(Default)]
 pub struct MockBroker {
     inner: Arc<Mutex<MockState>>,
@@ -48,43 +49,91 @@ pub struct MockBroker {
 
 #[derive(Default)]
 struct MockState {
-    sessions: std::collections::HashMap<String, MockSession>,
-    next_id: u64,
-}
-
-#[derive(Clone)]
-struct MockSession {
-    did: String,
-    #[allow(dead_code)] // we'll inspect this in tests once they land
-    blob: Value,
+    sessions: std::collections::HashMap<String, ResolvedSession>,
 }
 
 impl MockBroker {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Pre-seed a token → session mapping for tests.
+    pub fn seed(&self, broker_token: &str, session: ResolvedSession) {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(broker_token.to_string(), session);
+    }
 }
 
+#[async_trait::async_trait]
 impl BrokerClient for MockBroker {
-    fn whoami(&self, session_id: &str) -> Result<Option<WhoAmI>> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.sessions.get(session_id).map(|s| WhoAmI {
-            did: s.did.clone(),
-            handle: None,
-        }))
+    async fn resolve_broker_token(&self, broker_token: &str) -> Result<Option<ResolvedSession>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(broker_token)
+            .cloned())
     }
+}
 
-    fn register_session(&self, did: &str, session_blob: Value) -> Result<String> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.next_id += 1;
-        let session_id = format!("wumblr-session-{}", inner.next_id);
-        inner.sessions.insert(
-            session_id.clone(),
-            MockSession {
-                did: did.to_string(),
-                blob: session_blob,
-            },
-        );
-        Ok(session_id)
+/// HTTP client against a real freeq-auth-broker. Used in production.
+pub struct HttpBroker {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+impl HttpBroker {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SessionRequest<'a> {
+    broker_token: &'a str,
+}
+
+#[derive(Deserialize)]
+struct SessionResponse {
+    token: String,
+    nick: String,
+    did: String,
+    handle: String,
+}
+
+#[async_trait::async_trait]
+impl BrokerClient for HttpBroker {
+    async fn resolve_broker_token(&self, broker_token: &str) -> Result<Option<ResolvedSession>> {
+        let resp = self
+            .http
+            .post(format!("{}/session", self.base_url))
+            .json(&SessionRequest { broker_token })
+            .send()
+            .await
+            .context("calling broker /session")?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("broker /session returned {status}: {body}");
+        }
+
+        let body: SessionResponse = resp.json().await.context("decoding broker /session body")?;
+        Ok(Some(ResolvedSession {
+            did: body.did,
+            handle: body.handle,
+            freeq_web_token: body.token,
+            nick: body.nick,
+        }))
     }
 }

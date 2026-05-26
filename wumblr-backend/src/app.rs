@@ -11,7 +11,7 @@ use tower_http::{
 };
 
 use crate::{
-    broker::{BrokerClient, MockBroker},
+    broker::{BrokerClient, HttpBroker, MockBroker},
     config::Config,
     routes::{auth, health, session, well_known},
 };
@@ -20,23 +20,31 @@ use crate::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub broker: Arc<dyn BrokerClient>,
+    pub sessions: Arc<session::SessionStore>,
 }
 
 pub fn router(config: Config) -> Router {
-    let state = AppState {
-        config: Arc::new(config),
-        // M1 step 4: in-memory mock. Real HttpBroker swaps in at M2.
-        broker: Arc::new(MockBroker::new()),
+    // Broker selection: an explicit WUMBLR_DEV_MOCK_BROKER=1 forces the
+    // in-memory mock for unit-style local dev. Otherwise we point at the
+    // real broker at WUMBLR_BROKER_URL.
+    let broker: Arc<dyn BrokerClient> = if std::env::var("WUMBLR_DEV_MOCK_BROKER").is_ok() {
+        tracing::warn!("WUMBLR_DEV_MOCK_BROKER set — using in-memory MockBroker");
+        Arc::new(MockBroker::new())
+    } else {
+        Arc::new(HttpBroker::new(config.broker_url.clone()))
     };
 
-    // Permissive CORS for M1 dev. Tightens at M5 deploy.
+    let state = AppState {
+        config: Arc::new(config),
+        broker,
+        sessions: Arc::new(session::SessionStore::new()),
+    };
+
+    // Permissive CORS for M1/M2 dev. Tightens at M5 deploy.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::mirror_request())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .allow_credentials(false);
 
     Router::new()
@@ -48,14 +56,13 @@ pub fn router(config: Config) -> Router {
             get(well_known::oauth_client_metadata),
         )
         .route("/jwks.json", get(well_known::jwks))
-        // did:web identity for wumblr itself + the freeq credential issuer
+        // did:web identity for wumblr itself. (The issuer DID
+        // `did:web:api.wumblr.com:verify` is published by wumblr-issuer,
+        // routed at the same hostname via nginx.)
         .route("/.well-known/did.json", get(well_known::did_document))
-        .route(
-            "/verify/.well-known/did.json",
-            get(well_known::verify_did_document),
-        )
-        // Session endpoints (M1 step 4)
-        .route("/session/register", post(session::register_session))
+        // Session exchange — frontend posts broker_token, gets back a wumblr
+        // bearer + identity + freeq web-token.
+        .route("/session/exchange", post(session::exchange))
         .route("/me", get(session::me))
         // Dev-only OAuth callback bridge — see routes/auth.rs.
         .route("/auth/callback", get(auth::callback))

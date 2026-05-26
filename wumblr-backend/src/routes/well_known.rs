@@ -80,22 +80,6 @@ pub async fn did_document(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// `did:web:wumblr.com:verify` — the issuer DID used for freeq policy
-/// credentials. wumblr-freeq verifies `wumblr_member:<rkey>` credential
-/// signatures against this DID's verification method.
-///
-/// **M1 step 2 placeholder:** no verification method yet. Real key material
-/// lands in M2 when the freeq credential signer is wired up.
-pub async fn verify_did_document(State(state): State<AppState>) -> Json<Value> {
-    let mut did = derive_did_web(&state.config.public_origin);
-    did.push_str(":verify");
-    Json(json!({
-        "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": did,
-        "verificationMethod": [],
-    }))
-}
-
 /// Convert a public origin like `https://wumblr.com` → `did:web:wumblr.com`.
 /// For `http://127.0.0.1:8787` we emit `did:web:127.0.0.1%3A8787` (per spec).
 fn derive_did_web(origin: &str) -> String {
