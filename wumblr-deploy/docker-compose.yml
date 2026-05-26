@@ -27,6 +27,15 @@ services:
       dockerfile: wumblr-deploy/Dockerfile
     image: wumblr-freeq:latest
     restart: unless-stopped
+    # Force IPv4-only DNS resolution. The container's resolver returns AAAA
+    # records for public hostnames like api.wumblr.com (Cloudflare has both),
+    # but Docker's default bridge network has no public IPv6 routing — so
+    # freeq-sdk's `tokio::net::lookup_host` gets back v6 addresses and the
+    # subsequent connect() times out. The single-A4-only flag below makes
+    # glibc return only A records, so the resolver only ever sees IPv4.
+    dns_opt:
+      - single-request
+      - no-aaaa
     environment:
       BROKER_SHARED_SECRET: "${BROKER_SHARED_SECRET:?BROKER_SHARED_SECRET must be set}"
       OPER_DIDS: "${WUMBLR_OPER_DIDS:-}"
