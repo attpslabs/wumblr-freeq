@@ -1,0 +1,24 @@
+{
+  "name": "@wumblr/freeq-client",
+  "version": "0.0.0",
+  "private": false,
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/attpslabs/wumblr-freeq.git",
+    "directory": "wumblr-freeq-client"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@freeq/sdk": "file:../freeq-sdk-js"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3"
+  }
+}
