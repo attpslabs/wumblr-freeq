@@ -10286,6 +10286,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wumblr-issuer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bs58",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "freeq-sdk",
+ "freeq-server",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "wyz"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
