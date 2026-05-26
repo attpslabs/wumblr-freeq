@@ -25,6 +25,16 @@ pub struct Config {
     /// Empty in M1; populated when the approval queue lands in M5.
     #[arg(long, env = "WUMBLR_ADMIN_DIDS", default_value = "", value_delimiter = ',')]
     pub admin_dids: Vec<String>,
+
+    /// Dev-only OAuth callback bridge target. When set, GET /auth/callback
+    /// 302-redirects (or JS-redirects for fragment-bearing responses) to
+    /// this URL + the original ?query and #fragment.
+    ///
+    /// Set to e.g. `http://127.0.0.1:8081/auth/callback` during local
+    /// development. Leave unset in production; the frontend on
+    /// Cloudflare Pages will own the URL directly.
+    #[arg(long, env = "WUMBLR_DEV_CALLBACK_TARGET")]
+    pub dev_callback_target: Option<String>,
 }
 
 impl Config {

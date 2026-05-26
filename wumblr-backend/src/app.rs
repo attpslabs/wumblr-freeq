@@ -13,7 +13,7 @@ use tower_http::{
 use crate::{
     broker::{BrokerClient, MockBroker},
     config::Config,
-    routes::{health, session, well_known},
+    routes::{auth, health, session, well_known},
 };
 
 #[derive(Clone)]
@@ -57,6 +57,8 @@ pub fn router(config: Config) -> Router {
         // Session endpoints (M1 step 4)
         .route("/session/register", post(session::register_session))
         .route("/me", get(session::me))
+        // Dev-only OAuth callback bridge — see routes/auth.rs.
+        .route("/auth/callback", get(auth::callback))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

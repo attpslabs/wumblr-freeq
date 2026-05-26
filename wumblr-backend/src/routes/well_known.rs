@@ -28,15 +28,13 @@ pub async fn oauth_client_metadata(State(state): State<AppState>) -> Json<Value>
         "response_types": ["code"],
         "scope": "atproto transition:generic",
         "redirect_uris": [
-            // Production web: where deployed Cloudflare Pages will land users.
+            // Web redirect — production AND dev share this URL. Dev gets
+            // back to localhost via a server-side bridge in
+            // routes/auth.rs (gated by the WUMBLR_DEV_CALLBACK_TARGET
+            // env var). ATProto OAuth's hosted-metadata flow only permits
+            // HTTPS-on-the-client_id-origin or custom schemes; raw
+            // localhost loopback isn't allowed for discoverable clients.
             cfg.web_redirect_uri(),
-            // Local-dev web. ATProto OAuth allows http://127.0.0.1:<port>
-            // (loopback) as a redirect URI for development clients. The web
-            // OAuth library picks whichever declared redirect matches the
-            // current document origin. From `npx expo start --web` (default
-            // 8081) the library uses this one; from production it uses the
-            // https one above. Remove or restrict before public launch.
-            "http://127.0.0.1:8081/auth/callback",
             // Native custom-scheme redirect.
             //
             // ATProto OAuth spec: "Any custom scheme must match the client_id
