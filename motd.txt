@@ -1,10 +1,7 @@
-Welcome to freeq — IRC with AT Protocol identity.
+Welcome to wumblr — community-gated private groupchat on AT Protocol.
 
 Channels:
-  #freeq        Main channel — say hello!
-  #demo-follow  Bluesky follow-gated (must follow @freeq.at)
-  #demo-github  GitHub verification demo (auto-op with linked GitHub)
-  #demo-moderation  Moderator appointment demo
+  #wumblr-general  Main channel for the wumblr community — say hello!
 
 Sign in with your Bluesky handle to get a verified identity.
-Docs & source: https://github.com/chad/freeq
+Source: https://github.com/attpslabs/wumblr-freeq

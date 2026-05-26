@@ -935,8 +935,12 @@ async fn auth_callback(
 
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://irc.freeq.at",
+    "https://wumblr.com",
+    "https://api.wumblr.com",
+    "https://auth.wumblr.com",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:8081",
 ];
 
 async fn session(
