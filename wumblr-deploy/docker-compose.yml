@@ -1,0 +1,100 @@
+# Public wumblr stack — freeq (IRC-over-WebSocket), freeq-auth-broker
+# (ATProto OAuth orchestrator), wumblr-issuer (VerifiableCredential signer),
+# and the nginx reverse proxy that fronts them all.
+#
+# Designed to be combined with a closed-product overlay (e.g. the wumblr.com
+# backend) via:
+#
+#   docker compose \
+#     -f /opt/wumblr/wumblr-freeq/deploy/docker-compose.yml \
+#     -f /opt/wumblr/wumblr/infra/docker-compose.yml \
+#     --env-file /opt/wumblr/.env \
+#     up -d --build
+#
+# Layout assumed on the host:
+#   /opt/wumblr/
+#     wumblr-freeq/         ← this repo (attpslabs/wumblr-freeq)
+#       deploy/             ← this directory
+#     wumblr/               ← closed product repo (optional)
+#     tls/cert.pem, key.pem ← TLS cert (e.g. Cloudflare origin)
+#     .env                  ← BROKER_SHARED_SECRET, WUMBLR_ISSUER_PRIVKEY_B64,
+#                             WUMBLR_ISSUER_SHARED_SECRET, etc. (chmod 600)
+
+services:
+  freeq:
+    build:
+      context: ..                # repo root (this is wumblr-deploy/)
+      dockerfile: wumblr-deploy/Dockerfile
+    image: wumblr-freeq:latest
+    restart: unless-stopped
+    environment:
+      BROKER_SHARED_SECRET: "${BROKER_SHARED_SECRET:?BROKER_SHARED_SECRET must be set}"
+      OPER_DIDS: "${WUMBLR_OPER_DIDS:-}"
+      RUST_LOG: "freeq_server=info,info"
+    command:
+      - "--listen-addr=0.0.0.0:6667"
+      - "--web-addr=0.0.0.0:8080"
+      - "--server-name=irc.wumblr.com"
+      - "--db-path=/data/irc.db"
+      - "--data-dir=/data"
+      - "--motd-file=/data/motd.txt"
+    volumes:
+      - freeq-data:/data
+      - ../motd.txt:/data/motd.txt:ro
+    expose:
+      - "6667"
+      - "8080"
+    networks: [wumblr]
+
+  broker:
+    image: wumblr-freeq:latest
+    depends_on: [freeq]
+    restart: unless-stopped
+    entrypoint: ["freeq-auth-broker"]
+    environment:
+      BROKER_SHARED_SECRET: "${BROKER_SHARED_SECRET:?BROKER_SHARED_SECRET must be set}"
+      BROKER_PUBLIC_URL: "${WUMBLR_BROKER_PUBLIC_URL:-https://auth.wumblr.com}"
+      FREEQ_SERVER_URL: "http://freeq:8080"
+      BROKER_ADDR: "0.0.0.0:3080"
+      BROKER_DB_PATH: "/data/broker.db"
+      RUST_LOG: "freeq_auth_broker=info,info"
+    volumes:
+      - broker-data:/data
+    expose:
+      - "3080"
+    networks: [wumblr]
+
+  issuer:
+    image: wumblr-freeq:latest
+    restart: unless-stopped
+    entrypoint: ["wumblr-issuer"]
+    environment:
+      WUMBLR_ISSUER_DID: "${WUMBLR_ISSUER_DID:-did:web:api.wumblr.com:verify}"
+      WUMBLR_ISSUER_LISTEN: "0.0.0.0:3090"
+      WUMBLR_ISSUER_PRIVKEY_B64: "${WUMBLR_ISSUER_PRIVKEY_B64:?WUMBLR_ISSUER_PRIVKEY_B64 must be set}"
+      WUMBLR_ISSUER_SHARED_SECRET: "${WUMBLR_ISSUER_SHARED_SECRET:?WUMBLR_ISSUER_SHARED_SECRET must be set}"
+      RUST_LOG: "wumblr_issuer=info,info"
+    expose:
+      - "3090"
+    networks: [wumblr]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on: [freeq, broker, issuer]
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/wumblr.conf:/etc/nginx/conf.d/default.conf:ro
+      # Absolute path on the host. Secrets live outside the repo checkout.
+      - /opt/wumblr/tls:/etc/nginx/tls:ro
+    networks: [wumblr]
+
+networks:
+  wumblr:
+    driver: bridge
+
+volumes:
+  freeq-data:
+  broker-data:
