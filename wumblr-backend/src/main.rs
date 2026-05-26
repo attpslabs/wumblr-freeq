@@ -6,6 +6,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod app;
+mod broker;
 mod config;
 mod routes;
 

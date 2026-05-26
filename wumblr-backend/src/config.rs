@@ -33,7 +33,10 @@ impl Config {
         format!("{}/oauth-client-metadata.json", self.public_origin)
     }
 
-    /// JWKS URL referenced from the OAuth client metadata.
+    /// JWKS URL. Not referenced by the public OAuth client metadata in M1
+    /// (`token_endpoint_auth_method: "none"` for the native+SPA flow) but
+    /// kept around for future wumblr-owned PDS writes via `private_key_jwt`.
+    #[allow(dead_code)]
     pub fn jwks_uri(&self) -> String {
         format!("{}/jwks.json", self.public_origin)
     }

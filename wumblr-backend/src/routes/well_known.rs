@@ -18,20 +18,24 @@ pub async fn oauth_client_metadata(State(state): State<AppState>) -> Json<Value>
         "client_id": cfg.oauth_client_id(),
         "client_name": "wumblr",
         "client_uri": cfg.public_origin,
-        "application_type": "web",
+        // application_type "native" matches the Expo OAuth client and lets
+        // the same metadata serve web (RN-Web) and native (iOS/Android).
+        // ATProto OAuth accepts either application_type as long as redirects
+        // and auth-method align — "native" + token_endpoint_auth_method:"none"
+        // is what `@atproto/oauth-client-expo` expects.
+        "application_type": "native",
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "scope": "atproto transition:generic",
         "redirect_uris": [
             cfg.web_redirect_uri(),
             // Native custom-scheme redirect — reverse-DNS of the client_id host.
-            // wumblr.com → com.wumblr; trailing /auth/callback for the path.
+            // wumblr.com → com.wumblr; one trailing slash after the colon.
             "com.wumblr:/auth/callback",
         ],
-        "token_endpoint_auth_method": "private_key_jwt",
-        "token_endpoint_auth_signing_alg": "ES256",
+        // Public client; native and SPA flows don't have a stable secret.
+        "token_endpoint_auth_method": "none",
         "dpop_bound_access_tokens": true,
-        "jwks_uri": cfg.jwks_uri(),
     }))
 }
 
