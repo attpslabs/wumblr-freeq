@@ -19,13 +19,11 @@ All three Rust services build from the same image (`wumblr-freeq:latest`); broke
 |-------------------------------------------------------|---------|------------------------------------------|
 | `https://api.wumblr.com/verify/.well-known/did.json`  | issuer  | did:web issuer DID document              |
 | `https://api.wumblr.com/credentials/*`                | issuer  | VerifiableCredential issuance            |
-| `https://api.wumblr.com/*`                            | backend | (closed product API — separate compose)  |
+| `https://api.wumblr.com/*`                            | backend | OAuth-glue + session bridge              |
 | `https://auth.wumblr.com/*`                           | broker  | OAuth login/callback/session             |
 | `wss://irc.wumblr.com/*`                              | freeq   | IRC-over-WebSocket transport             |
 
-## Bring up — stack-only
-
-The three public services without a closed product overlay. Useful for verifying the stack works end-to-end before integrating wumblr-backend (closed). `api.wumblr.com/*` (non-issuer paths) will return `502 Bad Gateway` because the `backend` upstream isn't declared — that's expected.
+## Bring up
 
 ```sh
 docker compose \
@@ -34,17 +32,7 @@ docker compose \
   up -d --build
 ```
 
-## Bring up — with a closed product overlay
-
-Compose merges multiple `-f` files into one project; the `wumblr` network is shared, and nginx (declared here) resolves `backend` (declared in the closed compose) via Docker's embedded DNS.
-
-```sh
-docker compose \
-  -f /opt/wumblr/wumblr-freeq/wumblr-deploy/docker-compose.yml \
-  -f /opt/wumblr/wumblr/infra/docker-compose.yml \
-  --env-file /opt/wumblr/.env \
-  up -d --build
-```
+Single compose file covers everything — all four Rust services (freeq, broker, issuer, backend) build from one image and run alongside nginx. No external repo overlays needed.
 
 ## Required environment
 
