@@ -1,0 +1,108 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.community",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A wumblr community. Stored on the owner's PDS. The record's AT-URI (at://<owner-did>/com.wumblr.community/<rkey>) is the community's stable identifier.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["displayName", "topic", "type", "createdAt"],
+        "properties": {
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Human-readable community name."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "topic": {
+            "type": "string",
+            "knownValues": [
+              "anime-manga",
+              "art",
+              "business-finance",
+              "collectibles",
+              "education-culture",
+              "fashion-beauty",
+              "food-cooking",
+              "games",
+              "health",
+              "home-garden",
+              "humanities",
+              "identity-culture",
+              "internet-culture",
+              "memes",
+              "music",
+              "nature-outdoors",
+              "news-politics",
+              "places-travel",
+              "pop-culture",
+              "qa-trivia",
+              "reading-writing",
+              "science",
+              "sports",
+              "technology",
+              "vehicles",
+              "wellness",
+              "adult",
+              "mature"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "knownValues": ["public", "restricted", "private", "mature"]
+          },
+          "banner": {
+            "type": "blob",
+            "accept": ["image/png", "image/jpeg", "image/webp"],
+            "maxSize": 1048576
+          },
+          "rules": {
+            "type": "array",
+            "maxLength": 20,
+            "items": {
+              "type": "ref",
+              "ref": "#rule"
+            }
+          },
+          "welcomeMessage": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "setupComplete": {
+            "type": "boolean",
+            "default": false
+          },
+          "successorUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "If set, this community has moved to a new owner. Appviews follow the chain."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "required": ["title"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500
+        }
+      }
+    }
+  }
+}

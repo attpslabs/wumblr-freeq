@@ -1,0 +1,26 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.community.member",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A member's assertion of community membership. Stored on the member's PDS. Must be paired with a matching com.wumblr.community.membership.grant on the owner's PDS to constitute effective membership. The rkey should equal the community's rkey, e.g. at://did:plc:alice/com.wumblr.community.member/solarpunk.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["community", "joinedAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the com.wumblr.community record."
+          },
+          "joinedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

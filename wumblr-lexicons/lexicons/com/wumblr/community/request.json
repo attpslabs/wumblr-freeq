@@ -1,0 +1,63 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.community.request",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A request to create a new community, pending admin approval. Stored on the requester's PDS. When approved, the wumblr-backend updates this record's status field (via broker DPoP proxy) and writes the actual com.wumblr.community record to the same PDS.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["slug", "displayName", "topic", "type", "status", "submittedAt"],
+        "properties": {
+          "slug": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 21,
+            "description": "URL-safe identifier; becomes the community's rkey on approval. Lowercase alphanumerics and dashes only; backend enforces ^[a-z0-9-]{3,21}$ at write time."
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "topic": {
+            "type": "string",
+            "description": "Same knownValues set as com.wumblr.community.topic."
+          },
+          "type": {
+            "type": "string",
+            "knownValues": ["public", "restricted", "private", "mature"]
+          },
+          "status": {
+            "type": "string",
+            "knownValues": ["pending", "approved", "rejected"]
+          },
+          "approvalUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "Set when status=approved. AT-URI of the resulting com.wumblr.community record."
+          },
+          "rejectionReason": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Set when status=rejected."
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "datetime"
+          },
+          "reviewedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Set when the admin approves or rejects."
+          }
+        }
+      }
+    }
+  }
+}
