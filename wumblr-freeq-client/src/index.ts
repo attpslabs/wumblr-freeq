@@ -62,25 +62,15 @@ export type WumblrFreeqEventMap = {
 export class WumblrFreeq {
 	private readonly options: WumblrFreeqOptions;
 	private readonly serverOrigin: string;
-	private client: FreeqClient | null = null;
+	private readonly client: FreeqClient;
 
 	constructor(options: WumblrFreeqOptions) {
 		this.options = options;
 		this.serverOrigin = options.serverOrigin ?? deriveHttpOrigin(options.wsUrl);
-	}
-
-	/**
-	 * Connect end-to-end:
-	 *   1. POST credential to freeq's /api/v1/credentials/present.
-	 *   2. Open WebSocket + SASL.
-	 *   3. Auto-JOIN options.channels once `ready`.
-	 *
-	 * Returns a promise that resolves on `ready`, rejects on connection error.
-	 */
-	async connect(): Promise<void> {
-		await this.presentCredential();
-
-		const client = new FreeqClient({
+		// Build the inner SDK client immediately so consumers can register
+		// event listeners via `.on()` BEFORE calling connect(). The actual
+		// network dial is deferred to connect().
+		this.client = new FreeqClient({
 			url: this.options.wsUrl,
 			nick: this.options.nick,
 			channels: this.options.channels,
@@ -91,27 +81,37 @@ export class WumblrFreeq {
 				pdsUrl: "",
 			},
 		});
-		this.client = client;
+	}
+
+	/**
+	 * Connect end-to-end:
+	 *   1. POST credential to freeq's /api/v1/credentials/present.
+	 *   2. Open WebSocket + SASL (the SDK auto-joins options.channels on ready).
+	 *
+	 * Resolves on `ready`, rejects on `authError` or pre-ready disconnect.
+	 */
+	async connect(): Promise<void> {
+		await this.presentCredential();
 
 		return new Promise<void>((resolve, reject) => {
 			let settled = false;
-			client.on("ready", () => {
+			this.client.once("ready", () => {
 				if (settled) return;
 				settled = true;
 				resolve();
 			});
-			client.on("authError", (err: string) => {
+			this.client.once("authError", (err: string) => {
 				if (settled) return;
 				settled = true;
 				reject(new Error(`auth error: ${err}`));
 			});
-			client.on("disconnected", (reason: string) => {
+			this.client.once("disconnected", (reason: string) => {
 				if (settled) return;
 				settled = true;
 				reject(new Error(`websocket disconnected before ready: ${reason}`));
 			});
 
-			client.connect();
+			this.client.connect();
 		});
 	}
 
@@ -133,11 +133,11 @@ export class WumblrFreeq {
 	}
 
 	join(channel: string): void {
-		this.requireClient().join(channel);
+		this.client.join(channel);
 	}
 
 	say(channel: string, text: string): void {
-		this.requireClient().sendMessage(channel, text);
+		this.client.sendMessage(channel, text);
 	}
 
 	on<K extends keyof WumblrFreeqEventMap>(
@@ -146,19 +146,11 @@ export class WumblrFreeq {
 	): void {
 		// Pass-through to the SDK. The SDK's event signature for `message`
 		// matches ours; we narrow to the subset we expose.
-		this.requireClient().on(event as keyof FreeqEvents, handler as never);
+		this.client.on(event as keyof FreeqEvents, handler as never);
 	}
 
 	disconnect(): void {
-		this.client?.disconnect();
-		this.client = null;
-	}
-
-	private requireClient(): FreeqClient {
-		if (!this.client) {
-			throw new Error("WumblrFreeq: connect() before calling other methods");
-		}
-		return this.client;
+		this.client.disconnect();
 	}
 }
 

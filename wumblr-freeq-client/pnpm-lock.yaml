@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@freeq/sdk':
-        specifier: file:../freeq-sdk-js
-        version: file:../freeq-sdk-js
+        specifier: github:attpslabs/wumblr-freeq#path:freeq-sdk-js
+        version: https://codeload.github.com/attpslabs/wumblr-freeq/tar.gz/06d43eecf2a4352d37479b76c75b9d0a85eba5f3#path:freeq-sdk-js
     devDependencies:
       typescript:
         specifier: ~5.8.3
@@ -18,8 +18,9 @@ importers:
 
 packages:
 
-  '@freeq/sdk@file:../freeq-sdk-js':
-    resolution: {directory: ../freeq-sdk-js, type: directory}
+  '@freeq/sdk@https://codeload.github.com/attpslabs/wumblr-freeq/tar.gz/06d43eecf2a4352d37479b76c75b9d0a85eba5f3#path:freeq-sdk-js':
+    resolution: {path: freeq-sdk-js, tarball: https://codeload.github.com/attpslabs/wumblr-freeq/tar.gz/06d43eecf2a4352d37479b76c75b9d0a85eba5f3}
+    version: 0.1.0
 
   idb@8.0.3:
     resolution: {integrity: sha512-LtwtVyVYO5BqRvcsKuB2iUMnHwPVByPCXFXOpuU96IZPPoPN6xjOGxZQ74pgSVVLQWtUOYgyeL4GE98BY5D3wg==}
@@ -31,7 +32,7 @@ packages:
 
 snapshots:
 
-  '@freeq/sdk@file:../freeq-sdk-js':
+  '@freeq/sdk@https://codeload.github.com/attpslabs/wumblr-freeq/tar.gz/06d43eecf2a4352d37479b76c75b9d0a85eba5f3#path:freeq-sdk-js':
     dependencies:
       idb: 8.0.3
 
