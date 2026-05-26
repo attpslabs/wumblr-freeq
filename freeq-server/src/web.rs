@@ -230,8 +230,13 @@ pub fn router(state: Arc<SharedState>) -> Router {
                 "https://irc.freeq.at",
                 "https://auth.freeq.at",
                 "https://freeq.at",
+                "https://wumblr.com",
+                "https://www.wumblr.com",
+                "https://api.wumblr.com",
+                "https://auth.wumblr.com",
                 "http://127.0.0.1:5173", // vite dev
                 "http://localhost:5173",
+                "http://127.0.0.1:8081", // expo web dev
             ];
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(
