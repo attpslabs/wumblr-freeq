@@ -1087,6 +1087,43 @@ sharpen the thread. Do NOT address yourself."
     // saying something weird (e.g. reading image alt attributes).
     tracing::info!(text = %answer.text, "answer text (sent to TTS)");
 
+    // Deterministic peer hand-off (discussion mode). The LLM's
+    // answer often ends with addressing a peer ("Utopia, your
+    // counter?"). That hand-off comes back to the peer through
+    // TTS → MoQ → STT, and the chunker frequently splits the peer
+    // name from the question body so the peer hears "Utopia?" alone
+    // with no body and the address parser drops it. Send a parallel
+    // IRC privmsg so the addressed peer dispatches deterministically,
+    // ignoring the audio path entirely.
+    if is_discussion_mode_active(&cfg) && !cfg.peer_agents.is_empty() {
+        let self_canonical = cfg
+            .nick
+            .split_once('-')
+            .map(|(p, _)| p)
+            .unwrap_or(cfg.nick.as_str())
+            .to_ascii_lowercase();
+        // Filter out self from the peer set so a bot does not
+        // hand off to itself.
+        let candidates: std::collections::HashSet<String> = cfg
+            .peer_agents
+            .iter()
+            .filter(|p| **p != self_canonical)
+            .cloned()
+            .collect();
+        if let Some((peer, body)) =
+            crate::social::extract_peer_handoff(&answer.text, &candidates)
+        {
+            let body = if body.is_empty() {
+                "your take?".to_string()
+            } else {
+                body
+            };
+            let msg = format!("{peer}: {body}");
+            tracing::info!(target = %peer, %body, "discussion hand-off");
+            let _ = handle.privmsg(&channel, &msg).await;
+        }
+    }
+
     // Persist to memory so future sessions can recall this exchange.
     // Soft failure: a memory write error doesn't break the response.
     if let Some(mem) = cfg.memory.as_ref() {
@@ -1206,33 +1243,88 @@ sharpen the thread. Do NOT address yourself."
 /// gate before a bot starts its own TTS so multiple agents do not
 /// step on each other or on the human.
 ///
-/// The smoothed peer-level signal already decays at ~10%/audio frame,
-/// so a hold of 250 ms is enough to disambiguate "they paused mid-
-/// sentence" from "they're done talking." Caps total wait at 5 s so a
-/// stuck-open mic from a peer cannot mute the bot forever.
+/// Two-stage gate:
+///
+///   1. Standard quiet wait — peer_level below threshold for 250 ms.
+///   2. **Anti-collision confirmation jitter**: once quiet is
+///      detected, sleep a random 250–1000 ms and re-check. When two
+///      bots both detect quiet at the same instant (e.g. because the
+///      human just finished a question that armed both of them), the
+///      different jitter draws give different start times — one
+///      wakes first, starts speaking, and the other's confirmation
+///      re-check catches the new peer audio and restarts the wait.
+///      Without this step, the bots talk on top of each other every
+///      time the human's silence resolves the trigger for both.
+///
+/// Caps total wait at 8 s so a stuck-open mic from a peer cannot mute
+/// the bot forever.
 async fn wait_for_room_quiet(peer_level: &Arc<std::sync::atomic::AtomicU32>) {
     use std::sync::atomic::Ordering;
     const THRESHOLD: f32 = 0.04;
     const HOLD: Duration = Duration::from_millis(250);
-    const MAX_WAIT: Duration = Duration::from_millis(5000);
+    const MAX_WAIT: Duration = Duration::from_millis(8000);
     let start = Instant::now();
-    let mut quiet_since: Option<Instant> = None;
-    loop {
+    'outer: loop {
         if start.elapsed() >= MAX_WAIT {
             return;
         }
-        let level = f32::from_bits(peer_level.load(Ordering::Relaxed));
-        if level < THRESHOLD {
-            match quiet_since {
-                None => quiet_since = Some(Instant::now()),
-                Some(t) if t.elapsed() >= HOLD => return,
-                _ => {}
+        // ── Stage 1: classic quiet wait ──
+        let mut quiet_since: Option<Instant> = None;
+        loop {
+            if start.elapsed() >= MAX_WAIT {
+                return;
             }
-        } else {
-            quiet_since = None;
+            let level = f32::from_bits(peer_level.load(Ordering::Relaxed));
+            if level < THRESHOLD {
+                match quiet_since {
+                    None => quiet_since = Some(Instant::now()),
+                    Some(t) if t.elapsed() >= HOLD => break,
+                    _ => {}
+                }
+            } else {
+                quiet_since = None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
         }
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // ── Stage 2: anti-collision confirmation jitter ──
+        let jitter_ms = jitter_ms_per_bot(peer_level);
+        let jitter_start = Instant::now();
+        let jitter_dur = Duration::from_millis(jitter_ms);
+        while jitter_start.elapsed() < jitter_dur {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let level = f32::from_bits(peer_level.load(Ordering::Relaxed));
+            if level >= THRESHOLD {
+                // Another bot started while we were confirming — back
+                // off and restart the wait from scratch.
+                continue 'outer;
+            }
+        }
+        // Confirmed quiet across the jitter window.
+        return;
     }
+}
+
+/// Deterministic-but-different jitter per (bot, call). Mixes the
+/// `peer_level` Arc pointer (per-bot, stable for the call) with the
+/// current monotonic instant (per-call, drifts every invocation). The
+/// result is a value in [250, 1000) ms — long enough that two bots
+/// rarely draw the same number, short enough that the operator does
+/// not perceive the gate as a stall.
+fn jitter_ms_per_bot(peer_level: &Arc<std::sync::atomic::AtomicU32>) -> u64 {
+    use std::time::SystemTime;
+    let ptr = Arc::as_ptr(peer_level) as usize as u64;
+    let now_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // Splitmix-style mix so two nearby pointers don't yield close numbers.
+    let mut x = ptr.wrapping_add(now_ns);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    250 + (x % 750)
 }
 
 /// Periodic backchannel: every few seconds, check whether a peer has

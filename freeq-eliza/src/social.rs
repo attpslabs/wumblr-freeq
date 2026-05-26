@@ -59,6 +59,57 @@ pub fn is_discussion_trigger(text: &str) -> bool {
         .any(|p| lower.contains(p))
 }
 
+/// Scan `answer_text` for a trailing peer hand-off and return
+/// `(peer_name, question_body)`. Looks for the last occurrence of a
+/// peer name followed by `,` / `:` / ` -` and at least one more
+/// word. Falls back to detecting a bare peer name at the end of a
+/// question ("…Utopia?") with an empty body — caller can synthesise
+/// a generic continuation in that case.
+///
+/// Used to bypass TTS/STT chunking: the bot's LLM answer often
+/// addresses a peer in its last sentence, but the resulting TTS gets
+/// split into multiple STT utterances on the receiving side and the
+/// peer-name fragment lands without context. We extract the hand-off
+/// directly from the model's text and send it as a deterministic IRC
+/// privmsg the peer parses without going through audio at all.
+pub fn extract_peer_handoff(
+    answer_text: &str,
+    peers: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    let lower = answer_text.to_ascii_lowercase();
+    // Find every peer occurrence; pick the latest one.
+    let mut best: Option<(usize, &str)> = None;
+    for peer in peers {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(peer.as_str()) {
+            let pos = from + rel;
+            // Word boundary check on both sides.
+            let left_ok =
+                pos == 0 || !lower.as_bytes()[pos - 1].is_ascii_alphanumeric();
+            let right_ok = pos + peer.len() == lower.len()
+                || !lower.as_bytes()[pos + peer.len()].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                best = match best {
+                    Some((bp, _)) if bp >= pos => best,
+                    _ => Some((pos, peer.as_str())),
+                };
+            }
+            from = pos + 1;
+        }
+    }
+    let (pos, peer) = best?;
+    // Take everything after the peer name, strip leading punctuation
+    // and whitespace.
+    let after = &answer_text[pos + peer.len()..];
+    let body: String = after
+        .trim_start_matches(|c: char| {
+            c.is_ascii_punctuation() || c.is_whitespace()
+        })
+        .trim_end()
+        .to_string();
+    Some((peer.to_string(), body))
+}
+
 /// Strict direct-address check: only the punctuated forms count. The
 /// permissive parser in `freeq_agent_kit::addressing` treats any
 /// sentence beginning with the name as an address, which conflates
@@ -419,6 +470,62 @@ mod tests {
     #[test]
     fn discussion_trigger_case_insensitive() {
         assert!(is_discussion_trigger("DEBATE THIS for me"));
+    }
+
+    // ── extract_peer_handoff ─────────────────────────────────────
+
+    fn peers(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn handoff_finds_trailing_peer_with_question() {
+        let p = peers(&["utopia", "narrator"]);
+        let r = extract_peer_handoff(
+            "I see the pattern. Utopia, do you have the counter-evidence?",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(r.0, "utopia");
+        assert!(r.1.contains("counter-evidence"));
+    }
+
+    #[test]
+    fn handoff_returns_none_when_no_peer_mentioned() {
+        let p = peers(&["utopia", "narrator"]);
+        assert!(extract_peer_handoff("That's the whole story.", &p).is_none());
+    }
+
+    #[test]
+    fn handoff_prefers_last_peer_when_multiple() {
+        let p = peers(&["utopia", "narrator"]);
+        let r = extract_peer_handoff(
+            "Utopia made a point earlier. Narrator, your read?",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(r.0, "narrator");
+    }
+
+    #[test]
+    fn handoff_handles_bare_name_at_end() {
+        // "...Utopia?" — body is empty. Caller will synthesise a
+        // generic continuation.
+        let p = peers(&["utopia", "narrator"]);
+        let r =
+            extract_peer_handoff("The disagreement is legible. Utopia?", &p).unwrap();
+        assert_eq!(r.0, "utopia");
+        assert!(r.1.is_empty(), "got body {:?}", r.1);
+    }
+
+    #[test]
+    fn handoff_word_boundary_does_not_match_substring() {
+        let p = peers(&["utopia"]);
+        // "utopian" should NOT match the peer "utopia".
+        assert!(
+            extract_peer_handoff("That sounds utopian.", &p).is_none(),
+            "substring match would be a false positive"
+        );
     }
 
     #[test]
