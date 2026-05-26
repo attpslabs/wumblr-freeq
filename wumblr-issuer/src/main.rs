@@ -67,6 +67,12 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        // did:web spec resolution: for a DID with path components
+        // (did:web:api.wumblr.com:verify), the doc lives at /verify/did.json.
+        // For a DID without path components (did:web:api.wumblr.com), it
+        // lives at /.well-known/did.json. We serve both so resolvers that
+        // disagree on the rule still find us.
+        .route("/verify/did.json", get(did_document))
         .route("/verify/.well-known/did.json", get(did_document))
         .route("/credentials/issue", post(issue_credential))
         .with_state(state);
