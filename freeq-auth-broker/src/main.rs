@@ -1290,6 +1290,10 @@ fn is_valid_return_to(url: &str) -> bool {
     let allowed = [
         "https://irc.freeq.at",
         "https://staging.freeq.at",
+        "https://wumblr.com",
+        "https://www.wumblr.com",
+        "https://api.wumblr.com",
+        "https://auth.wumblr.com",
         "http://localhost:",
         "http://localhost/",
         "http://127.0.0.1:",
