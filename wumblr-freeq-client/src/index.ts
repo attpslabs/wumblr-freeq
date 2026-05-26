@@ -57,6 +57,8 @@ export type WumblrFreeqEventMap = {
 	part: (channel: string, nick: string) => void;
 	authError: (err: string) => void;
 	disconnected: (reason: string) => void;
+	/** Fires after requestHistory() completes; `messages` is chronological. */
+	historyBatch: (channel: string, messages: Message[]) => void;
 };
 
 export class WumblrFreeq {
@@ -138,6 +140,15 @@ export class WumblrFreeq {
 
 	say(channel: string, text: string): void {
 		this.client.sendMessage(channel, text);
+	}
+
+	/** Request CHATHISTORY for a channel. Results arrive via the `historyBatch` event. */
+	requestHistory(channel: string, count = 100): void {
+		this.client.requestHistory({
+			target: channel,
+			mode: "latest",
+			count,
+		});
 	}
 
 	on<K extends keyof WumblrFreeqEventMap>(
