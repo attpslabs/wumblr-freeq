@@ -118,9 +118,21 @@ fn urlencode(s: &str) -> String {
 }
 
 fn bridge_html(target: &str) -> String {
-    // Inline JS reads search + hash from the current URL and forwards to
-    // the dev target with both preserved. Wrapped in an HTML doc so the
-    // browser parses correctly (no plain JS response).
+    // Inline JS forwards the user back to the local dev target.
+    //
+    // The PDS returns OAuth params (`state`, `code`, `iss`) in the URL
+    // FRAGMENT (`#…`) rather than the query string. Servers can't see
+    // fragments, but the browser running this page can. We hoist any
+    // fragment-encoded params into the query string before redirecting,
+    // because @atproto/oauth-client-browser's `init()` reads from
+    // `window.location.search`, not `window.location.hash`.
+    //
+    // Effect:
+    //   in:  /auth/callback#state=…&code=…
+    //   out: <target>?state=…&code=…
+    //
+    // If the request already arrived with a query string (server-side
+    // 302 path), the JS path is unused.
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -135,7 +147,21 @@ fn bridge_html(target: &str) -> String {
       var target = {target_js};
       var search = window.location.search || "";
       var hash = window.location.hash || "";
-      window.location.replace(target + search + hash);
+      var hashQuery = "";
+      if (hash.length > 1) {{
+        // Strip the leading '#' and treat the remainder as URL-encoded
+        // query parameters.
+        hashQuery = hash.slice(1);
+      }}
+      var combined = "";
+      if (search && hashQuery) {{
+        combined = search + "&" + hashQuery;
+      }} else if (search) {{
+        combined = search;
+      }} else if (hashQuery) {{
+        combined = "?" + hashQuery;
+      }}
+      window.location.replace(target + combined);
     }})();
   </script>
 </body>
