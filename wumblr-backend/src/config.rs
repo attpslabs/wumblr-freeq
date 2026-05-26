@@ -16,10 +16,22 @@ pub struct Config {
     #[arg(long, env = "WUMBLR_PUBLIC_ORIGIN", default_value = "http://127.0.0.1:8787")]
     pub public_origin: String,
 
-    /// freeq-auth-broker base URL (used for `/whoami` and DPoP-proxied PDS writes).
-    /// Not yet contacted in M1 step 2 — wired in step 4.
+    /// freeq-auth-broker base URL. Backend calls `POST <broker>/session` to
+    /// exchange a broker_token (received by the client from the OAuth redirect)
+    /// for the user's `{did, handle, freeq_web_token}`.
     #[arg(long, env = "WUMBLR_BROKER_URL", default_value = "http://127.0.0.1:3080")]
     pub broker_url: String,
+
+    /// wumblr-issuer base URL. Backend posts HMAC-authed credential-issuance
+    /// requests here on behalf of the signed-in user.
+    #[arg(long, env = "WUMBLR_ISSUER_URL", default_value = "http://127.0.0.1:3090")]
+    pub issuer_url: String,
+
+    /// Shared HMAC secret between backend and the issuer. The issuer rejects
+    /// any /credentials/issue request whose signature doesn't verify under
+    /// this secret. Same value must be set on the issuer service.
+    #[arg(long, env = "WUMBLR_ISSUER_SHARED_SECRET", default_value = "")]
+    pub issuer_shared_secret: String,
 
     /// Admin DIDs (comma-separated). DID-gates `/admin/*` endpoints.
     /// Empty in M1; populated when the approval queue lands in M5.

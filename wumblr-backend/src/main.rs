@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod app;
 mod broker;
 mod config;
+mod issuer;
 mod routes;
 
 use crate::config::Config;
@@ -33,6 +34,7 @@ async fn main() -> Result<()> {
         listen = %addr,
         public_origin = %config.public_origin,
         broker = %config.broker_url,
+        issuer = %config.issuer_url,
         "starting wumblr-backend"
     );
 

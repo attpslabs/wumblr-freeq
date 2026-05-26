@@ -80,12 +80,15 @@ services:
 
   backend:
     image: wumblr-freeq:latest
+    depends_on: [broker, issuer]
     restart: unless-stopped
     entrypoint: ["wumblr-backend"]
     environment:
       WUMBLR_LISTEN: "0.0.0.0:8787"
       WUMBLR_PUBLIC_ORIGIN: "${WUMBLR_BACKEND_PUBLIC_ORIGIN:-https://api.wumblr.com}"
       WUMBLR_BROKER_URL: "http://broker:3080"
+      WUMBLR_ISSUER_URL: "http://issuer:3090"
+      WUMBLR_ISSUER_SHARED_SECRET: "${WUMBLR_ISSUER_SHARED_SECRET:?WUMBLR_ISSUER_SHARED_SECRET must be set}"
       WUMBLR_ADMIN_DIDS: "${WUMBLR_ADMIN_DIDS:-}"
       WUMBLR_DEV_CALLBACK_TARGET: "${WUMBLR_DEV_CALLBACK_TARGET:-}"
       RUST_LOG: "wumblr_backend=info,tower_http=info"

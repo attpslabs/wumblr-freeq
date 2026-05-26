@@ -13,7 +13,8 @@ use tower_http::{
 use crate::{
     broker::{BrokerClient, HttpBroker, MockBroker},
     config::Config,
-    routes::{auth, health, session, well_known},
+    issuer::IssuerClient,
+    routes::{auth, credentials, health, session, well_known},
 };
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub broker: Arc<dyn BrokerClient>,
     pub sessions: Arc<session::SessionStore>,
+    pub issuer: Arc<IssuerClient>,
 }
 
 pub fn router(config: Config) -> Router {
@@ -34,10 +36,16 @@ pub fn router(config: Config) -> Router {
         Arc::new(HttpBroker::new(config.broker_url.clone()))
     };
 
+    let issuer = Arc::new(IssuerClient::new(
+        config.issuer_url.clone(),
+        config.issuer_shared_secret.clone(),
+    ));
+
     let state = AppState {
         config: Arc::new(config),
         broker,
         sessions: Arc::new(session::SessionStore::new()),
+        issuer,
     };
 
     // Permissive CORS for M1/M2 dev. Tightens at M5 deploy.
@@ -64,6 +72,11 @@ pub fn router(config: Config) -> Router {
         // bearer + identity + freeq web-token.
         .route("/session/exchange", post(session::exchange))
         .route("/me", get(session::me))
+        // Credential proxy — backend HMAC-calls the issuer on the user's behalf.
+        .route(
+            "/credentials/wumblr_member",
+            get(credentials::wumblr_member),
+        )
         // Dev-only OAuth callback bridge — see routes/auth.rs.
         .route("/auth/callback", get(auth::callback))
         .with_state(state)
