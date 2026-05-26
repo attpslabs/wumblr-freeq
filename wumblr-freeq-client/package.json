@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@freeq/sdk": "file:../freeq-sdk-js"
+    "@freeq/sdk": "github:attpslabs/wumblr-freeq#path:freeq-sdk-js"
   },
   "devDependencies": {
     "typescript": "~5.8.3"
