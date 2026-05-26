@@ -29,9 +29,19 @@ pub async fn oauth_client_metadata(State(state): State<AppState>) -> Json<Value>
         "scope": "atproto transition:generic",
         "redirect_uris": [
             cfg.web_redirect_uri(),
-            // Native custom-scheme redirect — reverse-DNS of the client_id host.
-            // wumblr.com → com.wumblr; one trailing slash after the colon.
-            "com.wumblr:/auth/callback",
+            // Native custom-scheme redirect.
+            //
+            // ATProto OAuth spec: "Any custom scheme must match the client_id
+            // hostname in reverse-domain order." Our client_id host is
+            // `api.wumblr.com`, so the scheme is `com.wumblr.api`. One trailing
+            // slash after the colon (not two — `com.wumblr.api://` is invalid
+            // per the spec).
+            //
+            // If we ever change the host (e.g. to wumblr.com), this string
+            // changes to `com.wumblr:/auth/callback`. Keep in sync with
+            // apps/mobile/assets/oauth-client-metadata.json and the
+            // `scheme` field in apps/mobile/app.json.
+            "com.wumblr.api:/auth/callback",
         ],
         // Public client; native and SPA flows don't have a stable secret.
         "token_endpoint_auth_method": "none",
