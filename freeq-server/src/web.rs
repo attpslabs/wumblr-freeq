@@ -222,34 +222,41 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/channels/{name}/sessions", get(api_channel_sessions))
         .route("/auth/mobile", get(auth_mobile_redirect))
         .route("/join/{channel}", get(channel_invite_page))
-        .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)) // 12MB
-        .layer({
-            use axum::http::{Method, header};
-            use tower_http::cors::AllowOrigin;
-            let origins = [
-                "https://irc.freeq.at",
-                "https://auth.freeq.at",
-                "https://freeq.at",
-                "https://wumblr.com",
-                "https://www.wumblr.com",
-                "https://api.wumblr.com",
-                "https://auth.wumblr.com",
-                "http://127.0.0.1:5173", // vite dev
-                "http://localhost:5173",
-                "http://127.0.0.1:8081", // expo web dev
-            ];
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(
-                    origins.iter().filter_map(|o| o.parse().ok()),
-                ))
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([
-                    header::CONTENT_TYPE,
-                    header::AUTHORIZATION,
-                    "X-Broker-Signature".parse().unwrap(),
-                ])
-                .allow_credentials(true)
-        });
+        .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)); // 12MB
+
+    // CORS layer is applied to the FINAL app below, after every .merge() —
+    // axum's tower-http CorsLayer only wraps routes added BEFORE the layer
+    // call. The previous in-line `.layer(CorsLayer)` here missed routes
+    // merged afterwards (notably crate::policy::api::routes() with
+    // /api/v1/credentials/present), so OPTIONS preflights from
+    // browsers returned 405 with no Access-Control-Allow-Origin.
+    let cors_layer = {
+        use axum::http::{Method, header};
+        use tower_http::cors::AllowOrigin;
+        let origins = [
+            "https://irc.freeq.at",
+            "https://auth.freeq.at",
+            "https://freeq.at",
+            "https://wumblr.com",
+            "https://www.wumblr.com",
+            "https://api.wumblr.com",
+            "https://auth.wumblr.com",
+            "http://127.0.0.1:5173", // vite dev
+            "http://localhost:5173",
+            "http://127.0.0.1:8081", // expo web dev
+        ];
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(
+                origins.iter().filter_map(|o| o.parse().ok()),
+            ))
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                "X-Broker-Signature".parse().unwrap(),
+            ])
+            .allow_credentials(true)
+    };
 
     // Policy API endpoints
     if state.policy_engine.is_some() {
@@ -309,9 +316,11 @@ pub fn router(state: Arc<SharedState>) -> Router {
     if let Some(vr) = verifier_router {
         final_app = final_app.merge(vr);
     }
-    // Security headers as outermost layer so they apply to all responses
-    // including static files served via fallback_service
-    final_app.layer(axum::middleware::from_fn(security_headers))
+    // CORS + security headers as outermost layers so they apply to ALL
+    // routes, including those merged after the initial Router::new() block.
+    final_app
+        .layer(cors_layer)
+        .layer(axum::middleware::from_fn(security_headers))
 }
 
 // ── WebSocket handler ──────────────────────────────────────────────────
