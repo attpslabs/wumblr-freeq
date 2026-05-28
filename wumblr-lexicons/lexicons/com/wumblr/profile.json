@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.profile",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Community profile. Singleton record at rkey 'self' on the community's own PDS. Modeled after community.opensocial.profile.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["displayName", "joinMode", "createdAt"],
+        "properties": {
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Human-readable community name as typed by the creator. UI shows this — never the salted handle."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "joinMode": {
+            "type": "string",
+            "knownValues": ["open", "invite"],
+            "description": "Who can join. 'open' = any signed-in user. 'invite' = redeem-required (M4 feature; lexicon field exists in M3 but only 'open' is implemented end-to-end)."
+          },
+          "avatar": {
+            "type": "blob",
+            "accept": ["image/png", "image/jpeg", "image/webp"],
+            "maxSize": 1048576,
+            "description": "Community icon. Optional. No banner field in M3 — banner is M4+."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

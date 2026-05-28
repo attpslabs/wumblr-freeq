@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.admins",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Admin list for a community. Singleton record at rkey 'self' on the community's own PDS. The first entry in 'admins' is the primary admin (who can transfer the primary slot). All other admins have flat full powers except transfer. Modeled after community.opensocial.admins.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["admins"],
+        "properties": {
+          "admins": {
+            "type": "array",
+            "minLength": 1,
+            "items": {
+              "type": "ref",
+              "ref": "#adminEntry"
+            }
+          }
+        }
+      }
+    },
+    "adminEntry": {
+      "type": "object",
+      "required": ["did", "addedAt"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "datetime"
+        }
+      }
+    }
+  }
+}

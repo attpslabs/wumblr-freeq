@@ -22,16 +22,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use wumblr_issuer::{credentials, did_doc, keys};
+use wumblr_issuer::{credentials, did_doc, epds, keys, sessions};
 
+use crate::epds::EpdsClient;
 use crate::keys::IssuerKeys;
+use crate::sessions::{CommunitySession, SessionStore};
 
 #[derive(Clone)]
 struct AppState {
     keys: Arc<IssuerKeys>,
     shared_secret: Arc<String>,
+    sessions: Arc<Mutex<SessionStore>>,
+    epds: Arc<EpdsClient>,
 }
 
 #[tokio::main]
@@ -60,9 +65,18 @@ async fn main() -> anyhow::Result<()> {
         "wumblr-issuer keys loaded"
     );
 
+    let db_path =
+        std::env::var("WUMBLR_ISSUER_DB").unwrap_or_else(|_| "./data/issuer.db".to_string());
+    let session_store = SessionStore::open(&db_path)
+        .with_context(|| format!("opening community session store at {db_path}"))?;
+    let epds_client = EpdsClient::from_env()?;
+    tracing::info!(%db_path, "community session store ready; ePDS client configured");
+
     let state = AppState {
         keys: Arc::new(keys),
         shared_secret: Arc::new(shared_secret),
+        sessions: Arc::new(Mutex::new(session_store)),
+        epds: Arc::new(epds_client),
     };
 
     let app = Router::new()
@@ -75,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/verify/did.json", get(did_document))
         .route("/verify/.well-known/did.json", get(did_document))
         .route("/credentials/issue", post(issue_credential))
+        .route("/communities", post(create_community))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -149,6 +164,178 @@ async fn issue_credential(
     );
 
     Ok(Json(IssueResponse { credential: cred }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCommunityRequest {
+    /// Human-readable community name as typed by the creator (stored verbatim
+    /// as profile.displayName). Used, truncated, to seed the handle.
+    display_name: String,
+    /// Optional community description.
+    #[serde(default)]
+    description: Option<String>,
+    /// DID of the creating user — seeded as the community's primary admin.
+    creator_did: String,
+    /// "open" | "invite". Only "open" is implemented end-to-end in M3.
+    #[serde(default = "default_join_mode")]
+    join_mode: String,
+}
+
+fn default_join_mode() -> String {
+    "open".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct CreateCommunityResponse {
+    did: String,
+    handle: String,
+}
+
+/// Provision a community ATProto account on ePDS, custody its session, and
+/// write the initial profile + admins records. Called service-to-service by
+/// wumblr-backend (HMAC-authed). The issuer is a dumb executor here — the
+/// backend has already authorized the caller; the issuer just provisions.
+async fn create_community(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<CreateCommunityResponse>, (StatusCode, String)> {
+    verify_hmac(&headers, &body, state.shared_secret.as_bytes())
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+
+    let req: CreateCommunityRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+
+    if !req.creator_did.starts_with("did:") {
+        return Err((StatusCode::BAD_REQUEST, "creator_did must be a DID".into()));
+    }
+    let display_name = req.display_name.trim();
+    if display_name.is_empty() || display_name.chars().count() > 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "display_name must be 1–64 chars".into(),
+        ));
+    }
+    if req.join_mode != "open" && req.join_mode != "invite" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "join_mode must be 'open' or 'invite'".into(),
+        ));
+    }
+
+    // Derive the ePDS handle local-part: sanitized, truncated name + random
+    // salt. The salt disambiguates same-named communities. It can't be
+    // derived from the DID (the DID only exists after account creation), so
+    // it's random — the DID remains the true unique key.
+    let salt = random_salt();
+    let local = handle_local_part(display_name, &salt);
+    // Synthetic, never-delivered email — community accounts have no inbox.
+    let email = format!("community-{salt}@wumblr.internal");
+
+    let created = state
+        .epds
+        .create_account(&local, &email)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ePDS create failed: {e}")))?;
+
+    // Custody the session before any write — if a write fails we still have
+    // the credentials to retry rather than orphaning the account.
+    {
+        let store = state.sessions.lock().await;
+        store
+            .insert(&CommunitySession {
+                did: created.did.clone(),
+                handle: created.handle.clone(),
+                access_jwt: created.access_jwt.clone(),
+                refresh_jwt: created.refresh_jwt.clone(),
+            })
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("session store failed: {e}"),
+                )
+            })?;
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Write profile (rkey "self") on the community's own PDS.
+    let profile = json!({
+        "$type": "com.wumblr.profile",
+        "displayName": display_name,
+        "description": req.description,
+        "joinMode": req.join_mode,
+        "createdAt": now,
+    });
+    state
+        .epds
+        .put_record(
+            &created.access_jwt,
+            &created.did,
+            "com.wumblr.profile",
+            "self",
+            profile,
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("profile write failed: {e}")))?;
+
+    // Write admins (rkey "self") — creator is the primary admin (first entry).
+    let admins = json!({
+        "$type": "com.wumblr.admins",
+        "admins": [ { "did": req.creator_did, "addedAt": now } ],
+    });
+    state
+        .epds
+        .put_record(
+            &created.access_jwt,
+            &created.did,
+            "com.wumblr.admins",
+            "self",
+            admins,
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("admins write failed: {e}")))?;
+
+    tracing::info!(
+        did = %created.did,
+        handle = %created.handle,
+        creator = %req.creator_did,
+        "provisioned community"
+    );
+
+    Ok(Json(CreateCommunityResponse {
+        did: created.did,
+        handle: created.handle,
+    }))
+}
+
+/// 6 random base32-ish chars (a–z, 2–7) used to disambiguate handles.
+fn random_salt() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Build the ePDS handle local-part from a display name + salt.
+///
+/// ePDS requires the local part to be 5–20 chars, single-label, ASCII
+/// alphanumeric. We lowercase the name, strip everything non-alphanumeric,
+/// truncate to 14 chars (so name 14 + salt 6 = 20 max), and append the salt.
+/// If the sanitized name is empty (e.g. all-emoji name) we fall back to "c".
+fn handle_local_part(display_name: &str, salt: &str) -> String {
+    let mut name: String = display_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    name.truncate(14);
+    if name.is_empty() {
+        name.push('c');
+    }
+    format!("{name}{salt}")
 }
 
 fn verify_hmac(headers: &HeaderMap, body: &[u8], secret: &[u8]) -> anyhow::Result<()> {

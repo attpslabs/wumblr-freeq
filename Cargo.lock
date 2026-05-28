@@ -10319,6 +10319,7 @@ dependencies = [
 name = "wumblr-issuer"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "base64",
@@ -10328,6 +10329,9 @@ dependencies = [
  "freeq-sdk",
  "freeq-server",
  "hmac",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

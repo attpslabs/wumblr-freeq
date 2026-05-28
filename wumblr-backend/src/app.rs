@@ -14,7 +14,7 @@ use crate::{
     broker::{BrokerClient, HttpBroker, MockBroker},
     config::Config,
     issuer::IssuerClient,
-    routes::{auth, credentials, health, session, well_known},
+    routes::{auth, communities, credentials, health, session, well_known},
 };
 
 #[derive(Clone)]
@@ -77,6 +77,9 @@ pub fn router(config: Config) -> Router {
             "/credentials/wumblr_member",
             get(credentials::wumblr_member),
         )
+        // Community creation — backend resolves the caller's DID and asks the
+        // issuer to provision a community account on ePDS.
+        .route("/communities", post(communities::create_community))
         // Dev-only OAuth callback bridge — see routes/auth.rs.
         .route("/auth/callback", get(auth::callback))
         .with_state(state)

@@ -1,0 +1,26 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.member",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Membership intent. Written to the USER's PDS — one record per community joined. The rkey is a TID; the community is identified by the 'community' field, not the rkey (DIDs contain ':' which isn't valid in rkeys). Paired with com.wumblr.membershipProof on the community's PDS; both are required for active membership. Modeled after community.opensocial.membership.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["community", "joinedAt"],
+        "properties": {
+          "community": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the community account."
+          },
+          "joinedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

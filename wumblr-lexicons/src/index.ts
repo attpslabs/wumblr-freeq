@@ -1,58 +1,25 @@
-import communityJson from "../lexicons/com/wumblr/community.json" with { type: "json" };
-import memberJson from "../lexicons/com/wumblr/community/member.json" with { type: "json" };
-import grantJson from "../lexicons/com/wumblr/community/membership/grant.json" with { type: "json" };
-import channelJson from "../lexicons/com/wumblr/community/channel.json" with { type: "json" };
-import requestJson from "../lexicons/com/wumblr/community/request.json" with { type: "json" };
+import adminsJson from "../lexicons/com/wumblr/admins.json" with { type: "json" };
+import memberJson from "../lexicons/com/wumblr/member.json" with { type: "json" };
+import membershipProofJson from "../lexicons/com/wumblr/membershipProof.json" with { type: "json" };
+import profileJson from "../lexicons/com/wumblr/profile.json" with { type: "json" };
 
 export const lexicons = {
-	community: communityJson,
-	communityMember: memberJson,
-	communityMembershipGrant: grantJson,
-	communityChannel: channelJson,
-	communityRequest: requestJson,
+	profile: profileJson,
+	admins: adminsJson,
+	member: memberJson,
+	membershipProof: membershipProofJson,
 } as const;
 
 export const NSIDS = {
-	community: "com.wumblr.community",
-	communityMember: "com.wumblr.community.member",
-	communityMembershipGrant: "com.wumblr.community.membership.grant",
-	communityChannel: "com.wumblr.community.channel",
-	communityRequest: "com.wumblr.community.request",
+	profile: "com.wumblr.profile",
+	admins: "com.wumblr.admins",
+	member: "com.wumblr.member",
+	membershipProof: "com.wumblr.membershipProof",
 } as const;
 
-export type CommunityType = "public" | "restricted" | "private" | "mature";
-export type CommunityRole = "owner" | "mod" | "member";
-export type ChannelKind = "text" | "voice" | "video";
-export type RequestStatus = "pending" | "approved" | "rejected";
+export type JoinMode = "open" | "invite";
 
-export const TOPICS = [
-	"anime-manga",
-	"art",
-	"business-finance",
-	"collectibles",
-	"education-culture",
-	"fashion-beauty",
-	"food-cooking",
-	"games",
-	"health",
-	"home-garden",
-	"humanities",
-	"identity-culture",
-	"internet-culture",
-	"memes",
-	"music",
-	"nature-outdoors",
-	"news-politics",
-	"places-travel",
-	"pop-culture",
-	"qa-trivia",
-	"reading-writing",
-	"science",
-	"sports",
-	"technology",
-	"vehicles",
-	"wellness",
-	"adult",
-	"mature",
-] as const;
-export type Topic = (typeof TOPICS)[number];
+export interface AdminEntry {
+	did: string;
+	addedAt: string;
+}

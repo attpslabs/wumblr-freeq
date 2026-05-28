@@ -6,4 +6,6 @@
 
 pub mod credentials;
 pub mod did_doc;
+pub mod epds;
 pub mod keys;
+pub mod sessions;

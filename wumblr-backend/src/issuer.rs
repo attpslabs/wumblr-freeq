@@ -88,6 +88,58 @@ impl IssuerClient {
             .context("decoding issuer /credentials/issue body")?;
         Ok(body.credential)
     }
+
+    /// Ask the issuer to provision a new community account on ePDS, custody
+    /// its session, and write the initial profile + admins records.
+    /// `creator_did` becomes the community's primary admin. Returns the new
+    /// community DID + handle.
+    pub async fn create_community(
+        &self,
+        display_name: &str,
+        description: Option<&str>,
+        creator_did: &str,
+        join_mode: &str,
+    ) -> Result<CreatedCommunity> {
+        let body = serde_json::json!({
+            "display_name": display_name,
+            "description": description,
+            "creator_did": creator_did,
+            "join_mode": join_mode,
+        });
+        let body_bytes = serde_json::to_vec(&body)?;
+
+        let ts = chrono::Utc::now().timestamp();
+        let (sig, ts_str) = sign_hmac(ts, &body_bytes, self.shared_secret.as_bytes());
+
+        let resp = self
+            .http
+            .post(format!("{}/communities", self.base_url))
+            .header("Content-Type", "application/json")
+            .header("X-Wumblr-Signature", sig)
+            .header("X-Wumblr-Timestamp", ts_str)
+            .body(body_bytes)
+            .send()
+            .await
+            .context("calling issuer /communities")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("issuer /communities returned {status}: {body}");
+        }
+
+        let body: CreatedCommunity = resp
+            .json()
+            .await
+            .context("decoding issuer /communities body")?;
+        Ok(body)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedCommunity {
+    pub did: String,
+    pub handle: String,
 }
 
 fn sign_hmac(ts: i64, body: &[u8], secret: &[u8]) -> (String, String) {

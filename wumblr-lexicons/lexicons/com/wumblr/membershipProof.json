@@ -1,0 +1,30 @@
+{
+  "lexicon": 1,
+  "id": "com.wumblr.membershipProof",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Community-side confirmation of a member. Written to the COMMUNITY's PDS — one record per member (NOT a singleton, so this scales to millions of members). The rkey is a TID; the member is identified by the 'memberDid' field. Paired with com.wumblr.member on the user's PDS; both are required for active membership.\n\nThe 'cid' field is the CID of the user's matching com.wumblr.member record at the moment of confirmation. This cross-reference is the cryptographic anchor proving both records refer to the same join event — OpenSocial hit repeated bugs without this. Modeled after community.opensocial.membershipProof.\n\nPartial states:\n  member ✓ + proof ✓  = active member\n  member ✓ + proof ✗  = removed (or pending in invite-mode)\n  member ✗ + proof ✓  = user left voluntarily",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["memberDid", "cid", "confirmedAt"],
+        "properties": {
+          "memberDid": {
+            "type": "string",
+            "format": "did"
+          },
+          "cid": {
+            "type": "string",
+            "format": "cid",
+            "description": "CID of the user's com.wumblr.member record at confirmation time."
+          },
+          "confirmedAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

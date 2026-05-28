@@ -19,6 +19,10 @@ bs58 = { workspace = true }
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
 freeq-sdk = { path = "../freeq-sdk" }
 
 [dev-dependencies]
