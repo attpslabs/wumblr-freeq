@@ -13,6 +13,7 @@ use tower_http::{
 use crate::{
     broker::{BrokerClient, HttpBroker, MockBroker},
     config::Config,
+    freeq::FreeqClient,
     issuer::IssuerClient,
     routes::{auth, communities, credentials, health, session, well_known},
 };
@@ -23,6 +24,7 @@ pub struct AppState {
     pub broker: Arc<dyn BrokerClient>,
     pub sessions: Arc<session::SessionStore>,
     pub issuer: Arc<IssuerClient>,
+    pub freeq: Arc<FreeqClient>,
 }
 
 pub fn router(config: Config) -> Router {
@@ -41,11 +43,17 @@ pub fn router(config: Config) -> Router {
         config.issuer_shared_secret.clone(),
     ));
 
+    let freeq = Arc::new(FreeqClient::new(
+        config.freeq_url.clone(),
+        config.freeq_broker_secret.clone(),
+    ));
+
     let state = AppState {
         config: Arc::new(config),
         broker,
         sessions: Arc::new(session::SessionStore::new()),
         issuer,
+        freeq,
     };
 
     // Permissive CORS for M1/M2 dev. Tightens at M5 deploy.

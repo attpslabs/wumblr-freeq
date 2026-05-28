@@ -180,6 +180,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/auth/step-up", get(auth_step_up))
         .route("/auth/broker/web-token", post(auth_broker_web_token))
         .route("/auth/broker/session", post(auth_broker_session))
+        .route("/api/v1/communities/member", post(api_community_member))
         .route("/client-metadata.json", get(client_metadata))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
@@ -1470,6 +1471,154 @@ async fn auth_broker_session(
     Ok(Json(
         serde_json::json!({"ok": true, "upload_token": upload_token}),
     ))
+}
+
+#[derive(Deserialize)]
+struct CommunityMemberRequest {
+    /// The user joining (their PDS is written to).
+    did: String,
+    /// The community DID being joined.
+    community_did: String,
+}
+
+/// HMAC-authed (broker secret) endpoint: write a `com.wumblr.member` record to
+/// a logged-in user's PDS, marking them a member of `community_did`.
+///
+/// freeq is the natural home for this write: it already custodies the user's
+/// PDS session (pushed by the broker at `/auth/broker/session`), so it can act
+/// on the user's behalf without the backend needing to reach back through the
+/// broker. Called by wumblr-backend right after a community is provisioned, to
+/// auto-join the creator.
+///
+/// Uses the user's `Login` web-session credentials (DPoP + Bearer) to POST
+/// `com.atproto.repo.createRecord`, handling the one-shot `use_dpop_nonce`
+/// retry the PDS requires on first contact.
+async fn api_community_member(
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let secret = state.config.broker_shared_secret.clone().ok_or((
+        StatusCode::FORBIDDEN,
+        "Broker auth not configured".to_string(),
+    ))?;
+    verify_broker_signature_raw(&secret, &headers, &body)?;
+    let req: CommunityMemberRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))?;
+
+    if !req.did.starts_with("did:") || !req.community_did.starts_with("did:") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "did and community_did must be DIDs".to_string(),
+        ));
+    }
+
+    // We need the user's PDS session to write on their behalf. The Login
+    // session is created at first login with `atproto` scope, which permits
+    // repo writes to the user's own repo.
+    let session = state
+        .web_sessions
+        .lock()
+        .get(&(req.did.clone(), crate::server::OauthPurpose::Login))
+        .cloned()
+        .ok_or((
+            StatusCode::CONFLICT,
+            "No active session for this DID; user must be signed in".to_string(),
+        ))?;
+
+    let dpop_key = freeq_sdk::oauth::DpopKey::from_base64url(&session.dpop_key_b64)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Bad DPoP key: {e}")))?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.repo.createRecord",
+        session.pds_url.trim_end_matches('/')
+    );
+    // SSRF guard — pds_url ultimately derives from a DID document, which is
+    // attacker-influenced. Validate before POSTing the user's token there.
+    let (_parsed, client) = safe_outbound_client(&url, std::time::Duration::from_secs(10))
+        .await
+        .map_err(|(s, m)| (s, m.to_string()))?;
+
+    let record = serde_json::json!({
+        "$type": "com.wumblr.member",
+        "community": req.community_did,
+        "joinedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let xrpc_body = serde_json::json!({
+        "repo": req.did,
+        "collection": "com.wumblr.member",
+        "record": record,
+    });
+
+    // First attempt with whatever nonce we have cached (may be None).
+    let proof = dpop_key
+        .proof("POST", &url, session.dpop_nonce.as_deref(), Some(&session.access_token))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DPoP proof: {e}")))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("DPoP {}", session.access_token))
+        .header("DPoP", &proof)
+        .json(&xrpc_body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PDS request failed: {e}")))?;
+
+    let status = resp.status();
+    // PDS hands back a fresh nonce in `DPoP-Nonce` and 401s the first call;
+    // retry once with the supplied nonce.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let fresh_nonce = resp
+            .headers()
+            .get("dpop-nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        if let Some(nonce) = fresh_nonce {
+            let proof2 = dpop_key
+                .proof("POST", &url, Some(&nonce), Some(&session.access_token))
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DPoP proof: {e}")))?;
+            let resp2 = client
+                .post(&url)
+                .header("Authorization", format!("DPoP {}", session.access_token))
+                .header("DPoP", &proof2)
+                .json(&xrpc_body)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PDS retry failed: {e}")))?;
+            // Cache the working nonce for subsequent writes.
+            if let Some(mut s) = state
+                .web_sessions
+                .lock()
+                .get_mut(&(req.did.clone(), crate::server::OauthPurpose::Login))
+            {
+                s.dpop_nonce = Some(nonce);
+            }
+            return finish_member_write(resp2, &req).await;
+        }
+    }
+
+    finish_member_write(resp, &req).await
+}
+
+async fn finish_member_write(
+    resp: reqwest::Response,
+    req: &CommunityMemberRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("PDS createRecord {status}: {body}"),
+        ));
+    }
+    let out: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+    tracing::info!(
+        did = %req.did,
+        community = %req.community_did,
+        "wrote com.wumblr.member to user PDS"
+    );
+    let uri = out.get("uri").and_then(|v| v.as_str()).unwrap_or_default();
+    Ok(Json(serde_json::json!({ "ok": true, "uri": uri })))
 }
 
 /// Verify HMAC-SHA256 signature over raw request bytes with replay protection.

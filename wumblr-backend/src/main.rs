@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod app;
 mod broker;
 mod config;
+mod freeq;
 mod issuer;
 mod routes;
 

@@ -33,6 +33,18 @@ pub struct Config {
     #[arg(long, env = "WUMBLR_ISSUER_SHARED_SECRET", default_value = "")]
     pub issuer_shared_secret: String,
 
+    /// freeq-server base URL. Backend calls `POST <freeq>/api/v1/communities/member`
+    /// to write a user's `com.wumblr.member` record to their PDS (freeq holds
+    /// the user's PDS session and acts on their behalf).
+    #[arg(long, env = "WUMBLR_FREEQ_URL", default_value = "http://127.0.0.1:6789")]
+    pub freeq_url: String,
+
+    /// Shared HMAC secret between backend and freeq-server (the broker shared
+    /// secret). freeq rejects any broker-authed request whose signature
+    /// doesn't verify under this secret. Same value as the broker uses.
+    #[arg(long, env = "WUMBLR_FREEQ_BROKER_SECRET", default_value = "")]
+    pub freeq_broker_secret: String,
+
     /// Admin DIDs (comma-separated). DID-gates `/admin/*` endpoints.
     /// Empty in M1; populated when the approval queue lands in M5.
     #[arg(long, env = "WUMBLR_ADMIN_DIDS", default_value = "", value_delimiter = ',')]

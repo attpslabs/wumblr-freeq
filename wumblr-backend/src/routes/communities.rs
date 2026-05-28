@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
 };
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::app::AppState;
 
@@ -84,6 +84,23 @@ pub async fn create_community(
                 format!("community provisioning failed: {e}"),
             )
         })?;
+
+    // Auto-join the creator: write com.wumblr.member to their own PDS. freeq
+    // holds the user's PDS session and does the write. Non-fatal — the
+    // community already exists; a failed member write can be retried/repaired
+    // and shouldn't orphan the just-created community.
+    if let Err(e) = state
+        .freeq
+        .write_member(&session.did, &created.did)
+        .await
+    {
+        warn!(
+            did = %session.did,
+            community = %created.did,
+            error = %e,
+            "community created but creator member-record write failed"
+        );
+    }
 
     info!(
         did = %created.did,
