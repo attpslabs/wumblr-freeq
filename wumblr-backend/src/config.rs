@@ -33,10 +33,12 @@ pub struct Config {
     #[arg(long, env = "WUMBLR_ISSUER_SHARED_SECRET", default_value = "")]
     pub issuer_shared_secret: String,
 
-    /// freeq-server base URL. Backend calls `POST <freeq>/api/v1/communities/member`
-    /// to write a user's `com.wumblr.member` record to their PDS (freeq holds
-    /// the user's PDS session and acts on their behalf).
-    #[arg(long, env = "WUMBLR_FREEQ_URL", default_value = "http://127.0.0.1:6789")]
+    /// freeq-server base URL (its web/HTTP API). Backend calls
+    /// `POST <freeq>/api/v1/communities/member` to write a user's
+    /// `com.wumblr.member` record to their PDS (freeq holds the user's PDS
+    /// session and acts on their behalf). In the deploy stack freeq's web
+    /// API listens on :8080.
+    #[arg(long, env = "WUMBLR_FREEQ_URL", default_value = "http://127.0.0.1:8080")]
     pub freeq_url: String,
 
     /// Shared HMAC secret between backend and freeq-server (the broker shared

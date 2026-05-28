@@ -82,14 +82,22 @@ services:
       WUMBLR_ISSUER_LISTEN: "0.0.0.0:3090"
       WUMBLR_ISSUER_PRIVKEY_B64: "${WUMBLR_ISSUER_PRIVKEY_B64:?WUMBLR_ISSUER_PRIVKEY_B64 must be set}"
       WUMBLR_ISSUER_SHARED_SECRET: "${WUMBLR_ISSUER_SHARED_SECRET:?WUMBLR_ISSUER_SHARED_SECRET must be set}"
+      # Community-DID provisioning: custody of community PDS sessions + ePDS client.
+      WUMBLR_ISSUER_DB: "/data/issuer.db"
+      WUMBLR_ISSUER_SESSION_KEY_B64: "${WUMBLR_ISSUER_SESSION_KEY_B64:?WUMBLR_ISSUER_SESSION_KEY_B64 must be set (32-byte base64url AES key)}"
+      WUMBLR_ISSUER_EPDS_API_KEY: "${WUMBLR_ISSUER_EPDS_API_KEY:?WUMBLR_ISSUER_EPDS_API_KEY must be set (selfsurf can-create-directly key)}"
+      WUMBLR_ISSUER_EPDS_AUTH_URL: "${WUMBLR_ISSUER_EPDS_AUTH_URL:-https://auth.self.surf}"
+      WUMBLR_ISSUER_EPDS_PDS_URL: "${WUMBLR_ISSUER_EPDS_PDS_URL:-https://self.surf}"
       RUST_LOG: "wumblr_issuer=info,info"
+    volumes:
+      - issuer-data:/data
     expose:
       - "3090"
     networks: [wumblr]
 
   backend:
     image: wumblr-freeq:latest
-    depends_on: [broker, issuer]
+    depends_on: [broker, issuer, freeq]
     restart: unless-stopped
     entrypoint: ["wumblr-backend"]
     environment:
@@ -98,6 +106,11 @@ services:
       WUMBLR_BROKER_URL: "http://broker:3080"
       WUMBLR_ISSUER_URL: "http://issuer:3090"
       WUMBLR_ISSUER_SHARED_SECRET: "${WUMBLR_ISSUER_SHARED_SECRET:?WUMBLR_ISSUER_SHARED_SECRET must be set}"
+      # freeq web API — backend asks freeq to write com.wumblr.member to the
+      # user's PDS after a community is created. HMAC-authed with the broker
+      # shared secret (same value freeq + broker use).
+      WUMBLR_FREEQ_URL: "http://freeq:8080"
+      WUMBLR_FREEQ_BROKER_SECRET: "${BROKER_SHARED_SECRET:?BROKER_SHARED_SECRET must be set}"
       WUMBLR_ADMIN_DIDS: "${WUMBLR_ADMIN_DIDS:-}"
       WUMBLR_DEV_CALLBACK_TARGET: "${WUMBLR_DEV_CALLBACK_TARGET:-}"
       RUST_LOG: "wumblr_backend=info,tower_http=info"
@@ -125,3 +138,4 @@ networks:
 volumes:
   freeq-data:
   broker-data:
+  issuer-data:
