@@ -453,10 +453,11 @@ async fn client_metadata(State(state): State<Arc<BrokerState>>) -> Json<serde_js
         "redirect_uris": [redirect_uri],
         // Union of scopes the broker may ever request, plus
         // `transition:generic` for backward compat with refresh tokens
-        // issued before this change. We never request it at /authorize
-        // — the broker only asks for `atproto`. Remove transition:generic
-        // once the PDS grace period closes.
-        "scope": "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post transition:generic",
+        // issued before this change. The PDS only grants scopes the client
+        // declares here, so any scope the broker requests at /authorize must
+        // also appear in this union. Remove transition:generic once the PDS
+        // grace period closes.
+        "scope": "atproto blob:image/* repo:blue.irc.media?action=create repo:app.bsky.feed.post repo:com.wumblr.member?action=create transition:generic",
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -564,11 +565,13 @@ async fn auth_login(
         "{}/auth/callback",
         state.config.public_url.trim_end_matches('/')
     );
-    // Identity-only scope. The broker's job is to mint a session token
-    // for SASL — that needs nothing more than `atproto`. PDS-touching
-    // features (image upload, Bluesky cross-post) are step-ups served
-    // by the freeq-server's `/auth/step-up`, never the broker.
-    let scope = "atproto";
+    // Login scope: identity (`atproto`) for SASL, plus write access to the
+    // user's own `com.wumblr.member` records so they can create/join
+    // communities without a separate step-up. Every signed-in wumblr user
+    // is expected to do this, so it belongs in the base login grant. Other
+    // PDS-touching features (image upload, Bluesky cross-post) remain
+    // step-ups served by freeq-server's `/auth/step-up`.
+    let scope = "atproto repo:com.wumblr.member?action=create";
     let client_id = build_client_id(&state.config.public_url, &redirect_uri);
 
     let dpop_key = DpopKey::generate();
