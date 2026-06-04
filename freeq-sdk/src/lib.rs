@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod did;
 pub mod e2ee;
 pub mod e2ee_did;
+pub mod eimg;
 pub mod event;
 pub mod irc;
 pub mod media;
