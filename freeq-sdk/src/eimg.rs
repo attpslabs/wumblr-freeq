@@ -166,6 +166,63 @@ pub async fn fetch_encrypted_image(
     Ok(EimgFetch::Found(plaintext))
 }
 
+/// Like [`upload_encrypted_image`] but resolves the channel's member DIDs from a
+/// [`Membership`](crate::membership::Membership) tracker instead of an explicit
+/// list, so callers that maintain a `Membership` don't assemble DIDs by hand.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_encrypted_image_for(
+    client: &reqwest::Client,
+    web_base: &str,
+    did: &str,
+    channel: &str,
+    membership: &crate::membership::Membership,
+    epoch: u64,
+    upload_token: Option<&str>,
+    content_type: &str,
+    image_bytes: &[u8],
+) -> Result<EimgUploadResult> {
+    let members = membership.member_dids(channel);
+    upload_encrypted_image(
+        client,
+        web_base,
+        did,
+        channel,
+        &members,
+        epoch,
+        upload_token,
+        content_type,
+        image_bytes,
+    )
+    .await
+}
+
+/// Like [`fetch_encrypted_image`] but resolves member DIDs from a
+/// [`Membership`](crate::membership::Membership) tracker.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_encrypted_image_for(
+    client: &reqwest::Client,
+    web_base: &str,
+    image_id: &str,
+    did: &str,
+    channel: &str,
+    membership: &crate::membership::Membership,
+    epoch: u64,
+    upload_token: Option<&str>,
+) -> Result<EimgFetch> {
+    let members = membership.member_dids(channel);
+    fetch_encrypted_image(
+        client,
+        web_base,
+        image_id,
+        did,
+        channel,
+        &members,
+        epoch,
+        upload_token,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

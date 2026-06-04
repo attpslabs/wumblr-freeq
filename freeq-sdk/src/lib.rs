@@ -28,6 +28,7 @@ pub mod eimg;
 pub mod event;
 pub mod irc;
 pub mod media;
+pub mod membership;
 pub mod oauth;
 #[cfg(feature = "iroh-transport")]
 pub mod p2p;

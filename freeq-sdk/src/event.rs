@@ -23,6 +23,11 @@ pub enum Event {
     Joined {
         channel: String,
         nick: String,
+        /// The joiner's AT Protocol DID, from the IRCv3 `extended-join`
+        /// account parameter. `None` for guests or when the server didn't
+        /// send it (account `"*"` is normalized to `None`). DIDs are the
+        /// durable identity; see [`crate::membership::Membership`].
+        account: Option<String>,
     },
 
     /// Someone left a channel.
