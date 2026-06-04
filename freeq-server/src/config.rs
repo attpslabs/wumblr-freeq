@@ -126,6 +126,34 @@ pub struct ServerConfig {
     #[arg(long, env = "BROKER_SHARED_SECRET")]
     pub broker_shared_secret: Option<String>,
 
+    // ── Ephemeral image store (contrail spaces service) ────────────
+    /// Base URL of the contrail "spaces" service backing ephemeral,
+    /// E2E-encrypted images (e.g. `https://eimg.wumblr.com`). When set
+    /// (together with `eimg_shared_secret`), the `/api/v1/eimg` endpoints
+    /// are enabled.
+    #[arg(long, env = "FREEQ_EIMG_BASE_URL")]
+    pub eimg_base_url: Option<String>,
+
+    /// Shared secret for the contrail spaces trusted-gateway auth
+    /// (sent as `x-contrail-gateway-secret`). freeq authenticates the user,
+    /// then asserts their DID to the spaces service over this secret.
+    #[arg(long, env = "FREEQ_EIMG_SHARED_SECRET")]
+    pub eimg_shared_secret: Option<String>,
+
+    /// Contrail deployment namespace for the spaces XRPC surface
+    /// (`<namespace>.space.*`). Defaults to `com.wumblr.eimg`.
+    #[arg(long, env = "FREEQ_EIMG_NAMESPACE", default_value = "com.wumblr.eimg")]
+    pub eimg_namespace: String,
+
+    /// The space `type` NSID for image spaces. Defaults to
+    /// `com.wumblr.eimg.space`.
+    #[arg(
+        long,
+        env = "FREEQ_EIMG_SPACE_TYPE",
+        default_value = "com.wumblr.eimg.space"
+    )]
+    pub eimg_space_type: String,
+
     /// Server operator password. If set, the OPER command is enabled.
     /// OPER grants global operator privileges (can kick/ban in any channel, etc.)
     /// Can also be set via OPER_PASSWORD environment variable.
@@ -193,6 +221,10 @@ impl Default for ServerConfig {
             github_client_id: None,
             github_client_secret: None,
             broker_shared_secret: None,
+            eimg_base_url: None,
+            eimg_shared_secret: None,
+            eimg_namespace: "com.wumblr.eimg".to_string(),
+            eimg_space_type: "com.wumblr.eimg.space".to_string(),
             oper_password: None,
             oper_dids: vec![],
             llm_provider: None,

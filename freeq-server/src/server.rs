@@ -738,6 +738,10 @@ pub struct SharedState {
     pub spawned_agents: Mutex<HashMap<String, SpawnedAgent>>,
     /// Per-IP rate limiter for expensive REST endpoints (OG preview, blob proxy, upload).
     pub rest_rate_limiter: crate::web::IpRateLimiter,
+    /// Client for the contrail spaces service backing ephemeral E2E-encrypted
+    /// images. `None` when not configured (the `/api/v1/eimg` endpoints then
+    /// return 503). See [`crate::eimg`].
+    pub eimg_client: Option<std::sync::Arc<dyn crate::eimg::EimgClient>>,
 }
 
 /// A spawned virtual agent (child of a real agent session).
@@ -1108,6 +1112,24 @@ fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     key
 }
 
+/// Build the ephemeral-image spaces client from config, if configured.
+/// Returns `None` (so `/api/v1/eimg` returns 503) unless BOTH the base URL
+/// and the shared secret are set.
+fn build_eimg_client(
+    config: &ServerConfig,
+) -> Option<std::sync::Arc<dyn crate::eimg::EimgClient>> {
+    let base_url = config.eimg_base_url.clone()?;
+    let shared_secret = config.eimg_shared_secret.clone()?;
+    let cfg = crate::eimg::EimgConfig {
+        base_url,
+        shared_secret,
+        namespace: config.eimg_namespace.clone(),
+        space_type: config.eimg_space_type.clone(),
+    };
+    tracing::info!("Ephemeral image store enabled (spaces service: {})", cfg.base_url);
+    Some(std::sync::Arc::new(crate::eimg::HttpEimgClient::new(cfg)))
+}
+
 /// Install the agent-assist LLM provider into the process-wide slot
 /// based on `ServerConfig.llm_*` fields. No-op if the provider is
 /// `None` / `"none"` / unset.
@@ -1420,6 +1442,7 @@ impl Server {
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            eimg_client: build_eimg_client(&self.config),
         }))
     }
 
@@ -4399,6 +4422,7 @@ mod s2s_adversarial_tests {
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            eimg_client: None,
         })
     }
 
