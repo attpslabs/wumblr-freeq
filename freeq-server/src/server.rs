@@ -1954,6 +1954,36 @@ impl Server {
                             .as_secs();
                         cleanup_state.rest_rate_limiter.prune(now);
                     }
+                    // Prune expired ephemeral-image rows (private image store).
+                    // freeq's read path already 410s past expires_at; this just
+                    // reclaims freeq's own metadata. Byte deletion is the spaces
+                    // service's job (its gcExpiredBlobs cron + the R2 lifecycle
+                    // rule), so freeq — a blind broker — issues no delete here.
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        // Cap per tick so a large backlog can't stall the loop;
+                        // the next tick continues draining.
+                        const MAX_EIMG_PRUNE_PER_TICK: usize = 1000;
+                        let expired = cleanup_state
+                            .with_db(|db| db.list_expired_ephemeral_images(now, MAX_EIMG_PRUNE_PER_TICK))
+                            .unwrap_or_default();
+                        let mut pruned = 0usize;
+                        for img in &expired {
+                            if cleanup_state
+                                .with_db(|db| db.delete_ephemeral_image(&img.image_id))
+                                .unwrap_or(0)
+                                > 0
+                            {
+                                pruned += 1;
+                            }
+                        }
+                        if pruned > 0 {
+                            tracing::info!("Pruned {pruned} expired ephemeral image rows");
+                        }
+                    }
                 }
             });
         }

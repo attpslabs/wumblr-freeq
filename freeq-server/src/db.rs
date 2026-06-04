@@ -1983,6 +1983,27 @@ mod tests {
         // Deleting again affects 0 rows.
         assert_eq!(db.delete_ephemeral_image("gone").unwrap(), 0);
     }
+
+    #[test]
+    fn sweep_prunes_only_expired_rows() {
+        // Mirrors the cleanup-loop sweep: list_expired(now) then delete each.
+        // Expired rows go; unexpired survive.
+        let db = Db::open_memory().unwrap();
+        db.insert_ephemeral_image(&sample_eimg("expired1", 100)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("expired2", 200)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("fresh", 10_000)).unwrap();
+
+        let now = 500;
+        let expired = db.list_expired_ephemeral_images(now, 1000).unwrap();
+        for img in &expired {
+            db.delete_ephemeral_image(&img.image_id).unwrap();
+        }
+
+        assert!(db.get_ephemeral_image("expired1").unwrap().is_none());
+        assert!(db.get_ephemeral_image("expired2").unwrap().is_none());
+        // The unexpired row is untouched.
+        assert!(db.get_ephemeral_image("fresh").unwrap().is_some());
+    }
 }
 
 // ── Agent governance DB methods ────────────────────────────────────
