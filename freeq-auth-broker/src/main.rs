@@ -153,10 +153,32 @@ struct DidService {
 /// user's `.well-known` server is slow we'd accumulate stuck requests
 /// until the platform's gateway times out — and meanwhile the user
 /// stares at a spinner with no actionable error.
+///
+/// `pool_max_idle_per_host(0)` disables connection reuse — the
+/// observed failure mode was the *second* POST to bsky.social/oauth/par
+/// (DPoP nonce retry) consistently dying with "error sending request"
+/// while the first POST on the same client succeeded. Each call now
+/// uses a fresh TCP/TLS connection, which dodges that.
+///
+/// `http1_only()` similarly avoids HTTP/2 stream-state weirdness; the
+/// request volume from this endpoint is tiny so the perf cost is
+/// irrelevant.
 fn upstream_client() -> Result<reqwest::Client, anyhow::Error> {
     Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .connect_timeout(std::time::Duration::from_secs(4))
+        // 30s overall. Individual calls to bsky.social are normally
+        // fast (~600ms from a healthy network) but Miren's egress can
+        // be slow, so we keep headroom.
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        // Miren's egress can't reliably open a SECOND TCP connection
+        // to bsky.social inside the same login flow — the connect
+        // phase consistently `TimedOut`. Reusing the first connection
+        // via HTTP/2 multiplexing avoids opening a second TCP socket
+        // at all. We explicitly enable keep-alive idle pooling so the
+        // second POST piggybacks on the open connection from the first.
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()?)
 }
 
@@ -527,24 +549,28 @@ async fn auth_login(
         "{}/.well-known/oauth-authorization-server",
         auth_server.trim_end_matches('/')
     );
-    let auth_meta: serde_json::Value = client
+    let as_resp = client
         .get(&as_url)
         .send()
         .await
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Auth server metadata failed: {e}"),
-            )
-        })?
-        .json()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Auth server metadata parse failed: {e}"),
+                format!("Auth server metadata failed: {e:#?}"),
             )
         })?;
+    let as_status = as_resp.status();
+    let as_body = as_resp.text().await.unwrap_or_default();
+    let auth_meta: serde_json::Value = serde_json::from_str(&as_body).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Auth server metadata parse failed: {e} (status={as_status}, body_len={}, body_preview={:?})",
+                as_body.len(),
+                as_body.chars().take(200).collect::<String>(),
+            ),
+        )
+    })?;
 
     let authorization_endpoint = auth_meta["authorization_endpoint"]
         .as_str()
@@ -612,7 +638,22 @@ async fn auth_login(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let par_resp: serde_json::Value = if status.as_u16() == 400 && dpop_nonce.is_some() {
+    // Surface the first-PAR response body in logs and require the
+    // canonical `use_dpop_nonce` error code before retrying — a 400
+    // with an incidental DPoP-Nonce header but a different error
+    // (e.g. invalid_client_metadata) should NOT be retried into a
+    // timeout; the underlying problem isn't going to resolve.
+    let first_body = resp.text().await.unwrap_or_default();
+    let body_preview = first_body.chars().take(300).collect::<String>();
+    tracing::info!(
+        status = %status,
+        has_nonce = dpop_nonce.is_some(),
+        body = %body_preview,
+        "first PAR response"
+    );
+    let par_resp: serde_json::Value = if status.as_u16() == 400 && dpop_nonce.is_some()
+        && first_body.contains("use_dpop_nonce")
+    {
         let nonce = dpop_nonce.as_deref().unwrap();
         let dpop_proof2 = dpop_key
             .proof("POST", par_endpoint, Some(nonce), None)
@@ -622,13 +663,18 @@ async fn auth_login(
                     format!("DPoP retry failed: {e}"),
                 )
             })?;
+        // Reuse the SAME client for the retry. Miren's egress couldn't
+        // open a second TCP connection to bsky.social within 30s, so
+        // we lean on HTTP/2 multiplexing over the first call's still-
+        // open connection. Connection pooling is enabled in
+        // `upstream_client`.
         let resp2 = client
             .post(par_endpoint)
             .header("DPoP", &dpop_proof2)
             .form(&params)
             .send()
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR retry failed: {e}")))?;
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR retry failed: {e:#?}")))?;
         if !resp2.status().is_success() {
             let text = resp2.text().await.unwrap_or_default();
             return Err((StatusCode::BAD_GATEWAY, format!("PAR failed: {text}")));
@@ -638,14 +684,12 @@ async fn auth_login(
             .await
             .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR parse failed: {e}")))?
     } else if status.is_success() {
-        resp.json()
-            .await
+        serde_json::from_str(&first_body)
             .map_err(|e| (StatusCode::BAD_GATEWAY, format!("PAR parse failed: {e}")))?
     } else {
-        let text = resp.text().await.unwrap_or_default();
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("PAR failed ({status}): {text}"),
+            format!("PAR failed ({status}): {first_body}"),
         ));
     };
 
