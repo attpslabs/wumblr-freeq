@@ -11,6 +11,7 @@ pub mod config;
 pub mod connection;
 pub mod crdt;
 pub mod db;
+pub mod eimg;
 pub mod irc;
 pub mod iroh;
 pub mod manifest;
