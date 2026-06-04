@@ -132,7 +132,6 @@ pub struct EphemeralImage {
     pub space_uri: String,
     pub cid: String,
     pub content_type: Option<String>,
-    pub nonce: Option<Vec<u8>>,
     pub size: Option<u64>,
     pub created_at: u64,
     pub expires_at: u64,
@@ -468,8 +467,9 @@ impl Db {
         // Ephemeral encrypted images (private image store). freeq's authoritative
         // expiry record: the read path refuses (HTTP 410) any image past
         // expires_at even if the spaces-service GC hasn't reaped the bytes yet.
-        // `nonce` + `cid` + `space_uri` locate and decrypt the ciphertext blob;
-        // freeq never stores the content key.
+        // `cid` + `space_uri` locate the ciphertext blob in the spaces service;
+        // the AES-GCM nonce is prepended to the ciphertext (EAR1-style), so
+        // freeq stores no key and no separate nonce — it is a blind broker.
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS ephemeral_images (
                 image_id     TEXT PRIMARY KEY,
@@ -478,7 +478,6 @@ impl Db {
                 space_uri    TEXT NOT NULL,
                 cid          TEXT NOT NULL,
                 content_type TEXT,
-                nonce        BLOB,
                 size         INTEGER,
                 created_at   INTEGER NOT NULL,
                 expires_at   INTEGER NOT NULL
@@ -1080,8 +1079,8 @@ impl Db {
     pub fn insert_ephemeral_image(&self, img: &EphemeralImage) -> SqlResult<()> {
         self.conn.execute(
             "INSERT INTO ephemeral_images
-                (image_id, channel, uploader_did, space_uri, cid, content_type, nonce, size, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 img.image_id,
                 img.channel,
@@ -1089,7 +1088,6 @@ impl Db {
                 img.space_uri,
                 img.cid,
                 img.content_type,
-                img.nonce,
                 img.size.map(|s| s as i64),
                 img.created_at as i64,
                 img.expires_at as i64,
@@ -1104,7 +1102,7 @@ impl Db {
     /// from 410 (expired).
     pub fn get_ephemeral_image(&self, image_id: &str) -> SqlResult<Option<EphemeralImage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, nonce, size, created_at, expires_at
+            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at
              FROM ephemeral_images WHERE image_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![image_id], map_ephemeral_image)?;
@@ -1122,7 +1120,7 @@ impl Db {
         limit: usize,
     ) -> SqlResult<Vec<EphemeralImage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, nonce, size, created_at, expires_at
+            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at
              FROM ephemeral_images
              WHERE expires_at <= ?1
              ORDER BY expires_at ASC
@@ -1391,10 +1389,9 @@ fn map_ephemeral_image(row: &rusqlite::Row) -> SqlResult<EphemeralImage> {
         space_uri: row.get(3)?,
         cid: row.get(4)?,
         content_type: row.get(5)?,
-        nonce: row.get(6)?,
-        size: row.get::<_, Option<i64>>(7)?.map(|s| s as u64),
-        created_at: row.get::<_, i64>(8)? as u64,
-        expires_at: row.get::<_, i64>(9)? as u64,
+        size: row.get::<_, Option<i64>>(6)?.map(|s| s as u64),
+        created_at: row.get::<_, i64>(7)? as u64,
+        expires_at: row.get::<_, i64>(8)? as u64,
     })
 }
 
@@ -1912,7 +1909,6 @@ mod tests {
             space_uri: "at://did:plc:alice/com.wumblr.eimg.space/#secret".to_string(),
             cid: "bafyciphertext".to_string(),
             content_type: Some("image/png".to_string()),
-            nonce: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
             size: Some(4096),
             created_at: 1000,
             expires_at,
@@ -1931,7 +1927,6 @@ mod tests {
         assert_eq!(got.uploader_did, "did:plc:alice");
         assert_eq!(got.cid, "bafyciphertext");
         assert_eq!(got.content_type.as_deref(), Some("image/png"));
-        assert_eq!(got.nonce.as_deref(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12][..]));
         assert_eq!(got.size, Some(4096));
         assert_eq!(got.expires_at, 1000 + 86_400);
     }
