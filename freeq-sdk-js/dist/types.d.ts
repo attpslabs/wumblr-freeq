@@ -157,6 +157,29 @@ export interface Batch {
     type: string;
     target: string;
     messages: Message[];
+    /**
+     * `draft/multiline`-only: opener metadata (msgid, time, account,
+     * client-only tags from the BATCH opener) captured so the assembled
+     * message inherits the right identity. Unused for chathistory batches.
+     */
+    openerTags?: Record<string, string>;
+    /** `draft/multiline`-only: the BATCH opener's sender (the message author). */
+    openerFrom?: string;
+    /**
+     * `draft/multiline`-only: accumulated chunks. Each entry is one
+     * PRIVMSG body plus whether the chunk carried `+draft/multiline-concat`
+     * (join to predecessor without separator) or not (join with `\n`).
+     */
+    multilineLines?: Array<{
+        body: string;
+        concat: boolean;
+    }>;
+    /**
+     * If this batch's opener carried `batch=<parent>` (a nested batch),
+     * the parent id — assembled message gets pushed into the parent's
+     * `messages` instead of emitted as a top-level `message` event.
+     */
+    parentBatchId?: string;
 }
 /** Structured presence states an agent (or human) can broadcast. */
 export type PresenceState = 'online' | 'idle' | 'active' | 'executing' | 'waiting_for_input' | 'blocked_on_permission' | 'blocked_on_budget' | 'degraded' | 'paused' | 'sandboxed' | 'revoked' | 'offline';

@@ -370,6 +370,34 @@ mod tests {
         assert_eq!(pt, "Hello group!");
     }
 
+    /// Canonical cross-implementation parity vector. The TypeScript SDK
+    /// (`freeq-sdk-js/src/eimg.ts`) MUST derive the byte-identical key for these
+    /// exact inputs, or cross-client image decryption silently fails. The
+    /// expected hex below is the value this Rust implementation produces; the TS
+    /// test hardcodes the same constant. If either side's derivation changes,
+    /// this test breaks and the two must be re-synced.
+    ///
+    /// Inputs deliberately given UNSORTED + with a duplicate, and a mixed-case
+    /// channel, to exercise the sort/dedup/lowercase both sides must match.
+    #[test]
+    fn group_key_derivation_vector() {
+        let members = vec![
+            "did:plc:bob".to_string(),
+            "did:plc:alice".to_string(),
+            "did:plc:bob".to_string(),
+        ];
+        let gk = GroupKey::derive("#Secret", &members, 0);
+        let key_hex: String = gk.key.iter().map(|b| format!("{b:02x}")).collect();
+        // Emit so the TS vector can be copied if it ever needs regenerating.
+        println!("PARITY group_key(#Secret, sorted[alice,bob], epoch 0) = {key_hex}");
+        assert_eq!(key_hex, GROUP_KEY_PARITY_HEX);
+    }
+
+    /// Shared constant — keep identical to `EXPECTED_KEY_HEX` in
+    /// freeq-sdk-js/src/eimg.test.ts.
+    const GROUP_KEY_PARITY_HEX: &str =
+        "f3a95c43ef7245faee31bfde76b2e7de50de309c1ee801042ca22c90138900a7";
+
     #[test]
     fn encrypt_bytes_roundtrip() {
         let members = vec!["did:plc:alice".to_string(), "did:plc:bob".to_string()];

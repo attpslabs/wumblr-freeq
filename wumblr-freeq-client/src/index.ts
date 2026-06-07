@@ -18,6 +18,14 @@
 
 import { FreeqClient } from "@freeq/sdk";
 import type { FreeqEvents, Message } from "@freeq/sdk";
+import {
+	uploadEncryptedImage,
+	fetchEncryptedImage,
+	type EimgUploadResult,
+	type EimgFetchResult,
+} from "@freeq/sdk/eimg";
+
+export type { EimgUploadResult, EimgFetchResult };
 
 export interface VerifiableCredential {
 	type: "FreeqCredential/v1";
@@ -149,6 +157,54 @@ export class WumblrFreeq {
 			mode: "latest",
 			count,
 		});
+	}
+
+	/**
+	 * Encrypt an image with the channel's group key and upload the ciphertext to
+	 * the ephemeral image store (`/api/v1/eimg`). The server only ever sees
+	 * ciphertext; images are hard-deleted 24h after upload.
+	 *
+	 * `members` is the channel's member **DIDs** — the caller (which already
+	 * tracks per-channel membership) supplies them; the key is derived from this
+	 * set, so sender and recipient must agree on it. `epoch` is fixed at 0 for
+	 * now (no rotation until the MLS phase).
+	 */
+	uploadEncryptedImage(
+		channel: string,
+		members: string[],
+		contentType: string,
+		imageBytes: Uint8Array,
+		epoch = 0,
+	): Promise<EimgUploadResult> {
+		return uploadEncryptedImage(
+			this.serverOrigin,
+			this.options.did,
+			channel,
+			members,
+			contentType,
+			imageBytes,
+			epoch,
+		);
+	}
+
+	/**
+	 * Fetch and decrypt an ephemeral image. Resolves to `{ gone: true }` if the
+	 * image has expired (24h) or been deleted.
+	 */
+	fetchEncryptedImage(
+		imageId: string,
+		channel: string,
+		members: string[],
+		epoch = 0,
+	): Promise<EimgFetchResult> {
+		return fetchEncryptedImage(
+			this.serverOrigin,
+			imageId,
+			this.options.did,
+			channel,
+			members,
+			epoch,
+		);
 	}
 
 	on<K extends keyof WumblrFreeqEventMap>(
