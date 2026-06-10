@@ -57,6 +57,46 @@ impl FreeqClient {
         }
         Ok(())
     }
+
+    /// Mint a FRESH single-use freeq web-token for `did`/`handle` by calling
+    /// freeq's HMAC-authed `/auth/broker/web-token`. Used to re-issue a token on
+    /// each chat (re)connect — web-tokens are single-use + short-TTL, so the
+    /// frontend must not cache the one from initial login.
+    ///
+    /// Returns the token. (freeq also returns nick/did/handle, but the caller
+    /// already has identity from the SessionStore.)
+    pub async fn mint_web_token(&self, did: &str, handle: &str) -> Result<String> {
+        let body = serde_json::json!({ "did": did, "handle": handle });
+        let body_bytes = serde_json::to_vec(&body)?;
+
+        let ts = chrono::Utc::now().timestamp();
+        let (sig, ts_str) = sign_broker_hmac(ts, &body_bytes, self.broker_secret.as_bytes());
+
+        let resp = self
+            .http
+            .post(format!("{}/auth/broker/web-token", self.base_url))
+            .header("Content-Type", "application/json")
+            .header("X-Broker-Signature", sig)
+            .header("X-Broker-Timestamp", ts_str)
+            .body(body_bytes)
+            .send()
+            .await
+            .context("calling freeq /auth/broker/web-token")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("freeq /auth/broker/web-token returned {status}: {body}");
+        }
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .context("parsing /auth/broker/web-token response")?;
+        json.get("token")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("no token in /auth/broker/web-token response"))
+    }
 }
 
 /// HMAC-SHA256 over `ts={ts}\n` then `body`, base64url-no-pad — matching

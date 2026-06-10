@@ -79,6 +79,9 @@ pub fn router(config: Config) -> Router {
         // Session exchange — frontend posts broker_token, gets back a wumblr
         // bearer + identity + freeq web-token.
         .route("/session/exchange", post(session::exchange))
+        // Re-mint a fresh single-use freeq web-token from the durable bearer,
+        // called by the frontend before each chat (re)connect.
+        .route("/session/freeq-token", post(session::freeq_token))
         .route("/me", get(session::me))
         // Credential proxy — backend HMAC-calls the issuer on the user's behalf.
         .route(

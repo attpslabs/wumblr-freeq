@@ -102,6 +102,48 @@ pub async fn me(
     }))
 }
 
+#[derive(Serialize)]
+pub struct FreeqTokenRes {
+    /// A fresh single-use freeq web-token to present at IRC SASL.
+    pub freeq_web_token: String,
+}
+
+/// Re-mint a fresh freeq web-token for the bearer's session.
+///
+/// freeq web-tokens are single-use + short-TTL, so the frontend can't reuse the
+/// one issued at login (it breaks on every reconnect/refresh). The frontend
+/// calls this right before each chat connect to get a fresh token from the
+/// durable wumblr bearer.
+pub async fn freeq_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<FreeqTokenRes>, (StatusCode, String)> {
+    let bearer = extract_bearer(&headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "missing Authorization: Bearer header".into(),
+    ))?;
+    let resolved = state
+        .sessions
+        .get(bearer)
+        .ok_or((StatusCode::UNAUTHORIZED, "unknown session".into()))?;
+
+    let token = state
+        .freeq
+        .mint_web_token(&resolved.did, &resolved.handle)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("mint freeq web-token: {e:#}"),
+            )
+        })?;
+
+    info!(did = %resolved.did, "re-minted freeq web-token");
+    Ok(Json(FreeqTokenRes {
+        freeq_web_token: token,
+    }))
+}
+
 /// Opaque, URL-safe wumblr-backend bearer. `wb-` prefix lets us tell it
 /// apart from broker tokens in logs/error messages.
 fn mint_bearer() -> String {
