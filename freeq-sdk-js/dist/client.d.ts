@@ -41,6 +41,11 @@ export declare class FreeqClient extends EventEmitter {
     private backgroundWhois;
     private echoPlaintextCache;
     private batches;
+    /** Server-advertised `draft/multiline` policy (parsed from CAP LS). */
+    private multilineMaxBytes;
+    private multilineMaxLines;
+    /** Monotonic counter for client-generated BATCH ids. */
+    private nextBatchSeq;
     private pendingAwayReason;
     private _avSessions;
     private _activeAvSession;
@@ -99,11 +104,77 @@ export declare class FreeqClient extends EventEmitter {
     reconnect(): void;
     /** Set SASL credentials (call before connect, or before reconnect). */
     setSaslCredentials(creds: SaslCredentials): void;
-    /** Send a message to a channel or user. */
+    /**
+     * Send a message to a channel or user. Multi-line text routes by
+     * negotiated cap:
+     * - `draft/multiline` acked AND text contains `\n` → BATCH (one
+     *   chunk per logical line).
+     * - Otherwise → single PRIVMSG with `\n` escaped as `\\n` and a
+     *   `+freeq.at/multiline` tag. The SDK normalizes both forms on
+     *   receive so consumers always see real `\n`.
+     *
+     * The `multiline` param is accepted but unused; routing keys on `\n`
+     * in the text and the negotiated cap.
+     */
     sendMessage(target: string, text: string, multiline?: boolean): void;
-    /** Send a reply to a specific message. */
+    /**
+     * Multi-line send with two affordances `sendMessage` doesn't have:
+     *
+     * - **Array input** — pass `['line1', 'line2', ...]` directly.
+     *   Equivalent to `sendMessage(target, body.join('\n'))`.
+     * - **Opener tags** — pass arbitrary tags via `options.tags` to ride
+     *   on the BATCH opener (e.g. commit-reveal payloads). For common
+     *   tags use the dedicated methods: `sendReply` (+reply), `sendEdit`
+     *   (+draft/edit), `sendTagged` (arbitrary single-PRIVMSG tags).
+     *
+     * For plain multi-line text without custom opener tags, `sendMessage`
+     * is equivalent and simpler — it auto-detects `\n` and routes to a
+     * `draft/multiline` BATCH (when the cap is acked) or the legacy
+     * single-PRIVMSG path otherwise.
+     *
+     * Returns `null` — the BATCH frames are emitted asynchronously
+     * after the assembled body is signed, so the id isn't synchronously
+     * available.
+     */
+    sendMultiline(target: string, body: string | string[], options?: {
+        tags?: Record<string, string>;
+    }): string | null;
+    /**
+     * Shared implementation behind `sendMessage` / `sendMultiline` /
+     * `sendReply` / `sendEdit`. Picks the wire shape based on whether
+     * the text has line breaks, whether the channel is E2EE, and
+     * whether the server acked `draft/multiline`.
+     *
+     * Returns the BATCH id if a multiline BATCH was used, or `null` if
+     * a single PRIVMSG (with or without `+freeq.at/multiline`) was used.
+     */
+    private sendMessageInternal;
+    /**
+     * Single-PRIVMSG fallback: escapes `\n` as `\\n` and sets
+     * `+freeq.at/multiline` when the text has line breaks, so older
+     * receivers that decode that tag still render correctly. Used when
+     * the multiline cap isn't acked.
+     */
+    private sendLegacyPlaintext;
+    /**
+     * Emit local echo if `echo-message` wasn't acked, so the sender's UI
+     * still sees its own outbound message immediately.
+     */
+    private maybeLocalEcho;
+    /**
+     * Per-PRIVMSG-chunk byte budget. Caps below the SDK's own
+     * `LINE_SIZE_WARN_THRESHOLD` (7000) so chunked sends don't trigger
+     * an oversize warning. Reserve ~600 bytes for worst-case opener
+     * metadata; the rest is body content. The server-advertised
+     * `max-bytes` is the TOTAL across all chunks, not per-chunk, so it
+     * doesn't override this budget directly.
+     */
+    private perChunkByteBudget;
+    /** Send a reply to a specific message. Multi-line replies use the
+     *  same wire shape as `sendMessage`. */
     sendReply(target: string, replyToMsgId: string, text: string, multiline?: boolean): void;
-    /** Edit a previously sent message. */
+    /** Edit a message. Multi-line edits use the same wire shape as
+     *  `sendMessage`. */
     sendEdit(target: string, originalMsgId: string, newText: string, multiline?: boolean): void;
     /** Send a message with Markdown formatting. */
     sendMarkdown(target: string, text: string): void;
@@ -185,6 +256,48 @@ export declare class FreeqClient extends EventEmitter {
     private emitCoordinationEvent;
     private signedPrivmsg;
     private cacheEchoPlaintext;
+    /**
+     * Parse the cap params advertised as `draft/multiline=max-bytes=N,max-lines=M`.
+     * Captures server policy so the chunker doesn't exceed it.
+     */
+    private parseMultilineCapParams;
+    /** Mint a unique BATCH id for an outbound multiline send. */
+    private mintBatchId;
+    /**
+     * Assemble the chunks of a closed `draft/multiline` batch per spec
+     * concat rules: a chunk with `+draft/multiline-concat` is joined to
+     * the predecessor with no separator; otherwise joined with `\n`.
+     */
+    private assembleMultiline;
+    /**
+     * Emit a `draft/multiline` BATCH on the wire. `chunks` are already
+     * sized to fit in a PRIVMSG line. `openerTags` go on the BATCH opener
+     * (e.g. commit-reveal client-tags); `+encrypted` rides on each chunk.
+     * Returns the BATCH id used.
+     */
+    private emitMultilineBatch;
+    /**
+     * Close-time handler for an assembled `draft/multiline` batch.
+     * Concatenates the chunks per spec rules, decrypts if the assembled
+     * body is ENC1/ENC3, builds a synthetic `Message` carrying the
+     * opener's identity (msgid, time, sender, etc.), and either emits it
+     * as a top-level `message` event or pushes it into the parent batch
+     * if the multiline was nested (e.g. inside a CHATHISTORY batch).
+     */
+    private dispatchAssembledMultiline;
+    /**
+     * Chunk a body into lines respecting `max-bytes` per chunk and the
+     * `max-lines` per batch ceiling. Two strategies:
+     *
+     *   - `concatChunks=false`: chunk on `\n` boundaries; each source line
+     *     becomes one chunk (no `+draft/multiline-concat`). If a single
+     *     source line exceeds the byte budget it is hard-split with concat
+     *     so the assembled body is byte-identical.
+     *   - `concatChunks=true`: chunk on byte boundaries only (used for
+     *     ciphertext-chunking E2EE messages — there are no logical line
+     *     breaks to honor).
+     */
+    private chunkMultilineBody;
     private handleLine;
     private handleCap;
     private handleAuthenticate;

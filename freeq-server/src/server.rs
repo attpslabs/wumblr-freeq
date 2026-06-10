@@ -738,6 +738,10 @@ pub struct SharedState {
     pub spawned_agents: Mutex<HashMap<String, SpawnedAgent>>,
     /// Per-IP rate limiter for expensive REST endpoints (OG preview, blob proxy, upload).
     pub rest_rate_limiter: crate::web::IpRateLimiter,
+    /// Client for the contrail spaces service backing ephemeral E2E-encrypted
+    /// images. `None` when not configured (the `/api/v1/eimg` endpoints then
+    /// return 503). See [`crate::eimg`].
+    pub eimg_client: Option<std::sync::Arc<dyn crate::eimg::EimgClient>>,
 }
 
 /// A spawned virtual agent (child of a real agent session).
@@ -1108,6 +1112,24 @@ fn load_msg_signing_key(data_dir: &str) -> ed25519_dalek::SigningKey {
     key
 }
 
+/// Build the ephemeral-image spaces client from config, if configured.
+/// Returns `None` (so `/api/v1/eimg` returns 503) unless BOTH the base URL
+/// and the shared secret are set.
+fn build_eimg_client(
+    config: &ServerConfig,
+) -> Option<std::sync::Arc<dyn crate::eimg::EimgClient>> {
+    let base_url = config.eimg_base_url.clone()?;
+    let shared_secret = config.eimg_shared_secret.clone()?;
+    let cfg = crate::eimg::EimgConfig {
+        base_url,
+        shared_secret,
+        namespace: config.eimg_namespace.clone(),
+        space_type: config.eimg_space_type.clone(),
+    };
+    tracing::info!("Ephemeral image store enabled (spaces service: {})", cfg.base_url);
+    Some(std::sync::Arc::new(crate::eimg::HttpEimgClient::new(cfg)))
+}
+
 /// Install the agent-assist LLM provider into the process-wide slot
 /// based on `ServerConfig.llm_*` fields. No-op if the provider is
 /// `None` / `"none"` / unset.
@@ -1420,6 +1442,7 @@ impl Server {
             spawned_agents: Mutex::new(HashMap::new()),
             // 30 requests per 60-second window per IP for expensive REST endpoints
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            eimg_client: build_eimg_client(&self.config),
         }))
     }
 
@@ -1930,6 +1953,36 @@ impl Server {
                             .unwrap_or_default()
                             .as_secs();
                         cleanup_state.rest_rate_limiter.prune(now);
+                    }
+                    // Prune expired ephemeral-image rows (private image store).
+                    // freeq's read path already 410s past expires_at; this just
+                    // reclaims freeq's own metadata. Byte deletion is the spaces
+                    // service's job (its gcExpiredBlobs cron + the R2 lifecycle
+                    // rule), so freeq — a blind broker — issues no delete here.
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        // Cap per tick so a large backlog can't stall the loop;
+                        // the next tick continues draining.
+                        const MAX_EIMG_PRUNE_PER_TICK: usize = 1000;
+                        let expired = cleanup_state
+                            .with_db(|db| db.list_expired_ephemeral_images(now, MAX_EIMG_PRUNE_PER_TICK))
+                            .unwrap_or_default();
+                        let mut pruned = 0usize;
+                        for img in &expired {
+                            if cleanup_state
+                                .with_db(|db| db.delete_ephemeral_image(&img.image_id))
+                                .unwrap_or(0)
+                                > 0
+                            {
+                                pruned += 1;
+                            }
+                        }
+                        if pruned > 0 {
+                            tracing::info!("Pruned {pruned} expired ephemeral image rows");
+                        }
                     }
                 }
             });
@@ -4399,6 +4452,7 @@ mod s2s_adversarial_tests {
             ghost_sessions: Mutex::new(HashMap::new()),
             spawned_agents: Mutex::new(HashMap::new()),
             rest_rate_limiter: crate::web::IpRateLimiter::new(30, 60),
+            eimg_client: None,
         })
     }
 

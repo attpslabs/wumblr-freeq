@@ -1763,7 +1763,13 @@ where
                                 .and_then(|p| p.split('!').next())
                                 .unwrap_or("")
                                 .to_string();
-                            let _ = event_tx.send(Event::Joined { channel, nick }).await;
+                            // IRCv3 extended-join: `JOIN <channel> <account> :<realname>`.
+                            // params[1] is the account (the joiner's DID), or "*"
+                            // for none/guest. Plain JOIN (no extended-join) lacks params[1].
+                            let account = msg.params.get(1).and_then(|a| {
+                                if a == "*" || a.is_empty() { None } else { Some(a.clone()) }
+                            });
+                            let _ = event_tx.send(Event::Joined { channel, nick, account }).await;
                         }
                         "PART" => {
                             let channel = msg.params.first().cloned().unwrap_or_default();

@@ -156,6 +156,44 @@ impl GroupKey {
         String::from_utf8(pt).map_err(|_| DecryptError::InvalidUtf8)
     }
 
+    /// Encrypt raw bytes for the ephemeral image store.
+    ///
+    /// Unlike [`encrypt`](Self::encrypt) (which produces the textual `ENC2:`
+    /// wire format for IRC messages), this produces a raw binary blob:
+    /// the 12-byte AES-GCM nonce **prepended** to the ciphertext, with no
+    /// base64 or text envelope. This matches the freeq-server `/api/v1/eimg`
+    /// contract ("nonce-prepended ciphertext") and the at-rest format in
+    /// `freeq-server/src/db.rs`. The epoch is NOT embedded — the caller tracks
+    /// which epoch's key encrypted a given image out of band.
+    pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| EncryptError::BadKey)?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|_| EncryptError::EncryptFailed)?;
+
+        let mut blob = Vec::with_capacity(12 + ct.len());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ct);
+        Ok(blob)
+    }
+
+    /// Decrypt a nonce-prepended blob produced by [`encrypt_bytes`](Self::encrypt_bytes).
+    ///
+    /// The first 12 bytes are the AES-GCM nonce; the remainder is the
+    /// ciphertext+tag. Returns the plaintext bytes.
+    pub fn decrypt_bytes(&self, blob: &[u8]) -> Result<Vec<u8>, DecryptError> {
+        if blob.len() < 12 {
+            return Err(DecryptError::MalformedMessage);
+        }
+        let (nonce_bytes, ct_bytes) = blob.split_at(12);
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| DecryptError::BadKey)?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher
+            .decrypt(nonce, ct_bytes)
+            .map_err(|_| DecryptError::DecryptFailed)
+    }
+
     /// Check if this key has the same member set.
     pub fn members_match(&self, members: &[String]) -> bool {
         let mut sorted: Vec<String> = members.to_vec();
@@ -330,6 +368,89 @@ mod tests {
 
         let pt = gk.decrypt(&wire).unwrap();
         assert_eq!(pt, "Hello group!");
+    }
+
+    /// Canonical cross-implementation parity vector. The TypeScript SDK
+    /// (`freeq-sdk-js/src/eimg.ts`) MUST derive the byte-identical key for these
+    /// exact inputs, or cross-client image decryption silently fails. The
+    /// expected hex below is the value this Rust implementation produces; the TS
+    /// test hardcodes the same constant. If either side's derivation changes,
+    /// this test breaks and the two must be re-synced.
+    ///
+    /// Inputs deliberately given UNSORTED + with a duplicate, and a mixed-case
+    /// channel, to exercise the sort/dedup/lowercase both sides must match.
+    #[test]
+    fn group_key_derivation_vector() {
+        let members = vec![
+            "did:plc:bob".to_string(),
+            "did:plc:alice".to_string(),
+            "did:plc:bob".to_string(),
+        ];
+        let gk = GroupKey::derive("#Secret", &members, 0);
+        let key_hex: String = gk.key.iter().map(|b| format!("{b:02x}")).collect();
+        // Emit so the TS vector can be copied if it ever needs regenerating.
+        println!("PARITY group_key(#Secret, sorted[alice,bob], epoch 0) = {key_hex}");
+        assert_eq!(key_hex, GROUP_KEY_PARITY_HEX);
+    }
+
+    /// Shared constant — keep identical to `EXPECTED_KEY_HEX` in
+    /// freeq-sdk-js/src/eimg.test.ts.
+    const GROUP_KEY_PARITY_HEX: &str =
+        "f3a95c43ef7245faee31bfde76b2e7de50de309c1ee801042ca22c90138900a7";
+
+    #[test]
+    fn encrypt_bytes_roundtrip() {
+        let members = vec!["did:plc:alice".to_string(), "did:plc:bob".to_string()];
+        let gk = GroupKey::derive("#secret", &members, 1);
+
+        let plaintext = b"\x00\x01\x02 binary image bytes \xff\xfe";
+        let blob = gk.encrypt_bytes(plaintext).unwrap();
+        // Blob is nonce(12) ++ ciphertext+tag — strictly larger than plaintext,
+        // and NOT the text ENC2: envelope.
+        assert!(blob.len() > 12 + plaintext.len());
+        assert!(!blob.starts_with(b"ENC2:"));
+
+        let got = gk.decrypt_bytes(&blob).unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[test]
+    fn encrypt_bytes_wrong_members_fail() {
+        let m1 = vec!["did:plc:alice".to_string(), "did:plc:bob".to_string()];
+        let m2 = vec!["did:plc:alice".to_string(), "did:plc:carol".to_string()];
+        let k1 = GroupKey::derive("#chan", &m1, 0);
+        let k2 = GroupKey::derive("#chan", &m2, 0);
+
+        let blob = k1.encrypt_bytes(b"secret image").unwrap();
+        assert!(k2.decrypt_bytes(&blob).is_err());
+    }
+
+    #[test]
+    fn encrypt_bytes_tamper_fails() {
+        let members = vec!["did:plc:alice".to_string()];
+        let gk = GroupKey::derive("#chan", &members, 0);
+        let mut blob = gk.encrypt_bytes(b"hello").unwrap();
+        // Flip a byte in the ciphertext region (after the 12-byte nonce).
+        let last = blob.len() - 1;
+        blob[last] ^= 0xff;
+        assert!(gk.decrypt_bytes(&blob).is_err());
+    }
+
+    #[test]
+    fn decrypt_bytes_truncated_blob_fails() {
+        let members = vec!["did:plc:alice".to_string()];
+        let gk = GroupKey::derive("#chan", &members, 0);
+        // Fewer than 12 bytes can't contain a nonce.
+        assert!(gk.decrypt_bytes(&[0u8; 5]).is_err());
+        assert!(gk.decrypt_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn encrypt_bytes_empty_plaintext() {
+        let members = vec!["did:plc:alice".to_string()];
+        let gk = GroupKey::derive("#chan", &members, 0);
+        let blob = gk.encrypt_bytes(b"").unwrap();
+        assert_eq!(gk.decrypt_bytes(&blob).unwrap(), b"");
     }
 
     #[test]

@@ -34,4 +34,5 @@ export { fetchProfile, prefetchProfiles, getCachedProfile } from './profiles.js'
 // PDS, no OAuth, no external service. See `examples/full-validation-bot/`
 // for the canonical usage pattern.
 export { generateDidKey, importDidKey } from './did-key.js';
+export { deriveGroupKey, encryptBytes, decryptBytes, uploadEncryptedImage, fetchEncryptedImage, } from './eimg.js';
 //# sourceMappingURL=index.js.map

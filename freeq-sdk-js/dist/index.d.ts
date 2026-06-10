@@ -31,4 +31,6 @@ export { fetchProfile, prefetchProfiles, getCachedProfile } from './profiles.js'
 export type { ATProfile } from './profiles.js';
 export { generateDidKey, importDidKey } from './did-key.js';
 export type { DidKey } from './did-key.js';
+export { deriveGroupKey, encryptBytes, decryptBytes, uploadEncryptedImage, fetchEncryptedImage, } from './eimg.js';
+export type { EimgUploadResult, EimgFetchResult } from './eimg.js';
 //# sourceMappingURL=index.d.ts.map

@@ -191,6 +191,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/users/{nick}", get(api_user))
         .route("/api/v1/users/{nick}/whois", get(api_user_whois))
         .route("/api/v1/upload", axum::routing::post(api_upload))
+        .route("/api/v1/eimg", post(api_eimg_upload))
+        .route("/api/v1/eimg/{image_id}", get(api_eimg_get))
         .route("/api/v1/blob", get(api_blob_proxy))
         .route("/api/v1/og", get(api_og_preview))
         .route("/api/v1/keys/{did}", get(api_get_keys))
@@ -3106,6 +3108,261 @@ async fn api_upload(
     })))
 }
 
+// ── Ephemeral encrypted images (private image store) ────────────────────
+
+/// Pure membership check (unit-testable): is `did` a member of the channel,
+/// given the channel state and the session→DID map? Local members are session
+/// ids resolved via `session_dids`; remote (S2S) members carry their DID.
+fn did_is_member(
+    ch: &crate::server::ChannelState,
+    session_dids: &std::collections::HashMap<String, String>,
+    did: &str,
+) -> bool {
+    if ch
+        .remote_members
+        .values()
+        .any(|rm| rm.did.as_deref() == Some(did))
+    {
+        return true;
+    }
+    ch.members
+        .iter()
+        .any(|sid| session_dids.get(sid).map(|d| d.as_str()) == Some(did))
+}
+
+/// Is `did` currently a member of `channel`? Case-insensitive channel match.
+fn did_in_channel(state: &SharedState, did: &str, channel: &str) -> bool {
+    let channels = state.channels.lock();
+    let Some(ch) = channels.get(&channel.to_lowercase()) else {
+        return false;
+    };
+    let session_dids = state.session_dids.lock();
+    did_is_member(ch, &session_dids, did)
+}
+
+/// Pure auth-gate check (unit-testable): does the caller own `did` via a valid
+/// upload token or an active session? `upload_tokens` maps token → (DID, age).
+fn auth_owns_did(
+    token: Option<&str>,
+    upload_tokens: &std::collections::HashMap<String, (String, std::time::Instant)>,
+    active_session_dids: &std::collections::HashMap<String, String>,
+    did: &str,
+) -> bool {
+    let has_upload_token = token.is_some_and(|t| {
+        upload_tokens
+            .get(t)
+            .is_some_and(|(t_did, created)| t_did == did && created.elapsed().as_secs() < 300)
+    });
+    let has_active_session = active_session_dids.values().any(|d| d == did);
+    has_upload_token || has_active_session
+}
+
+/// Shared auth gate for the eimg endpoints: the caller must own `did` (active
+/// WebSocket session or a valid short-lived upload token). Mirrors `api_upload`.
+fn eimg_auth_ok(state: &SharedState, headers: &axum::http::HeaderMap, did: &str) -> bool {
+    let token = headers.get("x-upload-token").and_then(|v| v.to_str().ok());
+    let upload_tokens = state.upload_tokens.lock();
+    let session_dids = state.session_dids.lock();
+    auth_owns_did(token, &upload_tokens, &session_dids, did)
+}
+
+/// POST /api/v1/eimg — upload a client-encrypted image to the channel's space.
+///
+/// Multipart fields: `file` (ciphertext, nonce-prepended), `did`, `channel`.
+/// freeq is a blind broker: it never sees plaintext or the content key. It
+/// gates auth + channel membership, ensures the channel's space exists, forwards
+/// ciphertext to the spaces service, records `expires_at = now + 24h`, and
+/// returns an opaque `image_id`.
+async fn api_eimg_upload(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+    }
+    let Some(eimg) = state.eimg_client.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Ephemeral image store not configured".into(),
+        ));
+    };
+
+    let mut ciphertext: Option<Vec<u8>> = None;
+    let mut content_type = String::from("application/octet-stream");
+    let mut did = String::new();
+    let mut channel = String::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => {
+                if let Some(ct) = field.content_type() {
+                    content_type = ct.to_string();
+                }
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("File read error: {e}")))?;
+                if bytes.len() > 10 * 1024 * 1024 {
+                    return Err((StatusCode::PAYLOAD_TOO_LARGE, "File too large (max 10MB)".into()));
+                }
+                ciphertext = Some(bytes.to_vec());
+            }
+            "did" => {
+                did = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("DID read error: {e}")))?;
+            }
+            "channel" => {
+                channel = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Channel read error: {e}")))?;
+            }
+            _ => {}
+        }
+    }
+
+    let ciphertext =
+        ciphertext.ok_or_else(|| (StatusCode::BAD_REQUEST, "No file provided".into()))?;
+    if did.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No DID provided".into()));
+    }
+    if channel.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No channel provided".into()));
+    }
+
+    if !eimg_auth_ok(&state, &headers, &did) {
+        tracing::warn!(did = %did, "eimg upload rejected: no active session or upload token");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Upload requires an active connection for this DID".into(),
+        ));
+    }
+    if !did_in_channel(&state, &did, &channel) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a member of this channel".into(),
+        ));
+    }
+
+    // Ensure the channel's space exists (idempotent), then upload ciphertext.
+    let space_uri = eimg
+        .ensure_space(&did, &channel)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("spaces ensure_space failed: {e:#}")))?;
+    let uploaded = eimg
+        .upload_blob(&did, &space_uri, &content_type, &ciphertext)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("spaces upload failed: {e:#}")))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = now + 24 * 60 * 60;
+    let image_id = crate::msgid::generate();
+
+    let row = crate::db::EphemeralImage {
+        image_id: image_id.clone(),
+        channel: channel.clone(),
+        uploader_did: did.clone(),
+        space_uri: uploaded.space_uri,
+        cid: uploaded.cid,
+        content_type: Some(content_type),
+        size: Some(ciphertext.len() as u64),
+        created_at: now,
+        expires_at,
+    };
+    state.with_db(|db| db.insert_ephemeral_image(&row));
+
+    tracing::info!(did = %did, channel = %channel, image_id = %image_id, "ephemeral image uploaded");
+    Ok(Json(serde_json::json!({
+        "image_id": image_id,
+        "expires_at": expires_at,
+    })))
+}
+
+/// GET /api/v1/eimg/{image_id}?did=...&channel=... — fetch ciphertext.
+///
+/// Auth-gated (caller owns `did`), membership-gated (caller is in the image's
+/// channel), and expiry-gated: returns 410 Gone at/after `expires_at` even if
+/// the spaces service still holds the bytes — the authoritative 24h cut-off.
+async fn api_eimg_get(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    Path(image_id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+    }
+    let Some(eimg) = state.eimg_client.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Ephemeral image store not configured")
+            .into_response();
+    };
+    let Some(did) = q.get("did").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing did").into_response();
+    };
+
+    if !eimg_auth_ok(&state, &headers, &did) {
+        return (StatusCode::UNAUTHORIZED, "no active connection for this DID").into_response();
+    }
+
+    let Some(row) = state
+        .with_db(|db| db.get_ephemeral_image(&image_id))
+        .flatten()
+    else {
+        return (StatusCode::NOT_FOUND, "no such image").into_response();
+    };
+
+    // Read-time expiry: authoritative 24h cut-off, independent of spaces GC lag.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now >= row.expires_at {
+        return (StatusCode::GONE, "image expired").into_response();
+    }
+
+    // Membership gate (defense-in-depth on top of E2EE).
+    if !did_in_channel(&state, &did, &row.channel) {
+        return (StatusCode::FORBIDDEN, "not a member of this channel").into_response();
+    }
+
+    match eimg.get_blob(&did, &row.space_uri, &row.cid).await {
+        Ok(crate::eimg::BlobFetch::Found(blob)) => {
+            let mut resp_headers = axum::http::HeaderMap::new();
+            resp_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                blob.content_type
+                    .parse()
+                    .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+            );
+            // Never cache ciphertext at intermediaries; it's private + ephemeral.
+            resp_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                "private, no-store".parse().unwrap(),
+            );
+            (resp_headers, blob.bytes).into_response()
+        }
+        Ok(crate::eimg::BlobFetch::Gone) => {
+            (StatusCode::GONE, "image expired").into_response()
+        }
+        Err(e) => {
+            tracing::warn!(image_id = %image_id, error = %format!("{e:#}"), "eimg fetch failed");
+            (StatusCode::BAD_GATEWAY, "fetch failed").into_response()
+        }
+    }
+}
+
 // ── Channel invite page ────────────────────────────────────────────────
 
 /// Escape user-controlled strings for safe embedding in HTML.
@@ -3921,4 +4178,87 @@ fn session_to_json(s: &crate::av::AvSession, mgr: &crate::av::AvSessionManager) 
         "recording_enabled": s.recording_enabled,
         "iroh_ticket": s.iroh_ticket,
     })
+}
+
+#[cfg(test)]
+mod eimg_gate_tests {
+    use super::{auth_owns_did, did_is_member};
+    use crate::server::{ChannelState, RemoteMember};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    fn remote(did: &str) -> RemoteMember {
+        RemoteMember {
+            origin: "peer".into(),
+            did: Some(did.into()),
+            handle: None,
+            is_op: false,
+            actor_class: None,
+        }
+    }
+
+    #[test]
+    fn local_member_via_session_did_is_recognized() {
+        let mut ch = ChannelState::default();
+        ch.members.insert("sess-1".into());
+        let mut session_dids = HashMap::new();
+        session_dids.insert("sess-1".to_string(), "did:plc:alice".to_string());
+
+        assert!(did_is_member(&ch, &session_dids, "did:plc:alice"));
+        assert!(!did_is_member(&ch, &session_dids, "did:plc:bob"));
+    }
+
+    #[test]
+    fn remote_member_did_is_recognized() {
+        let mut ch = ChannelState::default();
+        ch.remote_members.insert("bob".into(), remote("did:plc:bob"));
+        let session_dids = HashMap::new();
+
+        assert!(did_is_member(&ch, &session_dids, "did:plc:bob"));
+        assert!(!did_is_member(&ch, &session_dids, "did:plc:carol"));
+    }
+
+    #[test]
+    fn non_member_session_id_without_did_mapping_is_rejected() {
+        // A session in members but with no DID mapping must not match.
+        let mut ch = ChannelState::default();
+        ch.members.insert("ghost-sess".into());
+        let session_dids = HashMap::new();
+        assert!(!did_is_member(&ch, &session_dids, "did:plc:alice"));
+    }
+
+    #[test]
+    fn auth_active_session_grants() {
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), "did:plc:alice".to_string());
+        let tokens = HashMap::new();
+        assert!(auth_owns_did(None, &tokens, &sessions, "did:plc:alice"));
+        assert!(!auth_owns_did(None, &tokens, &sessions, "did:plc:bob"));
+    }
+
+    #[test]
+    fn auth_valid_upload_token_grants() {
+        let sessions = HashMap::new();
+        let mut tokens = HashMap::new();
+        tokens.insert("tok".to_string(), ("did:plc:alice".to_string(), Instant::now()));
+        assert!(auth_owns_did(Some("tok"), &tokens, &sessions, "did:plc:alice"));
+        // Token bound to alice can't authorize bob.
+        assert!(!auth_owns_did(Some("tok"), &tokens, &sessions, "did:plc:bob"));
+        // Wrong/unknown token.
+        assert!(!auth_owns_did(Some("other"), &tokens, &sessions, "did:plc:alice"));
+        // No token, no session.
+        assert!(!auth_owns_did(None, &tokens, &sessions, "did:plc:alice"));
+    }
+
+    #[test]
+    fn auth_expired_upload_token_rejected() {
+        let sessions = HashMap::new();
+        let mut tokens = HashMap::new();
+        // created 301s ago → past the 300s TTL.
+        let old = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(301))
+            .unwrap();
+        tokens.insert("tok".to_string(), ("did:plc:alice".to_string(), old));
+        assert!(!auth_owns_did(Some("tok"), &tokens, &sessions, "did:plc:alice"));
+    }
 }

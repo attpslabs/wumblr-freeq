@@ -121,6 +121,22 @@ pub struct MessageRow {
     pub sender_did: Option<String>,
 }
 
+/// A persisted ephemeral-image record (private image store). Locates and
+/// authorizes a ciphertext blob in the contrail spaces service; freeq holds the
+/// authoritative `expires_at` for the read-time 410. Never holds the key.
+#[derive(Debug, Clone)]
+pub struct EphemeralImage {
+    pub image_id: String,
+    pub channel: String,
+    pub uploader_did: String,
+    pub space_uri: String,
+    pub cid: String,
+    pub content_type: Option<String>,
+    pub size: Option<u64>,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
 /// A persisted identity (DID-nick binding).
 #[derive(Debug, Clone)]
 pub struct IdentityRow {
@@ -445,6 +461,29 @@ impl Db {
                 title        TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_av_artifacts_session ON av_artifacts(session_id);
+            ",
+        )?;
+
+        // Ephemeral encrypted images (private image store). freeq's authoritative
+        // expiry record: the read path refuses (HTTP 410) any image past
+        // expires_at even if the spaces-service GC hasn't reaped the bytes yet.
+        // `cid` + `space_uri` locate the ciphertext blob in the spaces service;
+        // the AES-GCM nonce is prepended to the ciphertext (EAR1-style), so
+        // freeq stores no key and no separate nonce — it is a blind broker.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ephemeral_images (
+                image_id     TEXT PRIMARY KEY,
+                channel      TEXT NOT NULL,
+                uploader_did TEXT NOT NULL,
+                space_uri    TEXT NOT NULL,
+                cid          TEXT NOT NULL,
+                content_type TEXT,
+                size         INTEGER,
+                created_at   INTEGER NOT NULL,
+                expires_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eimg_expires ON ephemeral_images(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_eimg_channel ON ephemeral_images(channel);
             ",
         )?;
 
@@ -1034,6 +1073,72 @@ impl Db {
         rows.collect()
     }
 
+    // ── Ephemeral images (private image store) ─────────────────────
+
+    /// Persist an ephemeral-image record on upload.
+    pub fn insert_ephemeral_image(&self, img: &EphemeralImage) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO ephemeral_images
+                (image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                img.image_id,
+                img.channel,
+                img.uploader_did,
+                img.space_uri,
+                img.cid,
+                img.content_type,
+                img.size.map(|s| s as i64),
+                img.created_at as i64,
+                img.expires_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up an ephemeral image by id. Returns `None` if absent. Note: callers
+    /// MUST enforce `expires_at` at read time (HTTP 410) — this getter returns
+    /// the row regardless of expiry so the handler can distinguish 404 (absent)
+    /// from 410 (expired).
+    pub fn get_ephemeral_image(&self, image_id: &str) -> SqlResult<Option<EphemeralImage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at
+             FROM ephemeral_images WHERE image_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![image_id], map_ephemeral_image)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Find ephemeral images whose `expires_at <= now`, capped at `limit`, for
+    /// the cleanup sweep (best-effort byte deletion + row removal).
+    pub fn list_expired_ephemeral_images(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> SqlResult<Vec<EphemeralImage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_id, channel, uploader_did, space_uri, cid, content_type, size, created_at, expires_at
+             FROM ephemeral_images
+             WHERE expires_at <= ?1
+             ORDER BY expires_at ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now as i64, limit as i64], map_ephemeral_image)?;
+        rows.collect()
+    }
+
+    /// Delete an ephemeral-image row (after byte deletion in the sweep, or when
+    /// hard-removing). Returns rows affected.
+    pub fn delete_ephemeral_image(&self, image_id: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "DELETE FROM ephemeral_images WHERE image_id = ?1",
+            params![image_id],
+        )
+    }
+
     /// Get raw (potentially encrypted) message text for testing.
     /// Returns the stored text without decryption.
     pub fn get_raw_message_text(&self, channel: &str, timestamp: u64) -> SqlResult<String> {
@@ -1274,6 +1379,20 @@ impl Db {
             None => Ok(None),
         }
     }
+}
+
+fn map_ephemeral_image(row: &rusqlite::Row) -> SqlResult<EphemeralImage> {
+    Ok(EphemeralImage {
+        image_id: row.get(0)?,
+        channel: row.get(1)?,
+        uploader_did: row.get(2)?,
+        space_uri: row.get(3)?,
+        cid: row.get(4)?,
+        content_type: row.get(5)?,
+        size: row.get::<_, Option<i64>>(6)?.map(|s| s as u64),
+        created_at: row.get::<_, i64>(7)? as u64,
+        expires_at: row.get::<_, i64>(8)? as u64,
+    })
 }
 
 fn map_message_row(row: &rusqlite::Row) -> SqlResult<MessageRow> {
@@ -1780,6 +1899,110 @@ mod tests {
             )
             .unwrap();
         assert!(db.get_signing_key("did:plc:short").unwrap().is_none());
+    }
+
+    fn sample_eimg(id: &str, expires_at: u64) -> EphemeralImage {
+        EphemeralImage {
+            image_id: id.to_string(),
+            channel: "#secret".to_string(),
+            uploader_did: "did:plc:alice".to_string(),
+            space_uri: "at://did:plc:alice/com.wumblr.eimg.space/#secret".to_string(),
+            cid: "bafyciphertext".to_string(),
+            content_type: Some("image/png".to_string()),
+            size: Some(4096),
+            created_at: 1000,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn ephemeral_image_roundtrip() {
+        let db = Db::open_memory().unwrap();
+        let img = sample_eimg("img1", 1000 + 86_400);
+        db.insert_ephemeral_image(&img).unwrap();
+
+        let got = db.get_ephemeral_image("img1").unwrap().unwrap();
+        assert_eq!(got.image_id, "img1");
+        assert_eq!(got.channel, "#secret");
+        assert_eq!(got.uploader_did, "did:plc:alice");
+        assert_eq!(got.cid, "bafyciphertext");
+        assert_eq!(got.content_type.as_deref(), Some("image/png"));
+        assert_eq!(got.size, Some(4096));
+        assert_eq!(got.expires_at, 1000 + 86_400);
+    }
+
+    #[test]
+    fn ephemeral_image_missing_returns_none() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.get_ephemeral_image("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_ephemeral_image_returns_expired_row_for_410_distinction() {
+        // The getter must return an expired row (not None) so the handler can
+        // tell 410 (expired) from 404 (absent). Expiry is enforced at the
+        // handler, not here.
+        let db = Db::open_memory().unwrap();
+        let img = sample_eimg("old", 500); // already past created_at
+        db.insert_ephemeral_image(&img).unwrap();
+        let got = db.get_ephemeral_image("old").unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().expires_at, 500);
+    }
+
+    #[test]
+    fn list_expired_ephemeral_images_selects_only_past_expiry() {
+        let db = Db::open_memory().unwrap();
+        db.insert_ephemeral_image(&sample_eimg("a", 100)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("b", 200)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("c", 5000)).unwrap();
+
+        // now = 300 → a and b expired, c not.
+        let expired = db.list_expired_ephemeral_images(300, 10).unwrap();
+        let ids: Vec<&str> = expired.iter().map(|i| i.image_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]); // ordered by expires_at ASC
+    }
+
+    #[test]
+    fn list_expired_respects_limit() {
+        let db = Db::open_memory().unwrap();
+        for i in 0..5 {
+            db.insert_ephemeral_image(&sample_eimg(&format!("e{i}"), 100 + i))
+                .unwrap();
+        }
+        let expired = db.list_expired_ephemeral_images(1000, 3).unwrap();
+        assert_eq!(expired.len(), 3);
+    }
+
+    #[test]
+    fn delete_ephemeral_image_removes_row() {
+        let db = Db::open_memory().unwrap();
+        db.insert_ephemeral_image(&sample_eimg("gone", 9999)).unwrap();
+        assert_eq!(db.delete_ephemeral_image("gone").unwrap(), 1);
+        assert!(db.get_ephemeral_image("gone").unwrap().is_none());
+        // Deleting again affects 0 rows.
+        assert_eq!(db.delete_ephemeral_image("gone").unwrap(), 0);
+    }
+
+    #[test]
+    fn sweep_prunes_only_expired_rows() {
+        // Mirrors the cleanup-loop sweep: list_expired(now) then delete each.
+        // Expired rows go; unexpired survive.
+        let db = Db::open_memory().unwrap();
+        db.insert_ephemeral_image(&sample_eimg("expired1", 100)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("expired2", 200)).unwrap();
+        db.insert_ephemeral_image(&sample_eimg("fresh", 10_000)).unwrap();
+
+        let now = 500;
+        let expired = db.list_expired_ephemeral_images(now, 1000).unwrap();
+        for img in &expired {
+            db.delete_ephemeral_image(&img.image_id).unwrap();
+        }
+
+        assert!(db.get_ephemeral_image("expired1").unwrap().is_none());
+        assert!(db.get_ephemeral_image("expired2").unwrap().is_none());
+        // The unexpired row is untouched.
+        assert!(db.get_ephemeral_image("fresh").unwrap().is_some());
     }
 }
 
