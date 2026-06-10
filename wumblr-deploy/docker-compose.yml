@@ -40,6 +40,11 @@ services:
       BROKER_SHARED_SECRET: "${BROKER_SHARED_SECRET:?BROKER_SHARED_SECRET must be set}"
       OPER_DIDS: "${WUMBLR_OPER_DIDS:-}"
       RUST_LOG: "freeq_server=info,info"
+      # Ephemeral encrypted image store (contrail spaces worker). OPTIONAL: when
+      # both are set (in .env), freeq enables the /api/v1/eimg endpoints;
+      # otherwise they return 503 and the rest of freeq is unaffected.
+      FREEQ_EIMG_BASE_URL: "${FREEQ_EIMG_BASE_URL:-}"
+      FREEQ_EIMG_SHARED_SECRET: "${FREEQ_EIMG_SHARED_SECRET:-}"
     command:
       - "--listen-addr=0.0.0.0:6667"
       - "--web-addr=0.0.0.0:8080"

@@ -17,6 +17,7 @@ COPY freeq-windows-core/ freeq-windows-core/
 COPY freeq-bot-id/      freeq-bot-id/
 COPY freeq-av-client/   freeq-av-client/
 COPY freeq-av/          freeq-av/
+COPY freeq-av-image/    freeq-av-image/
 COPY freeq-agent-kit/   freeq-agent-kit/
 COPY freeq-eliza/       freeq-eliza/
 COPY wumblr-issuer/     wumblr-issuer/
