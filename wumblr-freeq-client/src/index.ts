@@ -73,6 +73,10 @@ export class WumblrFreeq {
 	private readonly options: WumblrFreeqOptions;
 	private readonly serverOrigin: string;
 	private readonly client: FreeqClient;
+	/** Per-channel (lowercased IRC name) member DID set, fed by the SDK's
+	 *  member events. Used to derive the eimg group key. The local user's own
+	 *  DID is always included. */
+	private readonly memberDids = new Map<string, Set<string>>();
 
 	constructor(options: WumblrFreeqOptions) {
 		this.options = options;
@@ -91,6 +95,52 @@ export class WumblrFreeq {
 				pdsUrl: "",
 			},
 		});
+		this.setupMemberTracking();
+	}
+
+	/** Maintain a per-channel member DID set from the SDK's member events.
+	 *  The SDK tracks nick↔DID globally and emits per-channel join/leave/list
+	 *  events; we accumulate the DIDs per channel here so the eimg path can
+	 *  derive the channel's group key. */
+	private setupMemberTracking(): void {
+		const ch = (channel: string) => channel.toLowerCase();
+		const setFor = (channel: string): Set<string> => {
+			const key = ch(channel);
+			let s = this.memberDids.get(key);
+			if (!s) {
+				s = new Set<string>();
+				this.memberDids.set(key, s);
+			}
+			// Always include our own DID — sender and recipients must derive the
+			// key from the identical member set.
+			s.add(this.options.did);
+			return s;
+		};
+		this.client.on("memberJoined", (channel, member) => {
+			if (member.did) setFor(channel).add(member.did);
+		});
+		this.client.on("membersList", (channel, members) => {
+			const s = setFor(channel);
+			for (const m of members) if (m.did) s.add(m.did);
+		});
+		this.client.on("memberLeft", (channel, nick) => {
+			const did = this.client.getDidForNick(nick);
+			if (did) this.memberDids.get(ch(channel))?.delete(did);
+		});
+		this.client.on("membersCleared", (channel) => {
+			// Reset to just our own DID; the fresh roster will repopulate it.
+			this.memberDids.set(ch(channel), new Set<string>([this.options.did]));
+		});
+	}
+
+	/** The current member DIDs of a channel (sorted), for eimg key derivation.
+	 *  Always includes the local user's DID. `channel` is the IRC channel name
+	 *  (e.g. `#general`). */
+	membersOf(channel: string): string[] {
+		const s = this.memberDids.get(channel.toLowerCase());
+		const out = s ? [...s] : [this.options.did];
+		out.sort();
+		return out;
 	}
 
 	/**
@@ -164,23 +214,24 @@ export class WumblrFreeq {
 	 * the ephemeral image store (`/api/v1/eimg`). The server only ever sees
 	 * ciphertext; images are hard-deleted 24h after upload.
 	 *
-	 * `members` is the channel's member **DIDs** — the caller (which already
-	 * tracks per-channel membership) supplies them; the key is derived from this
-	 * set, so sender and recipient must agree on it. `epoch` is fixed at 0 for
-	 * now (no rotation until the MLS phase).
+	 * Member DIDs are resolved from the tracked roster ([`membersOf`](#membersOf))
+	 * unless `members` is passed explicitly. The key is derived from this set, so
+	 * sender and recipients must agree on it (Phase A: a member who joins AFTER
+	 * upload can't decrypt — the set is snapshot at upload). `epoch` is fixed at 0
+	 * (no rotation until the MLS phase).
 	 */
 	uploadEncryptedImage(
 		channel: string,
-		members: string[],
 		contentType: string,
 		imageBytes: Uint8Array,
+		members?: string[],
 		epoch = 0,
 	): Promise<EimgUploadResult> {
 		return uploadEncryptedImage(
 			this.serverOrigin,
 			this.options.did,
 			channel,
-			members,
+			members ?? this.membersOf(channel),
 			contentType,
 			imageBytes,
 			epoch,
@@ -189,12 +240,13 @@ export class WumblrFreeq {
 
 	/**
 	 * Fetch and decrypt an ephemeral image. Resolves to `{ gone: true }` if the
-	 * image has expired (24h) or been deleted.
+	 * image has expired (24h) or been deleted. Member DIDs default to the tracked
+	 * roster unless passed explicitly.
 	 */
 	fetchEncryptedImage(
 		imageId: string,
 		channel: string,
-		members: string[],
+		members?: string[],
 		epoch = 0,
 	): Promise<EimgFetchResult> {
 		return fetchEncryptedImage(
@@ -202,7 +254,7 @@ export class WumblrFreeq {
 			imageId,
 			this.options.did,
 			channel,
-			members,
+			members ?? this.membersOf(channel),
 			epoch,
 		);
 	}
