@@ -480,6 +480,14 @@ pub(super) async fn handle_authenticate(
             );
             send(state, session_id, format!("{fail}\r\n"));
         }
+    } else if param == "+" {
+        // A stray continuation/terminator line with no SASL in progress. This
+        // happens legitimately: an IRCv3 client that chunks its response always
+        // sends a trailing `AUTHENTICATE +`, but if the final data chunk was
+        // < 400 chars we already completed and verified the response (clearing
+        // sasl_in_progress) before this `+` arrives. Silently ignore it —
+        // replying with an error here would tear down a just-authenticated
+        // session ("Unsupported SASL mechanism" right after 903 success).
     } else {
         let fail = Message::from_server(
             server_name,
