@@ -185,6 +185,11 @@ pub struct Connection {
     pub(crate) sasl_in_progress: bool,
     pub(crate) sasl_failures: u8,
     pub(crate) dpop_retries: u8,
+    /// Accumulates multi-line `AUTHENTICATE <chunk>` payloads (IRCv3 SASL
+    /// splits responses longer than 400 chars across multiple lines). The
+    /// concatenation is decoded when the client sends the final partial chunk
+    /// (or the `+` terminator).
+    pub(crate) sasl_response_buf: String,
 }
 
 impl Connection {
@@ -218,6 +223,7 @@ impl Connection {
             sasl_in_progress: false,
             sasl_failures: 0,
             dpop_retries: 0,
+            sasl_response_buf: String::new(),
         }
     }
 

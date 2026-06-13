@@ -187,11 +187,34 @@ pub(super) async fn handle_authenticate(
     if param.eq_ignore_ascii_case("ATPROTO-CHALLENGE") {
         conn.sasl_in_progress = true;
         conn.dpop_retries = 0; // Reset DPoP retry counter on new SASL attempt
+        conn.sasl_response_buf.clear();
         let encoded = state.challenge_store.create(session_id);
         let reply = Message::new("AUTHENTICATE", vec![&encoded]);
         send(state, session_id, format!("{reply}\r\n"));
     } else if conn.sasl_in_progress {
-        if let Some(response) = sasl::decode_response(param) {
+        // IRCv3 SASL chunking: responses longer than 400 chars arrive split
+        // across multiple `AUTHENTICATE <chunk>` lines. Accumulate until the
+        // response is complete, then decode the whole base64 payload.
+        // (pds-session responses carry a PDS access JWT and routinely exceed
+        // 400 chars — without reassembly they fail to decode as "bad response".)
+        match sasl::accumulate_sasl_chunk(&mut conn.sasl_response_buf, param) {
+            sasl::SaslChunk::More => return,
+            sasl::SaslChunk::TooLong => {
+                conn.sasl_in_progress = false;
+                conn.sasl_failures += 1;
+                let fail = Message::from_server(
+                    server_name,
+                    irc::ERR_SASLFAIL,
+                    vec![conn.nick_or_star(), "SASL authentication failed (response too long)"],
+                );
+                send(state, session_id, format!("{fail}\r\n"));
+                return;
+            }
+            sasl::SaslChunk::Complete => {}
+        }
+
+        let full_response = std::mem::take(&mut conn.sasl_response_buf);
+        if let Some(response) = sasl::decode_response(&full_response) {
             // Check for web-token method first (server-side OAuth pre-verified)
             let web_token_result = if response.method.as_deref() == Some("web-token") {
                 let mut tokens = state.web_auth_tokens.lock();
@@ -457,6 +480,14 @@ pub(super) async fn handle_authenticate(
             );
             send(state, session_id, format!("{fail}\r\n"));
         }
+    } else if param == "+" {
+        // A stray continuation/terminator line with no SASL in progress. This
+        // happens legitimately: an IRCv3 client that chunks its response always
+        // sends a trailing `AUTHENTICATE +`, but if the final data chunk was
+        // < 400 chars we already completed and verified the response (clearing
+        // sasl_in_progress) before this `+` arrives. Silently ignore it —
+        // replying with an error here would tear down a just-authenticated
+        // session ("Unsupported SASL mechanism" right after 903 success).
     } else {
         let fail = Message::from_server(
             server_name,

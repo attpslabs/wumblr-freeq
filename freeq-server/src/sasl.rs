@@ -113,6 +113,50 @@ pub fn decode_response(encoded: &str) -> Option<ChallengeResponse> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Max chars per `AUTHENTICATE` line in the IRCv3 SASL chunking scheme.
+/// A line of exactly this length means "more chunks follow"; a shorter line
+/// (or the `+` terminator) ends the response.
+pub const SASL_CHUNK_LEN: usize = 400;
+
+/// Upper bound on a reassembled SASL response; guards against an unbounded
+/// buffer from a misbehaving client.
+pub const SASL_MAX_RESPONSE: usize = 8192;
+
+/// Outcome of feeding one `AUTHENTICATE <param>` line into the chunk buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SaslChunk {
+    /// The full 400-char frame was consumed; wait for the next line.
+    More,
+    /// The response is complete; decode `buf`.
+    Complete,
+    /// The accumulated response exceeded `SASL_MAX_RESPONSE`; abort.
+    TooLong,
+}
+
+/// Accumulate one `AUTHENTICATE` continuation line into `buf` and report
+/// whether the SASL response is now complete.
+///
+/// IRCv3 SASL splits a response longer than 400 chars across multiple
+/// `AUTHENTICATE <chunk>` lines. `param == "+"` is the explicit terminator
+/// (used when the final chunk is exactly 400 chars, so the absence of a short
+/// line can't signal the end). pds-session responses carry a PDS access JWT
+/// and routinely exceed 400 chars, so without reassembly they fail to decode.
+pub fn accumulate_sasl_chunk(buf: &mut String, param: &str) -> SaslChunk {
+    let is_terminator = param == "+";
+    if !is_terminator {
+        buf.push_str(param);
+    }
+    if buf.len() > SASL_MAX_RESPONSE {
+        buf.clear();
+        return SaslChunk::TooLong;
+    }
+    if is_terminator || param.len() < SASL_CHUNK_LEN {
+        SaslChunk::Complete
+    } else {
+        SaslChunk::More
+    }
+}
+
 /// Verify a challenge response. Dispatches to crypto or PDS verification.
 pub async fn verify_response(
     challenge: &Challenge,
@@ -492,6 +536,104 @@ mod tests {
         let decoded = decode_response(&encoded).unwrap();
         assert_eq!(decoded.method.as_deref(), Some("pds-session"));
         assert_eq!(decoded.pds_url.as_deref(), Some("https://pds.example.com"));
+    }
+
+    /// Feed a full base64 response through the chunker the way an IRC client
+    /// sends it, returning the reassembled buffer once complete.
+    fn drive_chunks(chunks: &[&str]) -> (String, SaslChunk) {
+        let mut buf = String::new();
+        let mut last = SaslChunk::More;
+        for c in chunks {
+            last = accumulate_sasl_chunk(&mut buf, c);
+            if last != SaslChunk::More {
+                break;
+            }
+        }
+        (buf, last)
+    }
+
+    #[test]
+    fn sasl_single_short_chunk_completes() {
+        // did:key guests: small response in one < 400-char line, no terminator.
+        let (buf, state) = drive_chunks(&["short-response"]);
+        assert_eq!(state, SaslChunk::Complete);
+        assert_eq!(buf, "short-response");
+    }
+
+    #[test]
+    fn sasl_multi_chunk_reassembles_full_payload() {
+        // pds-session: a long base64 payload (carrying a PDS access JWT) split
+        // into a 400-char frame + a shorter remainder + the `+` terminator.
+        // This is the case that regressed as "bad response" before reassembly.
+        let chunk1 = "a".repeat(SASL_CHUNK_LEN); // exactly 400 → "more follows"
+        let chunk2 = "b".repeat(246); // < 400 → completes
+        let (buf, state) = drive_chunks(&[&chunk1, &chunk2, "+"]);
+        assert_eq!(state, SaslChunk::Complete);
+        assert_eq!(buf.len(), SASL_CHUNK_LEN + 246);
+        assert!(buf.starts_with(&chunk1));
+        assert!(buf.ends_with(&chunk2));
+    }
+
+    #[test]
+    fn sasl_exact_frame_then_terminator() {
+        // A response that is exactly 400 chars needs the `+` terminator, since
+        // the 400-char line itself signals "more follows".
+        let chunk1 = "x".repeat(SASL_CHUNK_LEN);
+        let (buf, state) = drive_chunks(&[&chunk1, "+"]);
+        assert_eq!(state, SaslChunk::Complete);
+        assert_eq!(buf.len(), SASL_CHUNK_LEN);
+    }
+
+    #[test]
+    fn sasl_oversized_response_rejected() {
+        let huge = "z".repeat(SASL_CHUNK_LEN);
+        let mut buf = String::new();
+        let mut state = SaslChunk::More;
+        // 21 full 400-char frames = 8400 bytes > SASL_MAX_RESPONSE (8192).
+        for _ in 0..21 {
+            state = accumulate_sasl_chunk(&mut buf, &huge);
+            if state != SaslChunk::More {
+                break;
+            }
+        }
+        assert_eq!(state, SaslChunk::TooLong);
+        assert!(buf.is_empty(), "buffer cleared on overflow");
+    }
+
+    /// End-to-end: a realistic pds-session response, chunked and reassembled,
+    /// decodes back to the original fields.
+    #[test]
+    fn sasl_chunked_pds_session_roundtrip() {
+        let resp = ChallengeResponse {
+            did: "did:plc:x7kval5xvraaaz4c6z535zne".to_string(),
+            signature: format!("eyJ0eXAiOiJhdCtqd3Qi.{}.{}", "a".repeat(180), "b".repeat(86)),
+            method: Some("pds-session".to_string()),
+            pds_url: Some("https://self.surf".to_string()),
+            dpop_proof: None,
+            challenge_nonce: Some("x".repeat(43)),
+        };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(&json);
+        assert!(encoded.len() > SASL_CHUNK_LEN, "fixture must exceed one frame");
+
+        // Split exactly as a client would.
+        let chunks: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(SASL_CHUNK_LEN)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let mut buf = String::new();
+        let mut state = SaslChunk::More;
+        for c in &chunks {
+            state = accumulate_sasl_chunk(&mut buf, c);
+        }
+        // Final chunk is < 400, so it already completed.
+        assert_eq!(state, SaslChunk::Complete);
+
+        let decoded = decode_response(&buf).unwrap();
+        assert_eq!(decoded.did, "did:plc:x7kval5xvraaaz4c6z535zne");
+        assert_eq!(decoded.method.as_deref(), Some("pds-session"));
+        assert_eq!(decoded.pds_url.as_deref(), Some("https://self.surf"));
     }
 
     #[tokio::test]
