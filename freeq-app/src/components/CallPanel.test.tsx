@@ -39,6 +39,10 @@ vi.mock('../lib/profiles', () => ({
   fetchProfile: vi.fn(),
 }));
 
+// Toasts: the camera watchdog reports through showToast; capture the calls.
+vi.mock('./Toast', () => ({ showToast: vi.fn() }));
+import { showToast } from './Toast';
+
 // ── DOM fakes for moq-publish / moq-watch ───────────────────────
 // These are bare custom elements that just record attributes/properties.
 // We can't import the real ones (they need a network) so we stub them.
@@ -146,7 +150,7 @@ afterEach(() => {
 });
 
 // We import CallPanel *after* the mocks above are registered.
-import { CallPanel } from './CallPanel';
+import { CallPanel, CAMERA_WATCHDOG_MS } from './CallPanel';
 
 // flush microtasks + small timers so async effects run
 async function flush(times = 3) {
@@ -167,7 +171,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
   });
 
   it('renders exactly one remote tile for a different (nick, instance)', async () => {
@@ -177,7 +181,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    const watches = container.querySelectorAll('moq-watch');
+    const watches = container.querySelectorAll('moq-watch:not([name$="/screen"])');
     expect(watches).toHaveLength(1);
     expect(watches[0].getAttribute('name')).toBe('sess-1/alice~aaaaaaaa');
   });
@@ -192,7 +196,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
   });
 
   it('renders one tile for the multi-device same-DID case (my nick, different instance)', async () => {
@@ -206,7 +210,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    const watches = container.querySelectorAll('moq-watch');
+    const watches = container.querySelectorAll('moq-watch:not([name$="/screen"])');
     expect(watches).toHaveLength(1);
     expect(watches[0].getAttribute('name')).toBe('sess-1/me~deadbeef');
   });
@@ -219,7 +223,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    const watches = container.querySelectorAll('moq-watch');
+    const watches = container.querySelectorAll('moq-watch:not([name$="/screen"])');
     expect(watches).toHaveLength(1);
     // No "~" suffix because the participant has no instance.
     expect(watches[0].getAttribute('name')).toBe('sess-1/bob');
@@ -242,7 +246,7 @@ describe('CallPanel — participant tiles', () => {
     // Microtask-drain so the initial pollParticipants completes.
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
 
     participants = [{ nick: 'alice', instance_id: 'aaaaaaaa' }];
     await act(async () => {
@@ -255,7 +259,7 @@ describe('CallPanel — participant tiles', () => {
     await flush();
 
     expect(fetchSpy).toHaveBeenCalled();
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(1);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(1);
   });
 
   it('renders three tiles for three distinct DIDs', async () => {
@@ -271,7 +275,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    const watches = Array.from(container.querySelectorAll('moq-watch'));
+    const watches = Array.from(container.querySelectorAll('moq-watch:not([name$="/screen"])'));
     expect(watches).toHaveLength(3);
     const names = watches.map((w) => w.getAttribute('name')).sort();
     expect(names).toEqual([
@@ -298,7 +302,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await flush();
 
-    const watches = Array.from(container.querySelectorAll('moq-watch'));
+    const watches = Array.from(container.querySelectorAll('moq-watch:not([name$="/screen"])'));
     expect(watches).toHaveLength(1);
     expect(watches[0].getAttribute('name')).toBe('sess-1/me~livesecond');
   });
@@ -326,7 +330,7 @@ describe('CallPanel — participant tiles', () => {
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
 
-    let watches = Array.from(container.querySelectorAll('moq-watch'));
+    let watches = Array.from(container.querySelectorAll('moq-watch:not([name$="/screen"])'));
     expect(watches).toHaveLength(1);
     expect(watches[0].getAttribute('name')).toBe('sess-1/alice~first');
     const firstWatch = watches[0];
@@ -345,7 +349,7 @@ describe('CallPanel — participant tiles', () => {
     vi.useRealTimers();
     await flush();
 
-    watches = Array.from(container.querySelectorAll('moq-watch'));
+    watches = Array.from(container.querySelectorAll('moq-watch:not([name$="/screen"])'));
     expect(watches).toHaveLength(1);
     expect(watches[0].getAttribute('name')).toBe('sess-1/alice~second');
     // The previous element was unmounted; its url should have been cleared
@@ -373,7 +377,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(1);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(1);
 
     // Server's disconnect handler removed alice from participants.
     participants = [];
@@ -386,7 +390,7 @@ describe('CallPanel — participant tiles', () => {
     vi.useRealTimers();
     await flush();
 
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
   });
 
   it('removes a tile within one poll cycle when a participant disappears', async () => {
@@ -407,7 +411,7 @@ describe('CallPanel — participant tiles', () => {
     const { container } = render(<CallPanel />);
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(1);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(1);
 
     participants = [];
     await act(async () => {
@@ -419,7 +423,7 @@ describe('CallPanel — participant tiles', () => {
     vi.useRealTimers();
     await flush();
 
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
   });
 });
 
@@ -554,6 +558,178 @@ describe('CallPanel — camera', () => {
     expect(sawVideoFromCallPanel).toBe(false);
   });
 
+  it('wires the local preview from a video signal that was set BEFORE camera-on (subscribe does not replay)', async () => {
+    // Regression: the local tile rendered black while the camera LED was
+    // on. Real moq Signals only fire subscribers on *future* changes —
+    // the current value is never replayed — and the element's `video`
+    // signal is assigned exactly once, when `source="camera"` is set at
+    // call start. So a bare subscribe made later, when the user toggles
+    // the camera on, never fired and the preview <video> never got a
+    // srcObject. CallPanel must replay the current value (peek) in
+    // addition to subscribing.
+    setupSession();
+    mockSessionsApi([]);
+
+    // Signal with real moq semantics: peek() + change-only subscribe.
+    function makeSignal<T>(initial: T) {
+      let value = initial;
+      const subs = new Set<(v: T) => void>();
+      return {
+        peek: () => value,
+        subscribe(fn: (v: T) => void) { subs.add(fn); return () => subs.delete(fn); },
+        set(v: T) { value = v; subs.forEach((fn) => fn(v)); },
+      };
+    }
+
+    class FakeMediaStream { tracks: unknown[]; constructor(tracks: unknown[]) { this.tracks = tracks; } }
+    vi.stubGlobal('MediaStream', FakeMediaStream);
+
+    const trackSig = makeSignal<MediaStreamTrack | undefined>(undefined);
+    const cameraSource = { source: trackSig };
+    const videoSig = makeSignal<typeof cameraSource | undefined>(undefined);
+
+    const { container } = render(<CallPanel />);
+    await flush();
+
+    const pub = container.querySelector('moq-publish') as HTMLElement & { video?: unknown };
+    // Like the real element: the video signal already holds the camera
+    // source object before the user ever touches the camera button.
+    videoSig.set(cameraSource);
+    pub.video = videoSig;
+
+    await act(async () => { useStore.getState().setAvCameraOn(true); });
+    await flush();
+
+    // moq-publish's internal getUserMedia resolves after camera-on and
+    // lands the captured track on the inner source signal.
+    const fakeTrack = { kind: 'video' } as MediaStreamTrack;
+    await act(async () => { trackSig.set(fakeTrack); });
+    await flush();
+
+    const video = container.querySelector('video') as HTMLVideoElement;
+    expect(video).not.toBeNull();
+    expect(video.srcObject).toBeTruthy();
+    expect((video.srcObject as unknown as FakeMediaStream).tracks).toEqual([fakeTrack]);
+  });
+
+  it('warns when camera-on lands no track within the watchdog window', async () => {
+    // moq-publish swallows getUserMedia failures (`.catch(() => {})`) —
+    // camera busy / permission blocked yields an audio-only publish with
+    // the camera button lit and no feedback ("the bot can't see me").
+    setupSession();
+    mockSessionsApi([]);
+    vi.mocked(showToast).mockClear();
+    vi.useFakeTimers();
+    try {
+      function makeSignal<T>(initial: T) {
+        let value = initial;
+        const subs = new Set<(v: T) => void>();
+        return {
+          peek: () => value,
+          subscribe(fn: (v: T) => void) { subs.add(fn); return () => subs.delete(fn); },
+          set(v: T) { value = v; subs.forEach((fn) => fn(v)); },
+        };
+      }
+      const trackSig = makeSignal<MediaStreamTrack | undefined>(undefined);
+      const videoSig = makeSignal<{ source: typeof trackSig } | undefined>({ source: trackSig });
+
+      const { container } = render(<CallPanel />);
+      await flush();
+      const pub = container.querySelector('moq-publish') as HTMLElement & { video?: unknown };
+      pub.video = videoSig;
+
+      await act(async () => { useStore.getState().setAvCameraOn(true); });
+      await flush();
+      expect(showToast).not.toHaveBeenCalled();
+
+      // The track never arrives — watchdog fires.
+      await act(async () => { vi.advanceTimersByTime(CAMERA_WATCHDOG_MS); });
+      expect(showToast).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(showToast).mock.calls[0][1]).toBe('warning');
+
+      // A late grant (user finally clicks Allow) closes the loop.
+      class FakeMediaStream { tracks: unknown[]; constructor(t: unknown[]) { this.tracks = t; } }
+      vi.stubGlobal('MediaStream', FakeMediaStream);
+      await act(async () => { trackSig.set({ kind: 'video' } as MediaStreamTrack); });
+      expect(showToast).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(showToast).mock.calls[1][1]).toBe('success');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not warn when the camera track arrives in time', async () => {
+    setupSession();
+    mockSessionsApi([]);
+    vi.mocked(showToast).mockClear();
+    vi.useFakeTimers();
+    try {
+      function makeSignal<T>(initial: T) {
+        let value = initial;
+        const subs = new Set<(v: T) => void>();
+        return {
+          peek: () => value,
+          subscribe(fn: (v: T) => void) { subs.add(fn); return () => subs.delete(fn); },
+          set(v: T) { value = v; subs.forEach((fn) => fn(v)); },
+        };
+      }
+      class FakeMediaStream { tracks: unknown[]; constructor(t: unknown[]) { this.tracks = t; } }
+      vi.stubGlobal('MediaStream', FakeMediaStream);
+      const trackSig = makeSignal<MediaStreamTrack | undefined>(undefined);
+      const videoSig = makeSignal<{ source: typeof trackSig } | undefined>({ source: trackSig });
+
+      const { container } = render(<CallPanel />);
+      await flush();
+      const pub = container.querySelector('moq-publish') as HTMLElement & { video?: unknown };
+      pub.video = videoSig;
+
+      await act(async () => { useStore.getState().setAvCameraOn(true); });
+      await flush();
+      await act(async () => { trackSig.set({ kind: 'video' } as MediaStreamTrack); });
+
+      await act(async () => { vi.advanceTimersByTime(CAMERA_WATCHDOG_MS * 2); });
+      expect(showToast).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the watchdog when the camera is toggled back off in time', async () => {
+    // Toggling off re-runs the effect; the cleanup must clear the timer —
+    // otherwise the user gets scolded for a camera they already turned off.
+    setupSession();
+    mockSessionsApi([]);
+    vi.mocked(showToast).mockClear();
+    vi.useFakeTimers();
+    try {
+      function makeSignal<T>(initial: T) {
+        let value = initial;
+        const subs = new Set<(v: T) => void>();
+        return {
+          peek: () => value,
+          subscribe(fn: (v: T) => void) { subs.add(fn); return () => subs.delete(fn); },
+          set(v: T) { value = v; subs.forEach((fn) => fn(v)); },
+        };
+      }
+      const trackSig = makeSignal<MediaStreamTrack | undefined>(undefined);
+      const videoSig = makeSignal<{ source: typeof trackSig } | undefined>({ source: trackSig });
+
+      const { container } = render(<CallPanel />);
+      await flush();
+      const pub = container.querySelector('moq-publish') as HTMLElement & { video?: unknown };
+      pub.video = videoSig;
+
+      await act(async () => { useStore.getState().setAvCameraOn(true); });
+      await flush();
+      await act(async () => { useStore.getState().setAvCameraOn(false); });
+      await flush();
+      await act(async () => { vi.advanceTimersByTime(CAMERA_WATCHDOG_MS * 2); });
+      expect(showToast).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('toggling camera while NOT in a call does not crash or send anything', async () => {
     // No session active.
     useStore.setState({ avAudioActive: false, activeAvSession: null });
@@ -636,7 +812,7 @@ describe('CallPanel — cleanup', () => {
     });
 
     expect(container.querySelector('moq-publish')).toBeNull();
-    expect(container.querySelectorAll('moq-watch')).toHaveLength(0);
+    expect(container.querySelectorAll('moq-watch:not([name$="/screen"])')).toHaveLength(0);
   });
 
   it('on unmount every <moq-watch> is removed and its url cleared', async () => {
@@ -648,7 +824,7 @@ describe('CallPanel — cleanup', () => {
 
     const { container, unmount } = render(<CallPanel />);
     await flush();
-    const watches = Array.from(container.querySelectorAll('moq-watch'));
+    const watches = Array.from(container.querySelectorAll('moq-watch:not([name$="/screen"])'));
     expect(watches).toHaveLength(2);
     for (const w of watches) expect(w.getAttribute('url')).not.toBe('');
 

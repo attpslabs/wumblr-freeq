@@ -864,6 +864,10 @@ impl ClientHandle {
 pub const TRANSPORT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn establish_connection(config: &ConnectConfig) -> Result<EstablishedConnection> {
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid ConnectConfig: {e}"))?;
+
     // If a WebSocket URL is configured, prefer that transport. iOS sets this
     // so it can reach the server on networks that block port 6667.
     #[cfg(feature = "websocket")]
@@ -1568,6 +1572,11 @@ where
     let mut last_activity = tokio::time::Instant::now();
     let ping_interval = tokio::time::Duration::from_secs(60);
     let ping_timeout = tokio::time::Duration::from_secs(120);
+    // Paced separately from `last_activity`: re-arming the timer off
+    // `last_activity` alone busy-loops once the first keepalive fires
+    // (the deadline stays in the past until inbound data arrives),
+    // spamming PINGs for a full RTT — or for 60s into a dead socket.
+    let mut next_ping = last_activity + ping_interval;
 
     loop {
         tokio::select! {
@@ -1579,6 +1588,7 @@ where
                 }
 
                 last_activity = tokio::time::Instant::now();
+                next_ping = last_activity + ping_interval;
                 let raw = line_buf.trim_end().to_string();
                 let _ = event_tx.send(Event::RawLine(raw.clone())).await;
 
@@ -2078,12 +2088,13 @@ where
                 }
             }
             // Periodic client-to-server PING and timeout detection
-            _ = tokio::time::sleep_until(last_activity + ping_interval) => {
+            _ = tokio::time::sleep_until(next_ping) => {
                 if last_activity.elapsed() > ping_timeout {
                     let _ = event_tx.send(Event::Disconnected { reason: "Ping timeout".to_string() }).await;
                     break;
                 }
                 writer.write_all(b"PING :keepalive\r\n").await?;
+                next_ping = tokio::time::Instant::now() + ping_interval;
             }
         }
     }
@@ -3080,6 +3091,59 @@ mod multiline_tests {
             got.as_deref(),
             Some(expected),
             "codeblock body should be assembled byte-exact. events: {events:#?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(ConnectConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized_nick() {
+        let mut c = ConnectConfig::default();
+        c.nick = String::new();
+        assert!(c.validate().is_err());
+        c.nick = "x".repeat(65);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_nick_with_protocol_characters() {
+        for bad in ["a b", "a,b", "a*b", "a?b", "a!b", "a@b", "a#b", "a\rb"] {
+            let mut c = ConnectConfig::default();
+            c.nick = bad.to_string();
+            assert!(c.validate().is_err(), "nick {bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_server_addr_and_user() {
+        let mut c = ConnectConfig::default();
+        c.server_addr = String::new();
+        assert!(c.validate().is_err());
+
+        let mut c = ConnectConfig::default();
+        c.user = String::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn establish_connection_enforces_validation() {
+        let mut c = ConnectConfig::default();
+        c.nick = "bad nick".to_string();
+        let err = match establish_connection(&c).await {
+            Ok(_) => panic!("invalid config must not connect"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("invalid ConnectConfig"),
+            "got: {err}"
         );
     }
 }

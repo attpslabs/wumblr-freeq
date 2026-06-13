@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import { getAvInstanceId, getNick, leaveAvSession } from '../irc/client';
 import { loadMoqComponents } from '../lib/moq-loader';
 import { getCachedProfile } from '../lib/profiles';
+import { showToast } from './Toast';
 
 /**
  * Inline call panel with audio + video support.
@@ -35,12 +36,44 @@ type MoqPublishEl = HTMLElement & {
   audio?: MoqSignal<MoqDeviceSource | undefined>;
   video?: MoqSignal<MoqDeviceSource | undefined>;
 };
+// moq-watch exposes a `broadcast` object whose `status` Signal transitions
+// offline → loading → live as a broadcast announces and its catalog
+// arrives. We use it to reveal a screen-share tile only once the
+// presenter's `…/screen` broadcast is actually live. (The signal lives on
+// `el.broadcast`, NOT on the element itself.)
+type MoqWatchEl = HTMLElement & {
+  broadcast?: { status?: MoqSignal<string> };
+};
+
+/** True when this browser can capture a screen (getDisplayMedia present). */
+function canShareScreen(): boolean {
+  return typeof navigator !== 'undefined'
+    && !!navigator.mediaDevices
+    && typeof navigator.mediaDevices.getDisplayMedia === 'function';
+}
+
+// moq's Signal.subscribe only fires on *future* changes — it never
+// replays the current value. `pub.video` is assigned exactly once, when
+// `source="camera"` is set at call start, so a bare subscribe made when
+// the camera is toggled on later never fires and the local preview
+// stays black. Always subscribe AND replay the current value.
+function watchSignal<T>(sig: MoqSignal<T>, fn: (value: T) => void): () => void {
+  const unsub = sig.subscribe(fn);
+  fn(sig.peek());
+  return unsub;
+}
+
+// How long after camera-on we wait for moq-publish to land a captured
+// track before warning the user. Generous enough for device spin-up, but
+// a permission prompt left unanswered will (correctly) trip it.
+export const CAMERA_WATCHDOG_MS = 5000;
 
 export function CallPanel() {
   const activeAvSession = useStore((s) => s.activeAvSession);
   const avAudioActive = useStore((s) => s.avAudioActive);
   const avMuted = useStore((s) => s.avMuted);
   const avCameraOn = useStore((s) => s.avCameraOn);
+  const avScreenShareOn = useStore((s) => s.avScreenShareOn);
   const avSessions = useStore((s) => s.avSessions);
 
   const session = activeAvSession ? avSessions.get(activeAvSession) : null;
@@ -49,10 +82,34 @@ export function CallPanel() {
 
   const publishContainerRef = useRef<HTMLDivElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localScreenRef = useRef<HTMLVideoElement>(null);
   const publishElRef = useRef<HTMLElement | null>(null);
+  // Second publisher dedicated to the screen-share broadcast
+  // (`{name}/screen`), so the camera+mic publish element above is never
+  // disturbed when sharing starts/stops.
+  const screenPubElRef = useRef<HTMLElement | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The moq-publish element, mirrored into state so the camera/mute sync
+  // effects re-run once it exists. They previously read publishElRef
+  // inside the effect: if the camera was toggled while start() was still
+  // awaiting module load or mic permission, the effect ran against a
+  // null ref and never re-ran — camera captured, no local preview.
+  const [pubEl, setPubEl] = useState<MoqPublishEl | null>(null);
 
   const [participantSlots, setParticipantSlots] = useState<Slot[]>([]);
+  // Which participant slots currently have a *live* `…/screen` broadcast.
+  // Driven up from each ScreenTile's moq-watch `status` so we only show the
+  // spotlight chrome when something is actually being shared.
+  const [liveScreens, setLiveScreens] = useState<Set<string>>(new Set());
+  const handleScreenLive = useCallback((key: string, live: boolean) => {
+    setLiveScreens((prev) => {
+      if (live === prev.has(key)) return prev;
+      const next = new Set(prev);
+      if (live) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
   // Full-screen: the call panel takes over the whole web-app viewport so
   // participant video (and eliza's visual-aid cards) is actually big
   // enough to see.
@@ -76,7 +133,13 @@ export function CallPanel() {
   // WS-via-nginx route is the only working transport.
   //
   // Original WebTransport URL: `https://${location.hostname}:8080/av/moq`
-  const moqOrigin = `wss://${location.hostname}/av/moq`;
+  //
+  // `location.host` (not hostname) + protocol-matched scheme so local dev
+  // works too: on http://127.0.0.1:5173 the vite proxy forwards
+  // ws://…:5173/av/moq to the freeq server; the old hardcoded
+  // `wss://${hostname}` dropped the port and refused to connect, which
+  // silently killed ALL local-dev AV.
+  const moqOrigin = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/av/moq`;
 
   // ── Device enumeration ──────────────────────────────────────
   // Device labels are blank until the matching permission is granted, so
@@ -143,6 +206,7 @@ export function CallPanel() {
       const pub = document.createElement('moq-publish');
       container.appendChild(pub);
       publishElRef.current = pub;
+      setPubEl(pub as MoqPublishEl);
 
       // Include the per-call instance suffix the IRC layer generated for
       // our av-join TAGMSG so this device's path is unique even if the
@@ -182,7 +246,7 @@ export function CallPanel() {
 
   // ── Sync mute state ─────────────────────────────────────────
   useEffect(() => {
-    const pub = publishElRef.current;
+    const pub = pubEl;
     if (!pub) return;
     // Belt + suspenders: set both the DOM attribute and the JS property
     // — moq-publish's mute implementation has shifted between attribute-
@@ -195,11 +259,11 @@ export function CallPanel() {
       pub.removeAttribute('muted');
     }
     (pub as HTMLElement & { muted?: boolean }).muted = avMuted;
-  }, [avMuted]);
+  }, [avMuted, pubEl]);
 
   // ── Sync camera state ───────────────────────────────────────
   useEffect(() => {
-    const pub = publishElRef.current as MoqPublishEl | null;
+    const pub = pubEl;
     if (!pub) return;
 
     if (!avCameraOn) {
@@ -219,12 +283,42 @@ export function CallPanel() {
     // happy local preview but no video rendition in the catalog.
     const videoSig = pub.video;
     if (!videoSig) return;
+
+    // Camera watchdog: moq-publish swallows getUserMedia failures
+    // (`.catch(() => {})` around its camera grab) — a busy camera, a
+    // blocked permission, or an ignored prompt leaves an audio-only
+    // publish with the camera button lit and ZERO feedback. The bots
+    // then "can't see you" with nothing wrong on their end. If no track
+    // lands within the window, say so; if one lands late, close the loop.
+    let gotTrack = false;
+    let warned = false;
+    const watchdog = window.setTimeout(() => {
+      if (gotTrack) return;
+      warned = true;
+      showToast(
+        'Camera is not publishing — check the permission prompt, or whether another app is using it.',
+        'warning',
+        10000,
+      );
+    }, CAMERA_WATCHDOG_MS);
+
     let unsubInner: (() => void) | null = null;
-    const unsubOuter = videoSig.subscribe((camera) => {
+    // watchSignal (not bare subscribe): pub.video already holds the
+    // camera source by the time the camera is toggled on, and the signal
+    // never fires again — a bare subscribe here left the preview black
+    // while the camera LED was on and the broadcast carried video.
+    const unsubOuter = watchSignal(videoSig, (camera) => {
       unsubInner?.();
       unsubInner = null;
       if (!camera?.source) return;
-      unsubInner = camera.source.subscribe((track) => {
+      unsubInner = watchSignal(camera.source, (track) => {
+        if (track) {
+          gotTrack = true;
+          if (warned) {
+            warned = false;
+            showToast('Camera connected — video is publishing now.', 'success');
+          }
+        }
         if (!localVideoRef.current) return;
         if (track) {
           localVideoRef.current.srcObject = new MediaStream([track]);
@@ -237,10 +331,85 @@ export function CallPanel() {
       });
     });
     return () => {
+      window.clearTimeout(watchdog);
       unsubInner?.();
       unsubOuter();
     };
-  }, [avCameraOn, refreshDevices]);
+  }, [avCameraOn, pubEl, refreshDevices]);
+
+  // ── Screen share: a second, dedicated publisher ─────────────
+  // The screen rides its own broadcast `{name}/screen` so the camera+mic
+  // publish element is never touched (a single MoQ broadcast can't carry
+  // mic audio + screen video — `source='screen'` would replace the mic).
+  // The element is muted: video only, never tab/system audio.
+  useEffect(() => {
+    if (!avScreenShareOn || !sessionId || !myNick) return;
+    if (!canShareScreen()) {
+      useStore.getState().setAvScreenShareOn(false);
+      return;
+    }
+    const container = publishContainerRef.current;
+    if (!container) return;
+
+    const myInstance = getAvInstanceId();
+    const broadcastKey = myInstance ? `${myNick}~${myInstance}` : myNick;
+    const screenName = `${sessionId}/${broadcastKey}/screen`;
+
+    const pub = document.createElement('moq-publish') as MoqPublishEl;
+    container.appendChild(pub);
+    screenPubElRef.current = pub;
+    pub.setAttribute('url', moqOrigin);
+    pub.setAttribute('name', screenName);
+    // Video only — mute before `source` so no audio rendition is ever
+    // published even if the browser hands us a display-audio track.
+    pub.setAttribute('muted', '');
+    (pub as HTMLElement & { muted?: boolean }).muted = true;
+    // `source='screen'` opens getDisplayMedia (the OS surface picker).
+    pub.setAttribute('source', 'screen');
+    console.log('[call] Sharing screen:', screenName);
+
+    // Local preview from the publisher's own track, and — critically —
+    // detect the browser's native "Stop sharing" button via the track's
+    // `ended` event so our toggle state stays truthful.
+    const onEnded = () => useStore.getState().setAvScreenShareOn(false);
+    let endedTrack: MediaStreamTrack | null = null;
+    let unsubInner: (() => void) | null = null;
+    const videoSig = pub.video;
+    const unsubOuter = videoSig?.subscribe((screen) => {
+      unsubInner?.();
+      unsubInner = null;
+      if (!screen?.source) return;
+      unsubInner = screen.source.subscribe((value) => {
+        // For `source="screen"` moq-publish stores a `{video, audio}`
+        // wrapper (getDisplayMedia returns both surfaces); the camera
+        // source stores the raw MediaStreamTrack. Accept either shape.
+        const track =
+          typeof MediaStreamTrack !== 'undefined' && value instanceof MediaStreamTrack
+            ? value
+            : ((value as { video?: MediaStreamTrack } | undefined)?.video ?? null);
+        if (endedTrack) {
+          endedTrack.removeEventListener('ended', onEnded);
+          endedTrack = null;
+        }
+        if (localScreenRef.current) {
+          localScreenRef.current.srcObject = track ? new MediaStream([track]) : null;
+        }
+        if (track) {
+          endedTrack = track;
+          track.addEventListener('ended', onEnded);
+        }
+      });
+    });
+
+    return () => {
+      unsubInner?.();
+      unsubOuter?.();
+      if (endedTrack) endedTrack.removeEventListener('ended', onEnded);
+      if (localScreenRef.current) localScreenRef.current.srcObject = null;
+      tearDownScreen();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [avScreenShareOn, sessionId]);
 
   // ── Poll participants ───────────────────────────────────────
   const pollParticipants = useCallback(async () => {
@@ -331,6 +500,8 @@ export function CallPanel() {
       pub.remove();
       publishElRef.current = null;
     }
+    tearDownScreen();
+    setPubEl(null);
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
@@ -340,8 +511,29 @@ export function CallPanel() {
     setSelectedCamera('');
   }
 
+  // Hard-stop the screen-share publisher. As with the main publish
+  // element, `removeAttribute('source')` (NOT `''`) is what closes the
+  // getDisplayMedia capture — clearing it to '' throws inside the
+  // component before its source state updates, leaking the capture.
+  function tearDownScreen() {
+    const pub = screenPubElRef.current;
+    if (!pub) return;
+    const p = pub as HTMLElement & { paused?: boolean; muted?: boolean };
+    p.muted = true;
+    p.paused = true;
+    pub.setAttribute('muted', '');
+    pub.removeAttribute('source');
+    pub.setAttribute('url', '');
+    pub.remove();
+    screenPubElRef.current = null;
+  }
+
   const handleMuteToggle = () => useStore.getState().setAvMuted(!avMuted);
   const handleCameraToggle = () => useStore.getState().setAvCameraOn(!avCameraOn);
+  const handleScreenShareToggle = () => {
+    if (!canShareScreen()) return;
+    useStore.getState().setAvScreenShareOn(!avScreenShareOn);
+  };
 
   // Switch capture hardware mid-call by setting the moq-publish source's
   // `device.preferred` signal. Empty id = keep moq's default heuristic.
@@ -360,6 +552,7 @@ export function CallPanel() {
     cleanup();
     useStore.getState().setAvAudioActive(false);
     useStore.getState().setAvCameraOn(false);
+    useStore.getState().setAvScreenShareOn(false);
     if (channel && sessionId) leaveAvSession(channel, sessionId);
   };
 
@@ -367,6 +560,7 @@ export function CallPanel() {
 
   const participantCount = (session?.participants.size || 0);
   const showVideoGrid = avCameraOn || participantSlots.length > 0;
+  const anyScreen = avScreenShareOn || liveScreens.size > 0;
   const authDid = useStore.getState().authDid;
   const myAvatar = authDid ? getCachedProfile(authDid)?.avatar : null;
 
@@ -378,6 +572,43 @@ export function CallPanel() {
           : 'border-b border-border bg-bg-secondary'
       }
     >
+      {/* Screen-share spotlight. The ScreenTiles are always mounted (so
+          their moq-watch can detect a `…/screen` broadcast going live), but
+          the row's visible chrome only appears when something is shared. */}
+      <div
+        className={
+          anyScreen
+            ? (fullscreen
+                ? 'flex flex-wrap gap-4 p-4 justify-center items-center'
+                : 'flex flex-wrap gap-3 p-3 justify-center border-b border-border')
+            : ''
+        }
+      >
+        {avScreenShareOn && (
+          <div className={spotlightTileClasses(fullscreen)}>
+            <video
+              ref={localScreenRef}
+              autoPlay
+              muted
+              playsInline
+              className="absolute inset-0 w-full h-full object-contain bg-black"
+            />
+            <span className="absolute bottom-1 left-1 text-[10px] bg-black/60 text-white px-1 rounded z-10">
+              You — screen
+            </span>
+          </div>
+        )}
+        {participantSlots.map((slot) => (
+          <ScreenTile
+            key={slot.broadcastKey + ':screen'}
+            slot={slot}
+            moqOrigin={moqOrigin}
+            fullscreen={fullscreen}
+            onLiveChange={handleScreenLive}
+          />
+        ))}
+      </div>
+
       {/* Video grid — shown when camera is on or participants exist */}
       {showVideoGrid && (
         <div
@@ -492,6 +723,21 @@ export function CallPanel() {
           {avCameraOn ? <CameraOnIcon size={18} /> : <CameraOffIcon size={18} />}
         </button>
 
+        {/* Share screen — only when the browser can capture a display */}
+        {canShareScreen() && (
+          <button
+            onClick={handleScreenShareToggle}
+            className={`p-2 rounded-full transition-colors ${
+              avScreenShareOn
+                ? 'bg-accent text-white hover:bg-accent/80'
+                : 'bg-bg-tertiary text-fg hover:bg-bg-tertiary/80'
+            }`}
+            title={avScreenShareOn ? 'Stop sharing screen' : 'Share screen'}
+          >
+            <ScreenShareIcon size={18} />
+          </button>
+        )}
+
         {/* Full screen */}
         <button
           onClick={() => setFullscreen((f) => !f)}
@@ -542,6 +788,106 @@ function tileClasses(fullscreen: boolean): string {
   return fullscreen
     ? 'relative w-[42vw] max-w-[820px] min-w-[280px] aspect-video rounded-xl overflow-hidden bg-bg-tertiary flex-shrink-0'
     : 'relative w-32 h-24 rounded-lg overflow-hidden bg-bg-tertiary flex-shrink-0';
+}
+
+/// Screen-share tiles are always large 16:9 (even when the panel isn't
+/// fullscreen) so shared content is actually legible.
+function spotlightTileClasses(fullscreen: boolean): string {
+  return fullscreen
+    ? 'relative w-[64vw] max-w-[1100px] min-w-[320px] aspect-video rounded-xl overflow-hidden bg-black flex-shrink-0'
+    : 'relative w-[80vw] max-w-[680px] min-w-[280px] aspect-video rounded-xl overflow-hidden bg-black flex-shrink-0';
+}
+
+/// A participant's screen-share tile. Always mounts a `<moq-watch>` on the
+/// participant's `…/screen` broadcast so it can observe the `status` signal,
+/// but only reveals the (large) tile while that broadcast is `live`.
+function ScreenTile({
+  slot,
+  moqOrigin,
+  fullscreen,
+  onLiveChange,
+}: {
+  slot: Slot;
+  moqOrigin: string;
+  fullscreen: boolean;
+  onLiveChange: (key: string, live: boolean) => void;
+}) {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const [live, setLive] = useState(false);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+    const watchEl = document.createElement('moq-watch') as MoqWatchEl;
+    const canvas = document.createElement('canvas');
+    // `object-contain` (not cover) so a shared window/screen isn't cropped.
+    canvas.className = 'absolute inset-0 w-full h-full object-contain';
+    watchEl.appendChild(canvas);
+    watchEl.style.position = 'absolute';
+    watchEl.style.inset = '0';
+    watchEl.style.width = '100%';
+    watchEl.style.height = '100%';
+    watchEl.setAttribute('jitter', '80');
+    watchEl.setAttribute('reload', '');
+    watchEl.setAttribute('url', moqOrigin);
+    watchEl.setAttribute('name', `${slot.broadcastName}/screen`);
+    mount.appendChild(watchEl);
+
+    // Reveal the tile only once the screen broadcast announces + its catalog
+    // arrives (status → 'live'); hide again when it stops.
+    //
+    // `el.broadcast` only exists once the moq bundle has defined the custom
+    // element. If this tile mounts before the (lazy) bundle loads, the
+    // element starts as an unknown element and upgrades in place later — a
+    // synchronous read here would see `broadcast === undefined` and the tile
+    // would never reveal. So wait for the loader before subscribing.
+    let cancelled = false;
+    let unsub: (() => void) | undefined;
+    loadMoqComponents().then(() => {
+      if (cancelled) return;
+      const statusSig = watchEl.broadcast?.status;
+      const apply = (s: string | undefined) => setLive(s === 'live');
+      apply(statusSig?.peek());
+      unsub = statusSig?.subscribe(apply);
+    });
+
+    return () => {
+      cancelled = true;
+      unsub?.();
+      (watchEl as HTMLElement & { paused?: boolean }).paused = true;
+      watchEl.setAttribute('url', '');
+      watchEl.setAttribute('name', '');
+      watchEl.remove();
+    };
+  }, [slot.broadcastName, moqOrigin]);
+
+  // Report live transitions up; clear on unmount.
+  useEffect(() => {
+    onLiveChange(slot.broadcastKey, live);
+    return () => onLiveChange(slot.broadcastKey, false);
+  }, [live, slot.broadcastKey, onLiveChange]);
+
+  return (
+    // While offline the tile must stay *intersecting* (1px, opacity-0) rather
+    // than display:none — moq-watch gates its whole pipeline on an
+    // IntersectionObserver over its canvas, so a hidden canvas would never
+    // enable the watch and `status` could never reach 'live'.
+    <div
+      data-live={live || undefined}
+      className={
+        live
+          ? spotlightTileClasses(fullscreen)
+          : 'relative w-px h-px opacity-0 overflow-hidden pointer-events-none'
+      }
+    >
+      <div ref={mountRef} className="absolute inset-0" />
+      {live && (
+        <span className="absolute bottom-1 left-1 text-[10px] bg-black/60 text-white px-1 rounded z-10">
+          {slot.nick} — screen
+        </span>
+      )}
+    </div>
+  );
 }
 
 function RemoteTile({
@@ -622,6 +968,17 @@ function MinimizeIcon({ size = 16 }: { size?: number }) {
   );
 }
 
+function ScreenShareIcon({ size = 16 }: { size?: number }) {
+  // Monitor with an up-arrow (share). Stroke style matches the other glyphs.
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1.5" y="2.5" width="13" height="9" rx="1.5" />
+      <path d="M5.5 14h5M8 11.5V14" />
+      <path d="M8 4.5v4M6 6.5 8 4.5l2 2" />
+    </svg>
+  );
+}
+
 function GearIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
@@ -646,7 +1003,7 @@ function AvatarTile({ name, avatarUrl }: { name: string; avatarUrl?: string | nu
   );
 }
 
-function MicIcon({ size = 14 }: { size?: number }) {
+export function MicIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
       <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
@@ -655,7 +1012,7 @@ function MicIcon({ size = 14 }: { size?: number }) {
   );
 }
 
-function MicOffIcon({ size = 14 }: { size?: number }) {
+export function MicOffIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
       <path d="M13 8c0 .564-.094 1.107-.266 1.613l-.814-.814A4.02 4.02 0 0 0 12 8V7a.5.5 0 0 1 1 0v1zm-5 4c.818 0 1.578-.245 2.212-.667l.718.719a4.973 4.973 0 0 1-2.43.923V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 1 0v1a4 4 0 0 0 4 4zm3-9v4.879L5.158 2.037A3.001 3.001 0 0 1 11 3z"/>
@@ -664,7 +1021,7 @@ function MicOffIcon({ size = 14 }: { size?: number }) {
   );
 }
 
-function CameraOnIcon({ size = 14 }: { size?: number }) {
+export function CameraOnIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
       <path fillRule="evenodd" d="M0 5a2 2 0 0 1 2-2h7.5a2 2 0 0 1 1.983 1.738l3.11-1.382A1 1 0 0 1 16 4.269v7.462a1 1 0 0 1-1.406.913l-3.111-1.382A2 2 0 0 1 9.5 13H2a2 2 0 0 1-2-2V5z"/>
@@ -672,7 +1029,7 @@ function CameraOnIcon({ size = 14 }: { size?: number }) {
   );
 }
 
-function CameraOffIcon({ size = 14 }: { size?: number }) {
+export function CameraOffIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
       <path fillRule="evenodd" d="M10.961 12.365a1.99 1.99 0 0 0 .522-1.103l3.11 1.382A1 1 0 0 0 16 11.731V4.269a1 1 0 0 0-1.406-.913l-3.111 1.382A2 2 0 0 0 9.5 3H4.272l6.69 9.365zm-10.114-9A2 2 0 0 0 0 5v6a2 2 0 0 0 2 2h5.728L.847 3.366zm9.746 11.925-14-19 .646-.708 14 19-.646.708z"/>
@@ -680,7 +1037,7 @@ function CameraOffIcon({ size = 14 }: { size?: number }) {
   );
 }
 
-function PhoneOffIcon({ size = 14 }: { size?: number }) {
+export function PhoneOffIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor">
       <path d="M10.68 4.236a.4.4 0 0 0-.358-.221H5.68a.4.4 0 0 0-.358.221L3.566 7.7a.4.4 0 0 0 .036.407l1.571 2.16-.426.733a.4.4 0 0 0 .047.444l1.602 1.837a.4.4 0 0 0 .603 0l1.602-1.837a.4.4 0 0 0 .047-.444l-.426-.733 1.571-2.16a.4.4 0 0 0 .036-.407L10.68 4.236z" transform="rotate(135 8 8)"/>

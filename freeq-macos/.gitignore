@@ -1,0 +1,14 @@
+# SwiftPM build artifacts (used by `swift test` for the validation harness)
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode build output (DerivedData)
+build/
+
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+
+# macOS noise
+.DS_Store
