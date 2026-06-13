@@ -15,6 +15,7 @@ pub mod eimg;
 pub mod irc;
 pub mod iroh;
 pub mod manifest;
+pub mod media_store;
 pub mod msgid;
 pub mod plugin;
 pub mod policy;

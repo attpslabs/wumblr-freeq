@@ -184,8 +184,12 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/client-metadata.json", get(client_metadata))
         // REST API (read-only, v1)
         .route("/api/v1/health", get(api_health))
+        .route("/metrics", get(api_metrics))
         .route("/api/v1/channels", get(api_channels))
         .route("/api/v1/channels/{name}/history", get(api_channel_history))
+        .route("/api/v1/search", get(api_search))
+        .route("/api/v1/messages/{msgid}", get(api_message_by_id))
+        .route("/api/v1/channels/{name}/export", get(api_channel_export))
         .route("/api/v1/channels/{name}/topic", get(api_channel_topic))
         .route("/api/v1/channels/{name}/pins", get(api_channel_pins))
         .route("/api/v1/users/{nick}", get(api_user))
@@ -194,6 +198,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/eimg", post(api_eimg_upload))
         .route("/api/v1/eimg/{image_id}", get(api_eimg_get))
         .route("/api/v1/blob", get(api_blob_proxy))
+        // Private media: serve an encrypted-at-rest blob via a signed capability
+        // URL. The trailing {filename} is cosmetic (preserves the extension so
+        // clients render it); only {id}/{sig} are authoritative.
+        .route("/api/v1/media/{id}/{sig}/{filename}", get(api_media_serve))
         .route("/api/v1/og", get(api_og_preview))
         .route("/api/v1/keys/{did}", get(api_get_keys))
         .route("/api/v1/keys", axum::routing::post(api_upload_keys))
@@ -406,6 +414,14 @@ struct MessageResponse {
 
 #[derive(Deserialize)]
 struct HistoryQuery {
+    limit: Option<usize>,
+    before: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    channel: String,
+    q: String,
     limit: Option<usize>,
     before: Option<u64>,
 }
@@ -1218,6 +1234,229 @@ async fn api_channel_history(
             }
         }
     }
+}
+
+/// True when REST may serve this channel's history: real channel (not a DM
+/// key) with no +i/+k access controls. Restricted content goes through the
+/// membership-checked IRC commands instead.
+fn rest_readable_channel(state: &SharedState, channel: &str) -> Result<(), StatusCode> {
+    if channel.to_lowercase().starts_with("dm:") || channel.contains("dm:") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let channels = state.channels.lock();
+    match channels.get(&channel.to_lowercase()) {
+        Some(ch) => {
+            if ch.invite_only || ch.key.is_some() {
+                Err(StatusCode::FORBIDDEN)
+            } else {
+                Ok(())
+            }
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// GET /api/v1/messages/{msgid} — permalink resolution. Returns the message
+/// plus its channel so clients can deep-link `irc.example.org/#/{channel}`
+/// scrolled to the msgid. Same access rules as channel history.
+async fn api_message_by_id(
+    Path(msgid): Path<String>,
+    State(state): State<Arc<SharedState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let row = state
+        .with_db(|db| db.find_message_by_msgid(&msgid))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    rest_readable_channel(&state, &row.channel)?;
+    Ok(Json(serde_json::json!({
+        "channel": row.channel,
+        "msgid": row.msgid,
+        "sender": row.sender,
+        "sender_did": row.sender_did,
+        "text": row.text,
+        "timestamp": row.timestamp,
+        "tags": row.tags,
+        "replaces_msgid": row.replaces_msgid,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+    limit: Option<usize>,
+    before: Option<u64>,
+}
+
+/// Render messages as a readable markdown transcript.
+fn format_export_markdown(channel: &str, rows: &[crate::db::MessageRow]) -> String {
+    let mut out = format!("# {channel} — exported transcript\n\n");
+    for r in rows {
+        let ts = chrono::DateTime::from_timestamp(r.timestamp as i64, 0)
+            .unwrap_or_default()
+            .format("%Y-%m-%d %H:%M:%S UTC");
+        let sender = r.sender.split('!').next().unwrap_or(&r.sender);
+        let msgid = r.msgid.as_deref().unwrap_or("-");
+        // Indent continuation lines so multiline messages stay readable.
+        let body = r.text.replace('\n', "\n    ");
+        out.push_str(&format!("- `{ts}` **{sender}** ({msgid}): {body}\n"));
+    }
+    out
+}
+
+/// GET /api/v1/channels/{name}/export?format=json|markdown — bulk export of
+/// a public channel's stored history, oldest-first. "The conversation is the
+/// commit": conversations must be extractable, not trapped in the database.
+async fn api_channel_export(
+    Path(name): Path<String>,
+    Query(params): Query<ExportQuery>,
+    State(state): State<Arc<SharedState>>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse as _;
+    let channel = if name.starts_with('#') {
+        name
+    } else {
+        format!("#{name}")
+    };
+    rest_readable_channel(&state, &channel)?;
+
+    let limit = params.limit.unwrap_or(1000).min(10_000);
+    let rows = state
+        .with_db(|db| db.get_messages(&channel, limit, params.before))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    match params.format.as_deref().unwrap_or("json") {
+        "markdown" | "md" => Ok((
+            [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            format_export_markdown(&channel, &rows),
+        )
+            .into_response()),
+        _ => {
+            let resp: Vec<MessageResponse> = rows
+                .into_iter()
+                .map(|r| MessageResponse {
+                    id: r.id,
+                    sender: r.sender,
+                    text: r.text,
+                    timestamp: r.timestamp,
+                    msgid: r.msgid,
+                    tags: r.tags,
+                })
+                .collect();
+            Ok(Json(resp).into_response())
+        }
+    }
+}
+
+/// Render Prometheus text exposition format (version 0.0.4).
+fn format_metrics(
+    connections: usize,
+    channels: usize,
+    s2s_peers: usize,
+    messages_total: u64,
+    sasl_success_total: u64,
+    sasl_failure_total: u64,
+    uptime_seconds: u64,
+) -> String {
+    format!(
+        "# HELP freeq_connections Currently connected sessions\n\
+         # TYPE freeq_connections gauge\n\
+         freeq_connections {connections}\n\
+         # HELP freeq_channels Channels known to this server\n\
+         # TYPE freeq_channels gauge\n\
+         freeq_channels {channels}\n\
+         # HELP freeq_s2s_peers Authenticated federation peers\n\
+         # TYPE freeq_s2s_peers gauge\n\
+         freeq_s2s_peers {s2s_peers}\n\
+         # HELP freeq_messages_total PRIVMSG/NOTICE handled since start\n\
+         # TYPE freeq_messages_total counter\n\
+         freeq_messages_total {messages_total}\n\
+         # HELP freeq_sasl_success_total Successful SASL authentications since start\n\
+         # TYPE freeq_sasl_success_total counter\n\
+         freeq_sasl_success_total {sasl_success_total}\n\
+         # HELP freeq_sasl_failure_total Failed SASL authentications since start\n\
+         # TYPE freeq_sasl_failure_total counter\n\
+         freeq_sasl_failure_total {sasl_failure_total}\n\
+         # HELP freeq_uptime_seconds Seconds since process start\n\
+         # TYPE freeq_uptime_seconds gauge\n\
+         freeq_uptime_seconds {uptime_seconds}\n"
+    )
+}
+
+/// GET /metrics — Prometheus scrape endpoint.
+async fn api_metrics(State(state): State<Arc<SharedState>>) -> impl axum::response::IntoResponse {
+    use std::sync::atomic::Ordering::Relaxed;
+    let connections = state.connections.lock().len();
+    let channels = state.channels.lock().len();
+    let s2s = state.s2s_manager.lock().clone();
+    let s2s_peers = match s2s {
+        Some(mgr) => mgr.authenticated_peers.lock().await.len(),
+        None => 0,
+    };
+    let body = format_metrics(
+        connections,
+        channels,
+        s2s_peers,
+        state.metrics.messages_total.load(Relaxed),
+        state.metrics.sasl_success_total.load(Relaxed),
+        state.metrics.sasl_failure_total.load(Relaxed),
+        state.metrics.started_at.elapsed().as_secs(),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+/// GET /api/v1/search?channel=#name&q=terms — full-text history search.
+/// Channels only: DM search requires DID auth and goes through the IRC
+/// SEARCH command. Access rules mirror /channels/{name}/history: channels
+/// with +i or +k return 403.
+async fn api_search(
+    Query(params): Query<SearchQuery>,
+    State(state): State<Arc<SharedState>>,
+) -> Result<Json<Vec<MessageResponse>>, StatusCode> {
+    let channel = if params.channel.starts_with('#') {
+        params.channel.clone()
+    } else {
+        format!("#{}", params.channel)
+    };
+    // Never expose DM history through the unauthenticated REST surface.
+    if channel.to_lowercase().contains("dm:") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    {
+        let channels = state.channels.lock();
+        match channels.get(&channel.to_lowercase()) {
+            Some(ch) => {
+                if ch.invite_only || ch.key.is_some() {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            None => return Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    let limit = params.limit.unwrap_or(25).min(100);
+    let rows = state
+        .with_db(|db| db.search_messages(&channel, &params.q, limit, params.before))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| MessageResponse {
+                id: r.id,
+                sender: r.sender,
+                text: r.text,
+                timestamp: r.timestamp,
+                msgid: r.msgid,
+                tags: r.tags,
+            })
+            .collect(),
+    ))
 }
 
 async fn api_channel_topic(
@@ -2898,7 +3137,12 @@ async fn api_upload(
     let mut did = String::new();
     let mut alt = None::<String>;
     let mut channel = None::<String>;
-    let mut cross_post = false;
+    let mut filename = None::<String>;
+    // Two independent opt-in share toggles (default: private-only).
+    // `share_bluesky` (feed post) implies `share_pds` since the feed embed
+    // references the PDS blob. `cross_post` is the legacy alias for it.
+    let mut share_pds = false;
+    let mut share_bluesky = false;
 
     while let Some(field) = multipart
         .next_field()
@@ -2910,6 +3154,9 @@ async fn api_upload(
             "file" => {
                 if let Some(ct) = field.content_type() {
                     content_type = ct.to_string();
+                }
+                if let Some(fname) = field.file_name() {
+                    filename = Some(fname.to_string());
                 }
                 let bytes = field
                     .bytes()
@@ -2943,9 +3190,13 @@ async fn api_upload(
                         (StatusCode::BAD_REQUEST, format!("Channel read error: {e}"))
                     })?);
             }
-            "cross_post" => {
+            "share_pds" => {
                 let val = field.text().await.unwrap_or_default();
-                cross_post = val == "true" || val == "1";
+                share_pds = val == "true" || val == "1";
+            }
+            "share_bluesky" | "cross_post" => {
+                let val = field.text().await.unwrap_or_default();
+                share_bluesky = val == "true" || val == "1";
             }
             _ => {}
         }
@@ -2956,6 +3207,8 @@ async fn api_upload(
     if did.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No DID provided".into()));
     }
+    // A Bluesky feed post needs the blob on the PDS, so it implies share_pds.
+    let share_pds = share_pds || share_bluesky;
 
     // ── Upload auth: verify the caller owns this DID ────────────────────
     // Accept either:
@@ -2984,127 +3237,158 @@ async fn api_upload(
         ));
     }
 
-    // Look up a session that is allowed to upload blobs. Prefer the
-    // dedicated BlobUpload session (Phase 2 step-up); fall back to the
-    // primary Login session only when its granted scope already covers
-    // blob upload (i.e. the PDS issued `transition:generic` because it
-    // doesn't speak granular scopes yet, or the user got both grants on
-    // the same legacy account).
-    let session = {
-        let sessions = state.web_sessions.lock();
-        let purpose = crate::server::OauthPurpose::BlobUpload;
-        if let Some(s) = sessions.get(&(did.clone(), purpose)) {
-            Some(s.clone())
-        } else if let Some(s) = sessions.get(&(did.clone(), crate::server::OauthPurpose::Login)) {
-            // Legacy/wide grant from the primary login is acceptable.
-            if crate::server::scope_satisfies_purpose(&s.granted_scope, purpose) {
+    // ── Opt-in PDS authorization ────────────────────────────────────────
+    // Private uploads (the default) never touch the PDS, so they need NO blob
+    // scope. Only when the user opts to share do we resolve a blob-upload
+    // session and, if absent, ask the client to step up. We check this BEFORE
+    // storing privately so a step-up retry doesn't leave an orphaned blob.
+    let pds_session = if share_pds {
+        // Prefer the dedicated BlobUpload session (Phase 2 step-up); fall back
+        // to the primary Login session only when its granted scope already
+        // covers blob upload (legacy wide grant).
+        let session = {
+            let sessions = state.web_sessions.lock();
+            let purpose = crate::server::OauthPurpose::BlobUpload;
+            if let Some(s) = sessions.get(&(did.clone(), purpose)) {
+                Some(s.clone())
+            } else if let Some(s) =
+                sessions.get(&(did.clone(), crate::server::OauthPurpose::Login))
+                && crate::server::scope_satisfies_purpose(&s.granted_scope, purpose)
+            {
                 Some(s.clone())
             } else {
                 None
             }
-        } else {
-            None
-        }
-    };
-    let session = match session {
-        Some(s) => s,
-        None => {
-            let has_login = state
-                .web_sessions
-                .lock()
-                .contains_key(&(did.clone(), crate::server::OauthPurpose::Login));
-            // Distinguish "you're not logged in" (re-auth) from "you're
-            // logged in but didn't grant blob upload" (step-up). The
-            // structured body lets the web client trigger the right
-            // recovery flow without parsing strings.
-            let body = if has_login {
-                serde_json::json!({
-                    "error": "step_up_required",
-                    "purpose": "blob_upload",
-                    "step_up_url": format!("/auth/step-up?purpose=blob_upload"),
-                    "message": "Image upload to your PDS needs an additional permission. \
-                                Authorize once and we'll proceed.",
-                })
-            } else {
-                serde_json::json!({
-                    "error": "not_authenticated",
-                    "message": "No active session for this DID — please log in.",
-                })
-            };
-            tracing::warn!(did = %did, has_login, "Upload denied: no blob-upload-capable session");
-            return Err((
-                if has_login { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED },
-                body.to_string(),
-            ));
-        }
-    };
-
-    // Upload to PDS using stored DPoP credentials
-    let dpop_key =
-        freeq_sdk::oauth::DpopKey::from_base64url(&session.dpop_key_b64).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DPoP key error: {e}"),
-            )
-        })?;
-
-    let result = freeq_sdk::media::upload_media_to_pds(
-        &session.pds_url,
-        &session.did,
-        &session.access_token,
-        Some(&dpop_key),
-        session.dpop_nonce.as_deref(),
-        &content_type,
-        &file_data,
-        alt.as_deref(),
-        channel.as_deref(),
-        cross_post,
-    )
-    .await
-    .map_err(|e| {
-        let msg = format!("{e:#}"); // include full error chain
-        tracing::warn!(did = %did, error = %msg, "Media upload failed");
-        // Surface auth expiry to client so it can prompt re-login
-        let status = if msg.contains("expired") || msg.contains("401") {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::BAD_GATEWAY
         };
-        (status, format!("PDS upload failed: {msg}"))
-    })?;
+        match session {
+            Some(s) => Some(s),
+            None => {
+                let has_login = state
+                    .web_sessions
+                    .lock()
+                    .contains_key(&(did.clone(), crate::server::OauthPurpose::Login));
+                let body = if has_login {
+                    serde_json::json!({
+                        "error": "step_up_required",
+                        "purpose": "blob_upload",
+                        "step_up_url": "/auth/step-up?purpose=blob_upload",
+                        "message": "Sharing this file to your PDS needs an additional \
+                                    permission. Authorize once and we'll proceed.",
+                    })
+                } else {
+                    serde_json::json!({
+                        "error": "not_authenticated",
+                        "message": "No active session for this DID — please log in.",
+                    })
+                };
+                tracing::warn!(did = %did, has_login, "Share denied: no blob-upload-capable session");
+                return Err((
+                    if has_login { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED },
+                    body.to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
-    // Update stored DPoP nonce so subsequent uploads don't start stale.
-    // Refresh the same session slot we read from above (BlobUpload first;
-    // Login fallback only on legacy wide grants).
-    if let Some(ref new_nonce) = result.updated_nonce {
-        let mut sessions = state.web_sessions.lock();
-        let blob_key = (did.clone(), crate::server::OauthPurpose::BlobUpload);
-        if let Some(s) = sessions.get_mut(&blob_key) {
-            s.dpop_nonce = Some(new_nonce.clone());
-        } else if let Some(s) =
-            sessions.get_mut(&(did.clone(), crate::server::OauthPurpose::Login))
-        {
-            s.dpop_nonce = Some(new_nonce.clone());
+    // ── Private storage (always) ────────────────────────────────────────
+    // Store the bytes encrypted-at-rest and mint a signed capability URL. The
+    // in-channel message always references this URL regardless of sharing, so
+    // the conversation renders consistently and nothing leaks publicly by
+    // default.
+    let (Some(store), Some(db)) = (state.media_store.as_ref(), state.db.as_ref()) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Private media storage is unavailable on this server".into(),
+        ));
+    };
+    let media_id = crate::media_store::new_id();
+    let stored_filename = pick_media_filename(filename.as_deref(), &content_type);
+    let size = file_data.len() as u64;
+    let scope = channel.clone().unwrap_or_default();
+    store.put(&media_id, &file_data).map_err(|e| {
+        tracing::error!(media_id = %media_id, error = %e, "Failed to write private media blob");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store media".into())
+    })?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(e) = db.lock().insert_media(
+        &media_id,
+        &did,
+        &scope,
+        &content_type,
+        size,
+        alt.as_deref(),
+        &stored_filename,
+        created_at,
+    ) {
+        // Roll back the orphaned blob so we don't leave unreferenced bytes.
+        store.remove(&media_id);
+        tracing::error!(media_id = %media_id, error = %e, "Failed to record media metadata");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to store media".into()));
+    }
+    let (origin, _) = derive_web_origin(&headers);
+    let client_url = store.capability_url(&origin, &media_id, &stored_filename);
+
+    // ── Opt-in PDS / Bluesky share (best-effort) ────────────────────────
+    // A failure here does NOT fail the upload: the private copy already
+    // succeeded and the channel message will render. We only warn.
+    if let Some(session) = pds_session {
+        match freeq_sdk::oauth::DpopKey::from_base64url(&session.dpop_key_b64) {
+            Ok(dpop_key) => {
+                match freeq_sdk::media::upload_media_to_pds(
+                    &session.pds_url,
+                    &session.did,
+                    &session.access_token,
+                    Some(&dpop_key),
+                    session.dpop_nonce.as_deref(),
+                    &content_type,
+                    &file_data,
+                    alt.as_deref(),
+                    channel.as_deref(),
+                    share_bluesky,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        // Persist the refreshed DPoP nonce for next time.
+                        if let Some(ref new_nonce) = result.updated_nonce {
+                            let mut sessions = state.web_sessions.lock();
+                            let blob_key = (did.clone(), crate::server::OauthPurpose::BlobUpload);
+                            if let Some(s) = sessions.get_mut(&blob_key) {
+                                s.dpop_nonce = Some(new_nonce.clone());
+                            } else if let Some(s) =
+                                sessions.get_mut(&(did.clone(), crate::server::OauthPurpose::Login))
+                            {
+                                s.dpop_nonce = Some(new_nonce.clone());
+                            }
+                        }
+                        tracing::info!(
+                            did = %did, share_bluesky,
+                            "Media also shared to PDS"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(did = %did, error = %format!("{e:#}"), "PDS share failed (private copy kept)");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(did = %did, error = %e, "PDS share skipped: bad DPoP key");
+            }
         }
     }
 
-    // For non-image content, proxy through our server to avoid PDS
-    // Content-Disposition: attachment and sandbox CSP blocking playback
-    let client_url = if !result.mime_type.starts_with("image/") {
-        let encoded = urlencoding::encode(&result.url);
-        // Include mime hint so clients can render without HEAD request
-        let mime_encoded = urlencoding::encode(&result.mime_type);
-        format!("https://irc.freeq.at/api/v1/blob?url={encoded}&mime={mime_encoded}")
-    } else {
-        result.url.clone()
-    };
-
-    tracing::info!(did = %did, url = %client_url, size = result.size, "Media uploaded to PDS");
+    tracing::info!(did = %did, url = %client_url, size, share_pds, "Private media stored");
 
     Ok(Json(serde_json::json!({
         "url": client_url,
-        "content_type": result.mime_type,
-        "size": result.size,
+        "content_type": content_type,
+        "size": size,
+        "private": !share_pds,
     })))
 }
 
@@ -3360,6 +3644,31 @@ async fn api_eimg_get(
             tracing::warn!(image_id = %image_id, error = %format!("{e:#}"), "eimg fetch failed");
             (StatusCode::BAD_GATEWAY, "fetch failed").into_response()
         }
+    }
+}
+
+/// Choose a stored filename that keeps a usable extension, so the capability
+/// URL's trailing segment lets clients detect the media type by extension.
+fn pick_media_filename(provided: Option<&str>, mime: &str) -> String {
+    let ext = match mime {
+        "image/jpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "video/mp4" => ".mp4",
+        "video/quicktime" => ".mov",
+        "video/webm" => ".webm",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/x-m4a" => ".m4a",
+        "audio/ogg" => ".ogg",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "application/pdf" => ".pdf",
+        _ => "",
+    };
+    match provided {
+        Some(n) if n.contains('.') => n.to_string(),
+        Some(n) if !n.is_empty() => format!("{n}{ext}"),
+        _ => format!("media{ext}"),
     }
 }
 
@@ -3690,6 +3999,120 @@ async fn api_blob_proxy(
     }
 
     (status, resp_headers, bytes).into_response()
+}
+
+/// Serve a privately-stored media blob via a signed capability URL.
+///
+/// Path: `/api/v1/media/{id}/{sig}/{filename}`. The signature gates access —
+/// possession of a valid URL (which only reaches members of the conversation
+/// it was posted to) is the grant. Bytes are decrypted from disk and streamed
+/// with HTTP Range support for video/audio seeking.
+async fn api_media_serve(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path((id, sig, _filename)): axum::extract::Path<(String, String, String)>,
+) -> impl IntoResponse {
+    if !state.rest_rate_limiter.check(addr.ip()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+    }
+    let Some(store) = state.media_store.as_ref() else {
+        return (StatusCode::NOT_FOUND, "media storage unavailable").into_response();
+    };
+    // Capability check first — never reveal whether an id exists to callers
+    // without a valid signature.
+    if !store.verify(&id, &sig) {
+        return (StatusCode::FORBIDDEN, "invalid capability").into_response();
+    }
+    // Look up live (non-deleted) metadata.
+    let row = match state.db.as_ref() {
+        Some(db) => match db.lock().get_media(&id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+            Err(e) => {
+                tracing::warn!(media_id = %id, error = %e, "media metadata lookup failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response();
+            }
+        },
+        None => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let bytes = match store.get(&id) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(media_id = %id, error = %e, "media blob read failed");
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+    };
+
+    let content_type: axum::http::HeaderValue = row
+        .mime
+        .parse()
+        .unwrap_or_else(|_| "application/octet-stream".parse().unwrap());
+    let total = bytes.len() as u64;
+
+    // Optional HTTP Range (single range only — sufficient for media players).
+    if let Some(range) = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        && let Some((start, end)) = parse_single_range(range, total)
+    {
+        let slice = bytes[start as usize..=end as usize].to_vec();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, content_type);
+        h.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        h.insert(
+            axum::http::header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable".parse().unwrap(),
+        );
+        if let Ok(cr) = format!("bytes {start}-{end}/{total}").parse() {
+            h.insert(axum::http::header::CONTENT_RANGE, cr);
+        }
+        return (StatusCode::PARTIAL_CONTENT, h, slice).into_response();
+    }
+
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(axum::http::header::CONTENT_TYPE, content_type);
+    h.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        "private, max-age=31536000, immutable".parse().unwrap(),
+    );
+    (StatusCode::OK, h, bytes).into_response()
+}
+
+/// Parse a single-range `Range: bytes=start-end` header against a known total
+/// length. Returns an inclusive `(start, end)` byte range, or None if the
+/// header is absent/unsatisfiable/multi-range.
+fn parse_single_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = match (s.trim(), e.trim()) {
+        ("", "") => return None,
+        ("", suffix) => {
+            // `-N` → last N bytes
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            (total.saturating_sub(n), total - 1)
+        }
+        (start, "") => (start.parse().ok()?, total - 1),
+        (start, end) => {
+            let st: u64 = start.parse().ok()?;
+            let en: u64 = end.parse().ok()?;
+            (st, en.min(total - 1))
+        }
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Fetch OpenGraph metadata from a URL and return as JSON.
@@ -4260,5 +4683,71 @@ mod eimg_gate_tests {
             .unwrap();
         tokens.insert("tok".to_string(), ("did:plc:alice".to_string(), old));
         assert!(!auth_owns_did(Some("tok"), &tokens, &sessions, "did:plc:alice"));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::format_export_markdown;
+    use std::collections::HashMap;
+
+    fn row(sender: &str, text: &str, ts: u64, msgid: &str) -> crate::db::MessageRow {
+        crate::db::MessageRow {
+            id: 1,
+            channel: "#x".into(),
+            sender: sender.into(),
+            text: text.into(),
+            timestamp: ts,
+            tags: HashMap::new(),
+            msgid: Some(msgid.into()),
+            replaces_msgid: None,
+            deleted_at: None,
+            sender_did: None,
+        }
+    }
+
+    #[test]
+    fn markdown_export_renders_transcript() {
+        let rows = vec![
+            row("alice!a@h", "hello world", 1750000000, "01A"),
+            row("bob!b@h", "line one\nline two", 1750000060, "01B"),
+        ];
+        let md = format_export_markdown("#dev", &rows);
+        assert!(md.starts_with("# #dev — exported transcript\n"));
+        assert!(md.contains("**alice** (01A): hello world\n"));
+        // Hostmask stripped to nick; multiline bodies indented, not split
+        // into separate top-level entries.
+        assert!(md.contains("**bob** (01B): line one\n    line two\n"));
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::format_metrics;
+
+    #[test]
+    fn exposition_format_is_well_formed() {
+        let out = format_metrics(3, 7, 2, 100, 5, 1, 42);
+        assert!(out.contains("freeq_connections 3\n"));
+        assert!(out.contains("freeq_channels 7\n"));
+        assert!(out.contains("freeq_s2s_peers 2\n"));
+        assert!(out.contains("freeq_messages_total 100\n"));
+        assert!(out.contains("freeq_sasl_success_total 5\n"));
+        assert!(out.contains("freeq_sasl_failure_total 1\n"));
+        assert!(out.contains("freeq_uptime_seconds 42\n"));
+        // Every metric line is preceded by HELP + TYPE comments.
+        for name in [
+            "freeq_connections",
+            "freeq_channels",
+            "freeq_s2s_peers",
+            "freeq_messages_total",
+            "freeq_sasl_success_total",
+            "freeq_sasl_failure_total",
+            "freeq_uptime_seconds",
+        ] {
+            assert!(out.contains(&format!("# HELP {name} ")), "missing HELP for {name}");
+            assert!(out.contains(&format!("# TYPE {name} ")), "missing TYPE for {name}");
+        }
+        assert!(out.ends_with('\n'));
     }
 }

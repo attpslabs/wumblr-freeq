@@ -16,6 +16,7 @@ members = [
     "freeq-eliza",
     "wumblr-issuer",
     "wumblr-backend",
+    "freeq-agent-kit/examples/claude-mcp",
 ]
 exclude = [
     "freeq-app/src-tauri",
